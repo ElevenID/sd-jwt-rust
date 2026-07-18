@@ -1,0 +1,95 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: "20 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Prepare reviewed upstream sync
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Fetch OpenWallet Foundation upstream
+        shell: bash
+        run: |
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/openwallet-foundation-labs/sd-jwt-rust.git
+          git fetch --prune --tags upstream main
+
+      - name: Measure upstream drift
+        id: drift
+        shell: bash
+        run: echo "behind=$(git rev-list --count origin/main..upstream/main)" >> "$GITHUB_OUTPUT"
+
+      - name: Close obsolete synchronization pull request
+        if: steps.drift.outputs.behind == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          number=$(gh pr list --state open --head automation/sync-upstream --json number --jq '.[0].number // empty')
+          if [[ -n "$number" ]]; then
+            gh pr close "$number" --comment "Upstream is fully synchronized; closing the obsolete synchronization PR."
+          fi
+
+      - name: Merge upstream into synchronization branch
+        if: steps.drift.outputs.behind != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          git config user.name "elevenid-upstream-sync[bot]"
+          git config user.email "actions@users.noreply.github.com"
+          git switch --force-create automation/sync-upstream origin/main
+          if ! git merge --no-edit upstream/main; then
+            conflicts=$(git diff --name-only --diff-filter=U | sed '/^$/d')
+            git merge --abort
+            gh label create upstream-sync --color 1d76db --description "Automated upstream synchronization" --force
+            existing=$(gh issue list --state open --label upstream-sync --search "sd-jwt-rust upstream sync conflict in:title" --json number --jq '.[0].number // empty')
+            body=$(printf 'The weekly sync could not merge `openwallet-foundation-labs/sd-jwt-rust:main` into the ElevenID fork.\n\nConflicting paths:\n```\n%s\n```' "$conflicts")
+            if [[ -n "$existing" ]]; then
+              gh issue comment "$existing" --body "$body"
+            else
+              gh issue create --title "sd-jwt-rust upstream sync conflict" --label upstream-sync --body "$body"
+            fi
+            exit 1
+          fi
+          git restore --source=origin/main --staged --worktree -- .github/workflows
+          if ! git diff --cached --quiet; then
+            git commit --amend --no-edit
+          fi
+          git push --force-with-lease origin automation/sync-upstream
+
+      - name: Create or refresh synchronization pull request
+        if: steps.drift.outputs.behind != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEHIND: ${{ steps.drift.outputs.behind }}
+        shell: bash
+        run: |
+          gh label create upstream-sync --color 1d76db --description "Automated upstream synchronization" --force
+          number=$(gh pr list --state open --head automation/sync-upstream --json number --jq '.[0].number // empty')
+          body=$(printf 'Automated reviewed synchronization from `openwallet-foundation-labs/sd-jwt-rust:main`.\n\nUpstream commits: %s\n\nMerge only after Rust, advisory, license, and organization-quality checks pass.' "$BEHIND")
+          if [[ -n "$number" ]]; then
+            gh pr edit "$number" --title "Sync with upstream openwallet-foundation-labs/sd-jwt-rust" --body "$body" --add-label upstream-sync
+          else
+            gh pr create --base main --head automation/sync-upstream --title "Sync with upstream openwallet-foundation-labs/sd-jwt-rust" --body "$body" --label upstream-sync
+          fi
