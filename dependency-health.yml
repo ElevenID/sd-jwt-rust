@@ -1,0 +1,14 @@
+version: 1
+dependencies:
+  - package: openwallet-foundation-labs/sd-jwt-rust
+    ecosystem: git
+    owner: ElevenID
+    upstream: https://github.com/openwallet-foundation-labs/sd-jwt-rust
+    current: upstream-main
+    target: upstream-main
+    status: maintained
+    decision: retain
+    advisories: []
+    tracking-issue: https://github.com/ElevenID/sd-jwt-rust/issues/4
+    review-after: 2026-10-18
+    rationale: The fork retains upstream behavior while adding ElevenID security and quality policy.
