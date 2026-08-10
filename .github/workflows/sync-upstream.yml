@@ -37,7 +37,13 @@ jobs:
       - name: Measure upstream drift
         id: drift
         shell: bash
-        run: echo "behind=$(git rev-list --count origin/main..upstream/main)" >> "$GITHUB_OUTPUT"
+        run: |
+          last_synced="$(jq -er '.last_synced_commit' .github/upstream-sync.json)"
+          git cat-file -e "${last_synced}^{commit}"
+          git merge-base --is-ancestor "$last_synced" upstream/main
+          echo "last-synced=$last_synced" >> "$GITHUB_OUTPUT"
+          echo "upstream-commit=$(git rev-parse upstream/main)" >> "$GITHUB_OUTPUT"
+          echo "behind=$(git rev-list --count "$last_synced"..upstream/main)" >> "$GITHUB_OUTPUT"
 
       - name: Close obsolete synchronization pull request
         if: steps.drift.outputs.behind == '0'
@@ -54,17 +60,20 @@ jobs:
         if: steps.drift.outputs.behind != '0'
         env:
           GH_TOKEN: ${{ github.token }}
+          LAST_SYNCED: ${{ steps.drift.outputs.last-synced }}
+          UPSTREAM_COMMIT: ${{ steps.drift.outputs.upstream-commit }}
         shell: bash
         run: |
           git config user.name "elevenid-upstream-sync[bot]"
           git config user.email "actions@users.noreply.github.com"
           git switch --force-create automation/sync-upstream origin/main
-          if ! git merge --no-edit upstream/main; then
-            conflicts=$(git diff --name-only --diff-filter=U | sed '/^$/d')
-            git merge --abort
+          merge_output="$(mktemp)"
+          if ! git merge-tree --write-tree --messages --name-only \
+            --merge-base="$LAST_SYNCED" origin/main upstream/main >"$merge_output" 2>&1; then
+            conflicts="$(tail -n +2 "$merge_output" | head -n 100)"
             gh label create upstream-sync --color 1d76db --description "Automated upstream synchronization" --force
             existing=$(gh issue list --state open --label upstream-sync --search "sd-jwt-rust upstream sync conflict in:title" --json number --jq '.[0].number // empty')
-            body=$(printf 'The weekly sync could not merge `openwallet-foundation-labs/sd-jwt-rust:main` into the ElevenID fork.\n\nConflicting paths:\n```\n%s\n```' "$conflicts")
+            body=$(printf 'The weekly sync could not apply changes after `%s` from `openwallet-foundation-labs/sd-jwt-rust:main` to the ElevenID fork.\n\nMerge diagnostics:\n```\n%s\n```' "$LAST_SYNCED" "$conflicts")
             if [[ -n "$existing" ]]; then
               gh issue comment "$existing" --body "$body"
             else
@@ -72,10 +81,21 @@ jobs:
             fi
             exit 1
           fi
-          git restore --source=origin/main --staged --worktree -- .github/workflows
-          if ! git diff --cached --quiet; then
-            git commit --amend --no-edit
-          fi
+          merged_tree="$(head -n 1 "$merge_output")"
+          git read-tree --reset -u "$merged_tree"
+          git restore --source=origin/main --staged --worktree -- .github/workflows .github/upstream-sync.json
+          python - "$UPSTREAM_COMMIT" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          path = pathlib.Path(".github/upstream-sync.json")
+          state = json.loads(path.read_text(encoding="utf-8"))
+          state["last_synced_commit"] = sys.argv[1]
+          path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+          PY
+          git add --all
+          git commit -m "chore: sync openwallet-foundation-labs/sd-jwt-rust@$UPSTREAM_COMMIT"
           git push --force-with-lease origin automation/sync-upstream
 
       - name: Create or refresh synchronization pull request

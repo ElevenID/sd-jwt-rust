@@ -6,7 +6,7 @@ use crate::error::Error;
 use crate::error::Result;
 use crate::SDJWTSerializationFormat;
 use jsonwebtoken::jwk::Jwk;
-use jsonwebtoken::{Algorithm, DecodingKey, Header, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use log::debug;
 use serde_json::{Map, Value};
 use std::ops::Add;
@@ -17,12 +17,10 @@ use std::vec::Vec;
 
 use crate::utils::base64_hash;
 use crate::{
-    SDJWTCommon, CNF_KEY, COMBINED_SERIALIZATION_FORMAT_SEPARATOR, DEFAULT_DIGEST_ALG,
+    KeyResolver, SDJWTCommon, CNF_KEY, COMBINED_SERIALIZATION_FORMAT_SEPARATOR, DEFAULT_DIGEST_ALG,
     DEFAULT_SIGNING_ALG, DIGEST_ALG_KEY, JWK_KEY, KB_DIGEST_KEY, KB_JWT_TYP_HEADER, SD_DIGESTS_KEY,
     SD_LIST_PREFIX,
 };
-
-type KeyResolver = dyn Fn(&str, &Header) -> DecodingKey;
 
 pub struct SDJWTVerifier {
     sd_jwt_engine: SDJWTCommon,
@@ -525,16 +523,20 @@ mod tests {
                 SDJWTSerializationFormat::Compact,
             )
             .unwrap();
-        let presentation = SDJWTHolder::new(sd_jwt.clone(), SDJWTSerializationFormat::Compact)
-            .unwrap()
-            .create_presentation(
-                user_claims.as_object().unwrap().clone(),
-                None,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
+        let presentation = SDJWTHolder::new(
+            sd_jwt.clone(),
+            SDJWTSerializationFormat::Compact,
+            Box::new(|_, _| DecodingKey::from_ec_pem(PUBLIC_ISSUER_PEM.as_bytes()).unwrap()),
+        )
+        .unwrap()
+        .create_presentation(
+            user_claims.as_object().unwrap().clone(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(sd_jwt, presentation);
         let verified_claims = SDJWTVerifier::new(
             presentation,
@@ -577,16 +579,17 @@ mod tests {
             )
             .unwrap();
 
-        let presentation = SDJWTHolder::new(sd_jwt.clone(), SDJWTSerializationFormat::Compact)
-            .unwrap()
-            .create_presentation(
-                user_claims.as_object().unwrap().clone(),
-                None,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
+        let presentation =
+            SDJWTHolder::new_unverified(sd_jwt.clone(), SDJWTSerializationFormat::Compact)
+                .unwrap()
+                .create_presentation(
+                    user_claims.as_object().unwrap().clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
         assert_eq!(sd_jwt, presentation);
         let verified_claims = SDJWTVerifier::new(
             presentation,
@@ -654,7 +657,7 @@ mod tests {
         claims_to_disclose["addresses"] = Value::Array(vec![Value::Bool(true), Value::Bool(true)]);
         claims_to_disclose["nationalities"] =
             Value::Array(vec![Value::Bool(true), Value::Bool(true)]);
-        let presentation = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
+        let presentation = SDJWTHolder::new_unverified(sd_jwt, SDJWTSerializationFormat::Compact)
             .unwrap()
             .create_presentation(
                 claims_to_disclose.as_object().unwrap().clone(),
@@ -750,7 +753,7 @@ mod tests {
 
         let claims_to_disclose = json!({});
 
-        let presentation = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
+        let presentation = SDJWTHolder::new_unverified(sd_jwt, SDJWTSerializationFormat::Compact)
             .unwrap()
             .create_presentation(
                 claims_to_disclose.as_object().unwrap().clone(),
@@ -816,17 +819,22 @@ mod tests {
             )
             .unwrap();
 
-        let presentation =
-            SDJWTHolder::new(sd_jwt.clone(), SDJWTSerializationFormat::FlattenedJson) // Changed to Flattened Json format
-                .unwrap()
-                .create_presentation(
-                    user_claims.as_object().unwrap().clone(),
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .unwrap();
+        let presentation = SDJWTHolder::new(
+            sd_jwt.clone(),
+            SDJWTSerializationFormat::FlattenedJson, // Changed to Flattened Json format
+            Box::new(|_, _| {
+                DecodingKey::from_ed_pem(PUBLIC_ISSUER_ED25519_PEM.as_bytes()).unwrap()
+            }),
+        )
+        .unwrap()
+        .create_presentation(
+            user_claims.as_object().unwrap().clone(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(sd_jwt, presentation);
         let verified_claims = SDJWTVerifier::new(
             presentation,
@@ -880,7 +888,8 @@ mod tests {
         let aud = Some(String::from("testAud"));
 
         let mut holder =
-            SDJWTHolder::new(sd_jwt.clone(), SDJWTSerializationFormat::FlattenedJson).unwrap(); // Changed to Flattened Json format
+            SDJWTHolder::new_unverified(sd_jwt.clone(), SDJWTSerializationFormat::FlattenedJson)
+                .unwrap(); // Changed to Flattened Json format
         let presentation = holder
             .create_presentation(
                 user_claims.as_object().unwrap().clone(),
@@ -955,7 +964,7 @@ mod tests {
         let nonce = Some(String::from("testNonce"));
         let aud = Some(String::from("testAud"));
 
-        let presentation = SDJWTHolder::new(sd_jwt, format.clone())
+        let presentation = SDJWTHolder::new_unverified(sd_jwt, format.clone())
             .unwrap()
             .create_presentation(
                 user_claims.as_object().unwrap().clone(),
@@ -1091,16 +1100,17 @@ mod tests {
         let nonce = Some(String::from("testNonce"));
         let aud = Some(String::from("testAud"));
 
-        let presentation = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::FlattenedJson)
-            .unwrap()
-            .create_presentation(
-                user_claims.as_object().unwrap().clone(),
-                nonce.clone(),
-                aud.clone(),
-                Some(holder_key),
-                Some("EdDSA".to_string()),
-            )
-            .unwrap();
+        let presentation =
+            SDJWTHolder::new_unverified(sd_jwt, SDJWTSerializationFormat::FlattenedJson)
+                .unwrap()
+                .create_presentation(
+                    user_claims.as_object().unwrap().clone(),
+                    nonce.clone(),
+                    aud.clone(),
+                    Some(holder_key),
+                    Some("EdDSA".to_string()),
+                )
+                .unwrap();
 
         // Tamper: re-sign the KB-JWT with the `iat` claim stripped from the
         // payload. The KB-JWT remains validly signed by the holder key, so
@@ -1221,7 +1231,7 @@ mod tests {
                 SDJWTSerializationFormat::Compact,
             )
             .unwrap();
-        let presentation = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
+        let presentation = SDJWTHolder::new_unverified(sd_jwt, SDJWTSerializationFormat::Compact)
             .unwrap()
             .create_presentation(
                 user_claims.as_object().unwrap().clone(),
@@ -1282,7 +1292,7 @@ mod tests {
             )
             .unwrap();
 
-        let presentation = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact)
+        let presentation = SDJWTHolder::new_unverified(sd_jwt, SDJWTSerializationFormat::Compact)
             .unwrap()
             .create_presentation(
                 user_claims.as_object().unwrap().clone(),
