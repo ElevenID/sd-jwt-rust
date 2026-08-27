@@ -6,6 +6,22 @@ use crate::error::{Error, Result};
 use crate::utils::{base64_hash, base64url_decode};
 use serde_json::Value;
 use std::collections::HashMap;
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+use std::thread;
+
+// Provisional opt-in policy. These cutoffs deliberately favor the serial
+// oracle until benchmarks cover the target architecture and payload mix.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+const PARALLEL_MIN_DISCLOSURES: usize = 64;
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+const PARALLEL_MIN_TOTAL_ENCODED_BYTES: usize = 1024 * 1024;
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+const MAX_PARALLEL_WORKERS: usize = 4;
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+const PARALLEL_WORKER_FAILURE: &str = "Disclosure preprocessing executor failure: worker panicked";
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+const PARALLEL_SPAWN_FAILURE: &str =
+    "Disclosure preprocessing executor failure: could not spawn worker";
 
 /// An immutable unit of disclosure preprocessing work.
 ///
@@ -33,20 +49,127 @@ struct DisclosureOutcome<'a> {
 }
 
 trait DisclosureExecutor {
-    fn execute<'a>(&self, jobs: &[DisclosureJob<'a>]) -> Vec<DisclosureOutcome<'a>>;
+    fn execute<'a>(&self, jobs: &[DisclosureJob<'a>]) -> Result<Vec<DisclosureOutcome<'a>>>;
 }
 
-/// The behavioral oracle. Production remains serial until an optimized
-/// executor can be compared against this implementation.
+/// The behavioral oracle and the fallback when native parallel execution is
+/// unavailable or below its measured workload threshold.
 struct SerialDisclosureExecutor;
 
 impl DisclosureExecutor for SerialDisclosureExecutor {
-    fn execute<'a>(&self, jobs: &[DisclosureJob<'a>]) -> Vec<DisclosureOutcome<'a>> {
-        jobs.iter().map(process_disclosure).collect()
+    fn execute<'a>(&self, jobs: &[DisclosureJob<'a>]) -> Result<Vec<DisclosureOutcome<'a>>> {
+        Ok(jobs.iter().map(process_disclosure).collect())
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DisclosureExecutionMode {
+    Serial,
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    NativeParallel {
+        worker_count: usize,
+    },
+}
+
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+type DisclosureWorker = for<'a> fn(&DisclosureJob<'a>) -> DisclosureOutcome<'a>;
+
+/// A bounded native executor. It divides the immutable job slice into at most
+/// `MAX_PARALLEL_WORKERS` chunks and uses scoped threads so disclosures do not
+/// need to be copied or given a `'static` lifetime.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+struct NativeParallelDisclosureExecutor {
+    worker_count: usize,
+    worker: DisclosureWorker,
+    #[cfg(test)]
+    forced_spawn_failure_at: Option<usize>,
+}
+
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+impl NativeParallelDisclosureExecutor {
+    fn new(worker_count: usize) -> Self {
+        Self {
+            worker_count: worker_count.clamp(1, MAX_PARALLEL_WORKERS),
+            worker: process_disclosure,
+            #[cfg(test)]
+            forced_spawn_failure_at: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_worker(worker_count: usize, worker: DisclosureWorker) -> Self {
+        Self {
+            worker_count: worker_count.clamp(1, MAX_PARALLEL_WORKERS),
+            worker,
+            forced_spawn_failure_at: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_forced_spawn_failure(worker_count: usize, spawn_index: usize) -> Self {
+        Self {
+            worker_count: worker_count.clamp(1, MAX_PARALLEL_WORKERS),
+            worker: process_disclosure,
+            forced_spawn_failure_at: Some(spawn_index),
+        }
+    }
+}
+
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+impl DisclosureExecutor for NativeParallelDisclosureExecutor {
+    fn execute<'a>(&self, jobs: &[DisclosureJob<'a>]) -> Result<Vec<DisclosureOutcome<'a>>> {
+        if jobs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let worker_count = self.worker_count.min(jobs.len());
+        let chunk_size = jobs.len() / worker_count + usize::from(jobs.len() % worker_count != 0);
+        let worker = self.worker;
+
+        thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(worker_count);
+            let mut spawn_failed = false;
+
+            for chunk in jobs.chunks(chunk_size) {
+                #[cfg(test)]
+                if self.forced_spawn_failure_at == Some(handles.len()) {
+                    spawn_failed = true;
+                    break;
+                }
+
+                let handle = thread::Builder::new()
+                    .name("sd-jwt-disclosure-worker".to_owned())
+                    .spawn_scoped(scope, move || chunk.iter().map(worker).collect::<Vec<_>>());
+                match handle {
+                    Ok(handle) => handles.push(handle),
+                    Err(_) => {
+                        spawn_failed = true;
+                        break;
+                    }
+                }
+            }
+
+            let mut outcomes = Vec::with_capacity(jobs.len());
+            let mut worker_panicked = false;
+            for handle in handles {
+                match handle.join() {
+                    Ok(mut chunk_outcomes) => outcomes.append(&mut chunk_outcomes),
+                    Err(_) => worker_panicked = true,
+                }
+            }
+
+            if spawn_failed {
+                Err(Error::InvalidState(PARALLEL_SPAWN_FAILURE.to_owned()))
+            } else if worker_panicked {
+                Err(Error::InvalidState(PARALLEL_WORKER_FAILURE.to_owned()))
+            } else {
+                Ok(outcomes)
+            }
+        })
+    }
+}
+
+#[derive(Debug, PartialEq)]
 pub(super) struct DisclosureMappings {
     pub(super) hash_to_decoded_disclosure: HashMap<String, Value>,
     pub(super) hash_to_disclosure: HashMap<String, String>,
@@ -54,8 +177,59 @@ pub(super) struct DisclosureMappings {
 
 pub(super) fn preprocess_disclosures(encoded_disclosures: &[String]) -> Result<DisclosureMappings> {
     let jobs = plan_disclosures(encoded_disclosures);
-    let outcomes = SerialDisclosureExecutor.execute(&jobs);
+    let total_encoded_bytes = jobs.iter().fold(0usize, |total, job| {
+        total.saturating_add(job.encoded_disclosure.len())
+    });
+    let outcomes =
+        match select_execution_mode(jobs.len(), total_encoded_bytes, available_worker_threads()) {
+            DisclosureExecutionMode::Serial => SerialDisclosureExecutor.execute(&jobs),
+            #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+            DisclosureExecutionMode::NativeParallel { worker_count } => {
+                NativeParallelDisclosureExecutor::new(worker_count).execute(&jobs)
+            }
+        }?;
     assemble_disclosures(&jobs, outcomes)
+}
+
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+fn available_worker_threads() -> usize {
+    thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1)
+}
+
+#[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
+fn available_worker_threads() -> usize {
+    1
+}
+
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+fn select_execution_mode(
+    disclosure_count: usize,
+    total_encoded_bytes: usize,
+    available_threads: usize,
+) -> DisclosureExecutionMode {
+    if available_threads > 1
+        && disclosure_count >= PARALLEL_MIN_DISCLOSURES
+        && total_encoded_bytes >= PARALLEL_MIN_TOTAL_ENCODED_BYTES
+    {
+        DisclosureExecutionMode::NativeParallel {
+            worker_count: available_threads
+                .min(disclosure_count)
+                .min(MAX_PARALLEL_WORKERS),
+        }
+    } else {
+        DisclosureExecutionMode::Serial
+    }
+}
+
+#[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
+fn select_execution_mode(
+    _disclosure_count: usize,
+    _total_encoded_bytes: usize,
+    _available_threads: usize,
+) -> DisclosureExecutionMode {
+    DisclosureExecutionMode::Serial
 }
 
 fn plan_disclosures(encoded_disclosures: &[String]) -> Vec<DisclosureJob<'_>> {
@@ -245,6 +419,53 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    fn generated_disclosures(count: usize, value_size: usize) -> Vec<String> {
+        (0..count)
+            .map(|ordinal| {
+                let decoded = serde_json::to_vec(&json!([
+                    format!("salt-{ordinal}"),
+                    format!("claim-{ordinal}"),
+                    "x".repeat(value_size)
+                ]))
+                .unwrap();
+                crate::utils::base64url_encode(&decoded)
+            })
+            .collect()
+    }
+
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    fn deterministic_shuffle<T>(values: &mut [T]) {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for upper in (1..values.len()).rev() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            values.swap(upper, (state as usize) % (upper + 1));
+        }
+    }
+
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    fn error_signature(error: Error) -> (String, String) {
+        (format!("{error:?}"), error.to_string())
+    }
+
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    fn assert_parallel_executor_failure(error: Error, expected_message: &str) {
+        assert_eq!(
+            error.to_string(),
+            format!("invalid state: {expected_message}")
+        );
+        match error {
+            Error::InvalidState(message) => {
+                assert_eq!(message, expected_message);
+                assert!(!message.contains("ordinal"));
+                assert!(!message.contains(OBJECT_DISCLOSURE));
+            }
+            other => panic!("expected InvalidState, got {other:?}"),
+        }
+    }
+
     #[test]
     fn worker_preserves_identity_and_computes_exact_value_and_hash() {
         let disclosures = owned(&[OBJECT_DISCLOSURE]);
@@ -267,7 +488,7 @@ mod tests {
         let disclosures = owned(&[OBJECT_DISCLOSURE, ARRAY_DISCLOSURE, WHITESPACE_DISCLOSURE]);
         let jobs = plan_disclosures(&disclosures);
 
-        let outcomes = SerialDisclosureExecutor.execute(&jobs);
+        let outcomes = SerialDisclosureExecutor.execute(&jobs).unwrap();
 
         assert_eq!(outcomes.len(), jobs.len());
         for (job, outcome) in jobs.iter().zip(&outcomes) {
@@ -280,7 +501,7 @@ mod tests {
     fn assembler_restores_shuffled_outcomes_before_building_mappings() {
         let disclosures = owned(&[OBJECT_DISCLOSURE, ARRAY_DISCLOSURE, WHITESPACE_DISCLOSURE]);
         let jobs = plan_disclosures(&disclosures);
-        let mut outcomes = SerialDisclosureExecutor.execute(&jobs);
+        let mut outcomes = SerialDisclosureExecutor.execute(&jobs).unwrap();
         outcomes.swap(0, 2);
 
         let mappings = assemble_disclosures(&jobs, outcomes).unwrap();
@@ -307,7 +528,7 @@ mod tests {
     fn assembler_uses_lowest_ordinal_malformed_error_after_shuffle() {
         let disclosures = owned(&[INVALID_JSON_DISCLOSURE, INVALID_BASE64_DISCLOSURE]);
         let jobs = plan_disclosures(&disclosures);
-        let mut outcomes = SerialDisclosureExecutor.execute(&jobs);
+        let mut outcomes = SerialDisclosureExecutor.execute(&jobs).unwrap();
         outcomes.reverse();
 
         let error = assemble_disclosures(&jobs, outcomes).unwrap_err();
@@ -323,7 +544,7 @@ mod tests {
             OBJECT_DISCLOSURE,
         ]);
         let jobs = plan_disclosures(&disclosures);
-        let mut outcomes = SerialDisclosureExecutor.execute(&jobs);
+        let mut outcomes = SerialDisclosureExecutor.execute(&jobs).unwrap();
         outcomes.reverse();
 
         let error = assemble_disclosures(&jobs, outcomes).unwrap_err();
@@ -339,7 +560,7 @@ mod tests {
             INVALID_JSON_DISCLOSURE,
         ]);
         let jobs = plan_disclosures(&disclosures);
-        let mut outcomes = SerialDisclosureExecutor.execute(&jobs);
+        let mut outcomes = SerialDisclosureExecutor.execute(&jobs).unwrap();
         outcomes.reverse();
 
         let error = assemble_disclosures(&jobs, outcomes).unwrap_err();
@@ -356,7 +577,7 @@ mod tests {
     fn assembler_rejects_missing_outcome() {
         let disclosures = owned(&[OBJECT_DISCLOSURE, ARRAY_DISCLOSURE]);
         let jobs = plan_disclosures(&disclosures);
-        let mut outcomes = SerialDisclosureExecutor.execute(&jobs);
+        let mut outcomes = SerialDisclosureExecutor.execute(&jobs).unwrap();
         outcomes.remove(1);
 
         let error = assemble_disclosures(&jobs, outcomes).unwrap_err();
@@ -368,7 +589,7 @@ mod tests {
     fn assembler_rejects_duplicate_outcome() {
         let disclosures = owned(&[OBJECT_DISCLOSURE, ARRAY_DISCLOSURE]);
         let jobs = plan_disclosures(&disclosures);
-        let mut outcomes = SerialDisclosureExecutor.execute(&jobs);
+        let mut outcomes = SerialDisclosureExecutor.execute(&jobs).unwrap();
         outcomes.push(process_disclosure(&jobs[1]));
 
         let error = assemble_disclosures(&jobs, outcomes).unwrap_err();
@@ -380,7 +601,7 @@ mod tests {
     fn assembler_rejects_out_of_range_outcome() {
         let disclosures = owned(&[OBJECT_DISCLOSURE, ARRAY_DISCLOSURE]);
         let jobs = plan_disclosures(&disclosures);
-        let mut outcomes = SerialDisclosureExecutor.execute(&jobs);
+        let mut outcomes = SerialDisclosureExecutor.execute(&jobs).unwrap();
         outcomes[1].ordinal = jobs.len();
 
         let error = assemble_disclosures(&jobs, outcomes).unwrap_err();
@@ -392,7 +613,7 @@ mod tests {
     fn assembler_rejects_identity_mutation() {
         let disclosures = owned(&[OBJECT_DISCLOSURE, ARRAY_DISCLOSURE]);
         let jobs = plan_disclosures(&disclosures);
-        let mut outcomes = SerialDisclosureExecutor.execute(&jobs);
+        let mut outcomes = SerialDisclosureExecutor.execute(&jobs).unwrap();
         outcomes[1].encoded_disclosure = jobs[0].encoded_disclosure;
 
         let error = assemble_disclosures(&jobs, outcomes).unwrap_err();
@@ -412,5 +633,145 @@ mod tests {
 
             assert_invalid_disclosure(outcome.result.unwrap_err(), expected_message);
         }
+    }
+
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    #[test]
+    fn native_parallel_matches_serial_after_deterministic_completion_shuffle() {
+        let disclosures = generated_disclosures(64, 512);
+        let jobs = plan_disclosures(&disclosures);
+        let serial_outcomes = SerialDisclosureExecutor.execute(&jobs).unwrap();
+        let serial_mappings = assemble_disclosures(&jobs, serial_outcomes).unwrap();
+
+        let mut parallel_outcomes = NativeParallelDisclosureExecutor::new(4)
+            .execute(&jobs)
+            .unwrap();
+        deterministic_shuffle(&mut parallel_outcomes);
+        let parallel_mappings = assemble_disclosures(&jobs, parallel_outcomes).unwrap();
+
+        assert_eq!(parallel_mappings, serial_mappings);
+    }
+
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    #[test]
+    fn native_parallel_matches_serial_error_variant_message_and_precedence() {
+        for disclosures in [
+            owned(&[INVALID_JSON_DISCLOSURE, INVALID_BASE64_DISCLOSURE]),
+            owned(&[
+                INVALID_JSON_DISCLOSURE,
+                OBJECT_DISCLOSURE,
+                OBJECT_DISCLOSURE,
+            ]),
+            owned(&[
+                OBJECT_DISCLOSURE,
+                OBJECT_DISCLOSURE,
+                INVALID_JSON_DISCLOSURE,
+            ]),
+        ] {
+            let jobs = plan_disclosures(&disclosures);
+            let serial_error =
+                assemble_disclosures(&jobs, SerialDisclosureExecutor.execute(&jobs).unwrap())
+                    .unwrap_err();
+            let mut parallel_outcomes = NativeParallelDisclosureExecutor::new(3)
+                .execute(&jobs)
+                .unwrap();
+            parallel_outcomes.reverse();
+            let parallel_error = assemble_disclosures(&jobs, parallel_outcomes).unwrap_err();
+
+            assert_eq!(
+                error_signature(parallel_error),
+                error_signature(serial_error)
+            );
+        }
+    }
+
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    #[test]
+    fn native_parallel_fails_closed_on_worker_panic_without_item_data() {
+        fn panicking_worker<'a>(job: &DisclosureJob<'a>) -> DisclosureOutcome<'a> {
+            if job.ordinal == 1 {
+                panic!("injected worker failure");
+            }
+            process_disclosure(job)
+        }
+
+        let disclosures = generated_disclosures(8, 64);
+        let jobs = plan_disclosures(&disclosures);
+
+        let error = NativeParallelDisclosureExecutor::with_worker(2, panicking_worker)
+            .execute(&jobs)
+            .unwrap_err();
+
+        assert_parallel_executor_failure(error, PARALLEL_WORKER_FAILURE);
+    }
+
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    #[test]
+    fn native_parallel_fails_closed_on_spawn_failure_without_item_data() {
+        let disclosures = generated_disclosures(8, 64);
+        let jobs = plan_disclosures(&disclosures);
+
+        let error = NativeParallelDisclosureExecutor::with_forced_spawn_failure(2, 1)
+            .execute(&jobs)
+            .unwrap_err();
+
+        assert_parallel_executor_failure(error, PARALLEL_SPAWN_FAILURE);
+    }
+
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    #[test]
+    fn adaptive_policy_uses_documented_cutoffs_and_bounds_workers() {
+        assert_eq!(
+            select_execution_mode(
+                PARALLEL_MIN_DISCLOSURES - 1,
+                PARALLEL_MIN_TOTAL_ENCODED_BYTES,
+                MAX_PARALLEL_WORKERS,
+            ),
+            DisclosureExecutionMode::Serial
+        );
+        assert_eq!(
+            select_execution_mode(
+                PARALLEL_MIN_DISCLOSURES,
+                PARALLEL_MIN_TOTAL_ENCODED_BYTES - 1,
+                MAX_PARALLEL_WORKERS,
+            ),
+            DisclosureExecutionMode::Serial
+        );
+        assert_eq!(
+            select_execution_mode(
+                PARALLEL_MIN_DISCLOSURES,
+                PARALLEL_MIN_TOTAL_ENCODED_BYTES,
+                1,
+            ),
+            DisclosureExecutionMode::Serial
+        );
+        assert_eq!(
+            select_execution_mode(
+                PARALLEL_MIN_DISCLOSURES,
+                PARALLEL_MIN_TOTAL_ENCODED_BYTES,
+                usize::MAX,
+            ),
+            DisclosureExecutionMode::NativeParallel {
+                worker_count: MAX_PARALLEL_WORKERS,
+            }
+        );
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    #[test]
+    fn feature_off_always_selects_serial_execution() {
+        assert_eq!(
+            select_execution_mode(usize::MAX, usize::MAX, usize::MAX),
+            DisclosureExecutionMode::Serial
+        );
+    }
+
+    #[cfg(all(feature = "parallel", target_arch = "wasm32"))]
+    #[test]
+    fn wasm_parallel_feature_still_selects_serial_execution() {
+        assert_eq!(
+            select_execution_mode(usize::MAX, usize::MAX, usize::MAX),
+            DisclosureExecutionMode::Serial
+        );
     }
 }
