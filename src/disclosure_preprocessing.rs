@@ -6,20 +6,20 @@ use crate::error::{Error, Result};
 use crate::utils::{base64_hash, base64url_decode};
 use serde_json::Value;
 use std::collections::HashMap;
-#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
 use std::thread;
 
 // Provisional opt-in policy. These cutoffs deliberately favor the serial
 // oracle until benchmarks cover the target architecture and payload mix.
-#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
-const PARALLEL_MIN_DISCLOSURES: usize = 64;
-#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+const PARALLEL_MIN_DISCLOSURES: usize = 128;
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
 const PARALLEL_MIN_TOTAL_ENCODED_BYTES: usize = 1024 * 1024;
-#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
 const MAX_PARALLEL_WORKERS: usize = 4;
-#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
 const PARALLEL_WORKER_FAILURE: &str = "Disclosure preprocessing executor failure: worker panicked";
-#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
 const PARALLEL_SPAWN_FAILURE: &str =
     "Disclosure preprocessing executor failure: could not spawn worker";
 
@@ -65,19 +65,19 @@ impl DisclosureExecutor for SerialDisclosureExecutor {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DisclosureExecutionMode {
     Serial,
-    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
     NativeParallel {
         worker_count: usize,
     },
 }
 
-#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
 type DisclosureWorker = for<'a> fn(&DisclosureJob<'a>) -> DisclosureOutcome<'a>;
 
 /// A bounded native executor. It divides the immutable job slice into at most
 /// `MAX_PARALLEL_WORKERS` chunks and uses scoped threads so disclosures do not
 /// need to be copied or given a `'static` lifetime.
-#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
 struct NativeParallelDisclosureExecutor {
     worker_count: usize,
     worker: DisclosureWorker,
@@ -85,7 +85,7 @@ struct NativeParallelDisclosureExecutor {
     forced_spawn_failure_at: Option<usize>,
 }
 
-#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
 impl NativeParallelDisclosureExecutor {
     fn new(worker_count: usize) -> Self {
         Self {
@@ -115,7 +115,14 @@ impl NativeParallelDisclosureExecutor {
     }
 }
 
-#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+fn static_chunk_size(job_count: usize, worker_count: usize) -> usize {
+    debug_assert!(job_count > 0);
+    debug_assert!(worker_count > 0);
+    job_count / worker_count + usize::from(job_count % worker_count != 0)
+}
+
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
 impl DisclosureExecutor for NativeParallelDisclosureExecutor {
     fn execute<'a>(&self, jobs: &[DisclosureJob<'a>]) -> Result<Vec<DisclosureOutcome<'a>>> {
         if jobs.is_empty() {
@@ -123,7 +130,7 @@ impl DisclosureExecutor for NativeParallelDisclosureExecutor {
         }
 
         let worker_count = self.worker_count.min(jobs.len());
-        let chunk_size = jobs.len() / worker_count + usize::from(jobs.len() % worker_count != 0);
+        let chunk_size = static_chunk_size(jobs.len(), worker_count);
         let worker = self.worker;
 
         thread::scope(|scope| {
@@ -178,58 +185,131 @@ pub(super) struct DisclosureMappings {
 
 pub(super) fn preprocess_disclosures(encoded_disclosures: &[String]) -> Result<DisclosureMappings> {
     let jobs = plan_disclosures(encoded_disclosures);
-    let total_encoded_bytes = jobs.iter().fold(0usize, |total, job| {
-        total.saturating_add(job.encoded_disclosure.len())
-    });
-    let outcomes =
-        match select_execution_mode(jobs.len(), total_encoded_bytes, available_worker_threads()) {
-            DisclosureExecutionMode::Serial => SerialDisclosureExecutor.execute(&jobs),
-            #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
-            DisclosureExecutionMode::NativeParallel { worker_count } => {
-                NativeParallelDisclosureExecutor::new(worker_count).execute(&jobs)
-            }
-        }?;
+    let outcomes = match select_execution_mode(&jobs) {
+        DisclosureExecutionMode::Serial => SerialDisclosureExecutor.execute(&jobs),
+        #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+        DisclosureExecutionMode::NativeParallel { worker_count } => {
+            NativeParallelDisclosureExecutor::new(worker_count).execute(&jobs)
+        }
+    }?;
     assemble_disclosures(&jobs, outcomes)
 }
 
-#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
 fn available_worker_threads() -> usize {
     thread::available_parallelism()
         .map(|parallelism| parallelism.get())
         .unwrap_or(1)
 }
 
-#[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
-fn available_worker_threads() -> usize {
-    1
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+fn select_execution_mode(jobs: &[DisclosureJob<'_>]) -> DisclosureExecutionMode {
+    select_execution_mode_with_thread_supplier(jobs, available_worker_threads)
 }
 
-#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
-fn select_execution_mode(
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+fn select_execution_mode_with_thread_supplier<F>(
+    jobs: &[DisclosureJob<'_>],
+    available_threads: F,
+) -> DisclosureExecutionMode
+where
+    F: FnOnce() -> usize,
+{
+    select_execution_mode_for_lengths_with_thread_supplier(
+        jobs.len(),
+        jobs.iter().map(|job| job.encoded_disclosure.len()),
+        available_threads,
+    )
+}
+
+#[cfg(all(test, feature = "parallel", target_arch = "x86_64"))]
+fn select_execution_mode_for_lengths<I>(
     disclosure_count: usize,
-    total_encoded_bytes: usize,
+    encoded_lengths: I,
     available_threads: usize,
-) -> DisclosureExecutionMode {
-    if available_threads > 1
-        && disclosure_count >= PARALLEL_MIN_DISCLOSURES
-        && total_encoded_bytes >= PARALLEL_MIN_TOTAL_ENCODED_BYTES
-    {
-        DisclosureExecutionMode::NativeParallel {
-            worker_count: available_threads
-                .min(disclosure_count)
-                .min(MAX_PARALLEL_WORKERS),
-        }
-    } else {
-        DisclosureExecutionMode::Serial
-    }
+) -> DisclosureExecutionMode
+where
+    I: Clone + IntoIterator<Item = usize>,
+{
+    select_execution_mode_for_lengths_with_thread_supplier(
+        disclosure_count,
+        encoded_lengths,
+        || available_threads,
+    )
 }
 
-#[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
-fn select_execution_mode(
-    _disclosure_count: usize,
-    _total_encoded_bytes: usize,
-    _available_threads: usize,
-) -> DisclosureExecutionMode {
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+fn select_execution_mode_for_lengths_with_thread_supplier<I, F>(
+    disclosure_count: usize,
+    encoded_lengths: I,
+    available_threads: F,
+) -> DisclosureExecutionMode
+where
+    I: Clone + IntoIterator<Item = usize>,
+    F: FnOnce() -> usize,
+{
+    if disclosure_count < PARALLEL_MIN_DISCLOSURES {
+        return DisclosureExecutionMode::Serial;
+    }
+
+    let mut observed_count = 0usize;
+    let mut total_encoded_bytes = 0u128;
+
+    for encoded_length in encoded_lengths.clone() {
+        if observed_count == disclosure_count {
+            return DisclosureExecutionMode::Serial;
+        }
+
+        let encoded_length = encoded_length as u128;
+        total_encoded_bytes = total_encoded_bytes.saturating_add(encoded_length);
+        observed_count += 1;
+    }
+
+    if observed_count != disclosure_count {
+        return DisclosureExecutionMode::Serial;
+    }
+
+    if total_encoded_bytes < PARALLEL_MIN_TOTAL_ENCODED_BYTES as u128 {
+        return DisclosureExecutionMode::Serial;
+    }
+
+    let available_threads = available_threads();
+    if available_threads <= 1 {
+        return DisclosureExecutionMode::Serial;
+    }
+
+    let worker_count = available_threads
+        .min(disclosure_count)
+        .min(MAX_PARALLEL_WORKERS);
+    let chunk_size = static_chunk_size(disclosure_count, worker_count);
+    let mut observed_count = 0usize;
+    let mut current_chunk_bytes = 0u128;
+    let mut largest_chunk_bytes = 0u128;
+
+    for encoded_length in encoded_lengths {
+        current_chunk_bytes = current_chunk_bytes.saturating_add(encoded_length as u128);
+        observed_count += 1;
+
+        if observed_count % chunk_size == 0 {
+            largest_chunk_bytes = largest_chunk_bytes.max(current_chunk_bytes);
+            current_chunk_bytes = 0;
+        }
+    }
+    largest_chunk_bytes = largest_chunk_bytes.max(current_chunk_bytes);
+
+    // Match the executor's contiguous count-based chunks. Requiring the
+    // largest chunk to hold at most half the encoded bytes allows an even
+    // two-worker split while rejecting one-dominant and clustered workloads.
+    let half_total_rounded_up = total_encoded_bytes / 2 + total_encoded_bytes % 2;
+    if largest_chunk_bytes > half_total_rounded_up {
+        return DisclosureExecutionMode::Serial;
+    }
+
+    DisclosureExecutionMode::NativeParallel { worker_count }
+}
+
+#[cfg(not(all(feature = "parallel", target_arch = "x86_64")))]
+fn select_execution_mode(_jobs: &[DisclosureJob<'_>]) -> DisclosureExecutionMode {
     DisclosureExecutionMode::Serial
 }
 
@@ -397,6 +477,28 @@ mod tests {
             .collect()
     }
 
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+    fn balanced_lengths(disclosure_count: usize, total_encoded_bytes: usize) -> Vec<usize> {
+        let bytes_per_disclosure = total_encoded_bytes / disclosure_count;
+        let remainder = total_encoded_bytes % disclosure_count;
+
+        (0..disclosure_count)
+            .map(|ordinal| bytes_per_disclosure + usize::from(ordinal < remainder))
+            .collect()
+    }
+
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+    fn mode_for_lengths(
+        encoded_lengths: &[usize],
+        available_threads: usize,
+    ) -> DisclosureExecutionMode {
+        select_execution_mode_for_lengths(
+            encoded_lengths.len(),
+            encoded_lengths.iter().copied(),
+            available_threads,
+        )
+    }
+
     fn assert_invalid_disclosure(error: Error, expected_message: &str) {
         assert_eq!(
             error.to_string(),
@@ -424,7 +526,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
     fn generated_disclosures(count: usize, value_size: usize) -> Vec<String> {
         (0..count)
             .map(|ordinal| {
@@ -439,7 +541,7 @@ mod tests {
             .collect()
     }
 
-    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
     fn deterministic_shuffle<T>(values: &mut [T]) {
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         for upper in (1..values.len()).rev() {
@@ -450,12 +552,12 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
     fn error_signature(error: Error) -> (String, String) {
         (format!("{error:?}"), error.to_string())
     }
 
-    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
     fn assert_parallel_executor_failure(error: Error, expected_message: &str) {
         assert_eq!(
             error.to_string(),
@@ -648,7 +750,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
     #[test]
     fn native_parallel_matches_serial_after_deterministic_completion_shuffle() {
         let disclosures = generated_disclosures(64, 512);
@@ -665,7 +767,7 @@ mod tests {
         assert_eq!(parallel_mappings, serial_mappings);
     }
 
-    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
     #[test]
     fn native_parallel_matches_serial_error_variant_message_and_precedence() {
         for disclosures in [
@@ -698,7 +800,7 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
     #[test]
     fn native_parallel_fails_closed_on_worker_panic_without_item_data() {
         fn panicking_worker<'a>(job: &DisclosureJob<'a>) -> DisclosureOutcome<'a> {
@@ -718,7 +820,7 @@ mod tests {
         assert_parallel_executor_failure(error, PARALLEL_WORKER_FAILURE);
     }
 
-    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
     #[test]
     fn native_parallel_fails_closed_on_spawn_failure_without_item_data() {
         let disclosures = generated_disclosures(8, 64);
@@ -731,39 +833,130 @@ mod tests {
         assert_parallel_executor_failure(error, PARALLEL_SPAWN_FAILURE);
     }
 
-    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
     #[test]
     fn adaptive_policy_uses_documented_cutoffs_and_bounds_workers() {
+        let below_count = balanced_lengths(
+            PARALLEL_MIN_DISCLOSURES - 1,
+            PARALLEL_MIN_TOTAL_ENCODED_BYTES,
+        );
         assert_eq!(
-            select_execution_mode(
-                PARALLEL_MIN_DISCLOSURES - 1,
-                PARALLEL_MIN_TOTAL_ENCODED_BYTES,
-                MAX_PARALLEL_WORKERS,
-            ),
+            mode_for_lengths(&below_count, MAX_PARALLEL_WORKERS),
+            DisclosureExecutionMode::Serial
+        );
+
+        let below_bytes = balanced_lengths(
+            PARALLEL_MIN_DISCLOSURES,
+            PARALLEL_MIN_TOTAL_ENCODED_BYTES - 1,
+        );
+        assert_eq!(
+            mode_for_lengths(&below_bytes, MAX_PARALLEL_WORKERS),
+            DisclosureExecutionMode::Serial
+        );
+
+        let at_cutoffs =
+            balanced_lengths(PARALLEL_MIN_DISCLOSURES, PARALLEL_MIN_TOTAL_ENCODED_BYTES);
+        assert_eq!(
+            mode_for_lengths(&at_cutoffs, 1),
             DisclosureExecutionMode::Serial
         );
         assert_eq!(
-            select_execution_mode(
-                PARALLEL_MIN_DISCLOSURES,
-                PARALLEL_MIN_TOTAL_ENCODED_BYTES - 1,
-                MAX_PARALLEL_WORKERS,
-            ),
+            mode_for_lengths(&at_cutoffs, usize::MAX),
+            DisclosureExecutionMode::NativeParallel {
+                worker_count: MAX_PARALLEL_WORKERS,
+            }
+        );
+    }
+
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+    #[test]
+    fn adaptive_policy_skips_thread_query_until_cheap_gates_pass() {
+        use std::cell::Cell;
+
+        let thread_query_count = Cell::new(0usize);
+        let select = |encoded_lengths: &[usize]| {
+            select_execution_mode_for_lengths_with_thread_supplier(
+                encoded_lengths.len(),
+                encoded_lengths.iter().copied(),
+                || {
+                    thread_query_count.set(thread_query_count.get() + 1);
+                    MAX_PARALLEL_WORKERS
+                },
+            )
+        };
+
+        let below_count = balanced_lengths(
+            PARALLEL_MIN_DISCLOSURES - 1,
+            PARALLEL_MIN_TOTAL_ENCODED_BYTES,
+        );
+        assert_eq!(select(&below_count), DisclosureExecutionMode::Serial);
+        assert_eq!(thread_query_count.get(), 0);
+
+        let below_bytes = balanced_lengths(
+            PARALLEL_MIN_DISCLOSURES,
+            PARALLEL_MIN_TOTAL_ENCODED_BYTES - 1,
+        );
+        assert_eq!(select(&below_bytes), DisclosureExecutionMode::Serial);
+        assert_eq!(thread_query_count.get(), 0);
+
+        let eligible = balanced_lengths(PARALLEL_MIN_DISCLOSURES, PARALLEL_MIN_TOTAL_ENCODED_BYTES);
+        assert_eq!(
+            select(&eligible),
+            DisclosureExecutionMode::NativeParallel {
+                worker_count: MAX_PARALLEL_WORKERS,
+            }
+        );
+        assert_eq!(thread_query_count.get(), 1);
+    }
+
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+    #[test]
+    fn adaptive_policy_rejects_imbalanced_static_chunks() {
+        let balanced_large = vec![64 * 1024; PARALLEL_MIN_DISCLOSURES];
+        assert_eq!(
+            mode_for_lengths(&balanced_large, MAX_PARALLEL_WORKERS),
+            DisclosureExecutionMode::NativeParallel {
+                worker_count: MAX_PARALLEL_WORKERS,
+            }
+        );
+
+        let balanced_mixed: Vec<_> = (0..PARALLEL_MIN_DISCLOSURES)
+            .map(|ordinal| match ordinal % 4 {
+                0 => 64,
+                1 => 1024,
+                _ => 64 * 1024,
+            })
+            .collect();
+        assert_eq!(
+            mode_for_lengths(&balanced_mixed, MAX_PARALLEL_WORKERS),
+            DisclosureExecutionMode::NativeParallel {
+                worker_count: MAX_PARALLEL_WORKERS,
+            }
+        );
+
+        let mut one_dominant = vec![1; PARALLEL_MIN_DISCLOSURES];
+        one_dominant[0] = PARALLEL_MIN_TOTAL_ENCODED_BYTES;
+        assert_eq!(
+            mode_for_lengths(&one_dominant, MAX_PARALLEL_WORKERS),
             DisclosureExecutionMode::Serial
         );
+
+        let mut clustered = vec![1; PARALLEL_MIN_DISCLOSURES];
+        let first_chunk_len = static_chunk_size(PARALLEL_MIN_DISCLOSURES, MAX_PARALLEL_WORKERS);
+        clustered[..first_chunk_len].fill(64 * 1024);
         assert_eq!(
-            select_execution_mode(
-                PARALLEL_MIN_DISCLOSURES,
-                PARALLEL_MIN_TOTAL_ENCODED_BYTES,
-                1,
-            ),
+            mode_for_lengths(&clustered, MAX_PARALLEL_WORKERS),
             DisclosureExecutionMode::Serial
         );
+    }
+
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+    #[test]
+    fn adaptive_policy_byte_accounting_does_not_overflow() {
+        let maximal_lengths = vec![usize::MAX; PARALLEL_MIN_DISCLOSURES];
+
         assert_eq!(
-            select_execution_mode(
-                PARALLEL_MIN_DISCLOSURES,
-                PARALLEL_MIN_TOTAL_ENCODED_BYTES,
-                usize::MAX,
-            ),
+            mode_for_lengths(&maximal_lengths, MAX_PARALLEL_WORKERS),
             DisclosureExecutionMode::NativeParallel {
                 worker_count: MAX_PARALLEL_WORKERS,
             }
@@ -773,17 +966,23 @@ mod tests {
     #[cfg(not(feature = "parallel"))]
     #[test]
     fn feature_off_always_selects_serial_execution() {
+        let disclosures = owned(&[OBJECT_DISCLOSURE, ARRAY_DISCLOSURE]);
+        let jobs = plan_disclosures(&disclosures);
+
         assert_eq!(
-            select_execution_mode(usize::MAX, usize::MAX, usize::MAX),
+            select_execution_mode(&jobs),
             DisclosureExecutionMode::Serial
         );
     }
 
-    #[cfg(all(feature = "parallel", target_arch = "wasm32"))]
+    #[cfg(all(feature = "parallel", not(target_arch = "x86_64")))]
     #[test]
-    fn wasm_parallel_feature_still_selects_serial_execution() {
+    fn unmeasured_architecture_parallel_feature_still_selects_serial_execution() {
+        let disclosures = owned(&[OBJECT_DISCLOSURE, ARRAY_DISCLOSURE]);
+        let jobs = plan_disclosures(&disclosures);
+
         assert_eq!(
-            select_execution_mode(usize::MAX, usize::MAX, usize::MAX),
+            select_execution_mode(&jobs),
             DisclosureExecutionMode::Serial
         );
     }
