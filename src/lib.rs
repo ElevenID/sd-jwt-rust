@@ -321,8 +321,226 @@ impl SDJWTCommon {
 
 #[cfg(test)]
 mod tests {
-    use crate::{utils, SDJWTCommon};
+    use crate::{error::Error, utils, SDJWTCommon};
     use serde_json::json;
+
+    const OBJECT_DISCLOSURE: &str = "WyJzYWx0IiwibmFtZSIseyJyb2xlIjoiYWRtaW4ifV0";
+    const OBJECT_DISCLOSURE_HASH: &str = "UIToslcm0Y9tZh7-6HTCY9UQjI_duhh-wnQtQX9yfqQ";
+    const WHITESPACE_DISCLOSURE: &str = "WyJzYWx0IiwgIm5hbWUiLCB7InJvbGUiOiAiYWRtaW4ifV0";
+    const WHITESPACE_DISCLOSURE_HASH: &str = "heY8-8zXVWlYO5sT5PWM6IQGEGJcyW_aTHm-2D1DgTQ";
+    const ARRAY_DISCLOSURE: &str = "WyJhcnJheS1zYWx0Iiw0Ml0";
+    const ARRAY_DISCLOSURE_HASH: &str = "GiEJkgij2cXW0bIMz3Fwi09P0ZQLSXzQ-1CpxGGfl98";
+    const INVALID_BASE64_DISCLOSURE: &str = "%";
+    const INVALID_BASE64_MESSAGE: &str =
+        "Error decoding disclosure %: invalid input: Invalid byte 37, offset 0.";
+    const INVALID_JSON_DISCLOSURE: &str = "ew";
+    const INVALID_JSON_MESSAGE: &str =
+        "Error parsing disclosure ew: EOF while parsing an object at line 1 column 1";
+
+    fn common_with_disclosures(disclosures: &[&str]) -> SDJWTCommon {
+        SDJWTCommon {
+            input_disclosures: disclosures
+                .iter()
+                .map(|disclosure| (*disclosure).to_owned())
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn assert_invalid_disclosure(error: Error, expected_message: &str) {
+        assert_eq!(
+            error.to_string(),
+            format!("invalid disclosure: {expected_message}")
+        );
+        match error {
+            Error::InvalidDisclosure(message) => assert_eq!(message, expected_message),
+            other => panic!("expected InvalidDisclosure, got {other:?}"),
+        }
+    }
+
+    fn assert_duplicate_disclosure(error: Error) {
+        assert_eq!(
+            error.to_string(),
+            format!("Digest {OBJECT_DISCLOSURE_HASH} appears multiple times")
+        );
+        match error {
+            Error::DuplicateDigestError(digest) => {
+                assert_eq!(digest, OBJECT_DISCLOSURE_HASH)
+            }
+            other => panic!("expected DuplicateDigestError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_hash_mappings_preserves_exact_raw_hash_and_decoded_values() {
+        let mut sdjwt = common_with_disclosures(&[OBJECT_DISCLOSURE, ARRAY_DISCLOSURE]);
+
+        sdjwt.create_hash_mappings().unwrap();
+
+        assert_eq!(sdjwt.hash_to_decoded_disclosure.len(), 2);
+        assert_eq!(sdjwt.hash_to_disclosure.len(), 2);
+        assert_eq!(
+            sdjwt.hash_to_decoded_disclosure.get(OBJECT_DISCLOSURE_HASH),
+            Some(&json!(["salt", "name", { "role": "admin" }]))
+        );
+        assert_eq!(
+            sdjwt.hash_to_decoded_disclosure.get(ARRAY_DISCLOSURE_HASH),
+            Some(&json!(["array-salt", 42]))
+        );
+        assert_eq!(
+            sdjwt
+                .hash_to_disclosure
+                .get(OBJECT_DISCLOSURE_HASH)
+                .map(String::as_str),
+            Some(OBJECT_DISCLOSURE)
+        );
+        assert_eq!(
+            sdjwt
+                .hash_to_disclosure
+                .get(ARRAY_DISCLOSURE_HASH)
+                .map(String::as_str),
+            Some(ARRAY_DISCLOSURE)
+        );
+    }
+
+    #[test]
+    fn create_hash_mappings_hashes_original_encoded_disclosure_bytes() {
+        let mut sdjwt = common_with_disclosures(&[OBJECT_DISCLOSURE, WHITESPACE_DISCLOSURE]);
+
+        sdjwt.create_hash_mappings().unwrap();
+
+        let compact = sdjwt
+            .hash_to_decoded_disclosure
+            .get(OBJECT_DISCLOSURE_HASH)
+            .unwrap();
+        let spaced = sdjwt
+            .hash_to_decoded_disclosure
+            .get(WHITESPACE_DISCLOSURE_HASH)
+            .unwrap();
+        assert_eq!(compact, spaced);
+        assert_ne!(OBJECT_DISCLOSURE, WHITESPACE_DISCLOSURE);
+        assert_ne!(OBJECT_DISCLOSURE_HASH, WHITESPACE_DISCLOSURE_HASH);
+        assert_eq!(
+            sdjwt
+                .hash_to_disclosure
+                .get(OBJECT_DISCLOSURE_HASH)
+                .map(String::as_str),
+            Some(OBJECT_DISCLOSURE)
+        );
+        assert_eq!(
+            sdjwt
+                .hash_to_disclosure
+                .get(WHITESPACE_DISCLOSURE_HASH)
+                .map(String::as_str),
+            Some(WHITESPACE_DISCLOSURE)
+        );
+    }
+
+    #[test]
+    fn create_hash_mappings_reports_invalid_base64_variant_and_message() {
+        let mut sdjwt = common_with_disclosures(&[INVALID_BASE64_DISCLOSURE]);
+
+        let error = sdjwt.create_hash_mappings().unwrap_err();
+
+        assert_invalid_disclosure(error, INVALID_BASE64_MESSAGE);
+    }
+
+    #[test]
+    fn create_hash_mappings_reports_invalid_json_variant_and_message() {
+        let mut sdjwt = common_with_disclosures(&[INVALID_JSON_DISCLOSURE]);
+
+        let error = sdjwt.create_hash_mappings().unwrap_err();
+
+        assert_invalid_disclosure(error, INVALID_JSON_MESSAGE);
+    }
+
+    #[test]
+    fn create_hash_mappings_rejects_duplicate_presented_disclosure() {
+        let mut sdjwt = common_with_disclosures(&[OBJECT_DISCLOSURE, OBJECT_DISCLOSURE]);
+
+        let error = sdjwt.create_hash_mappings().unwrap_err();
+
+        assert_duplicate_disclosure(error);
+    }
+
+    #[test]
+    fn create_hash_mappings_preserves_mixed_fault_input_order() {
+        for (disclosures, expected_message) in [
+            (
+                vec![
+                    INVALID_BASE64_DISCLOSURE,
+                    OBJECT_DISCLOSURE,
+                    OBJECT_DISCLOSURE,
+                ],
+                Some(INVALID_BASE64_MESSAGE),
+            ),
+            (
+                vec![
+                    INVALID_JSON_DISCLOSURE,
+                    OBJECT_DISCLOSURE,
+                    OBJECT_DISCLOSURE,
+                ],
+                Some(INVALID_JSON_MESSAGE),
+            ),
+            (
+                vec![
+                    OBJECT_DISCLOSURE,
+                    OBJECT_DISCLOSURE,
+                    INVALID_BASE64_DISCLOSURE,
+                ],
+                None,
+            ),
+            (
+                vec![
+                    OBJECT_DISCLOSURE,
+                    OBJECT_DISCLOSURE,
+                    INVALID_JSON_DISCLOSURE,
+                ],
+                None,
+            ),
+        ] {
+            let mut sdjwt = common_with_disclosures(&disclosures);
+            let error = sdjwt.create_hash_mappings().unwrap_err();
+
+            if let Some(expected_message) = expected_message {
+                assert_invalid_disclosure(error, expected_message);
+            } else {
+                assert_duplicate_disclosure(error);
+            }
+        }
+    }
+
+    #[test]
+    fn create_hash_mappings_clears_stale_mappings_for_empty_input() {
+        let mut sdjwt = SDJWTCommon::default();
+        sdjwt
+            .hash_to_decoded_disclosure
+            .insert("stale".to_owned(), json!(["stale"]));
+        sdjwt
+            .hash_to_disclosure
+            .insert("stale".to_owned(), "stale".to_owned());
+
+        sdjwt.create_hash_mappings().unwrap();
+
+        assert!(sdjwt.hash_to_decoded_disclosure.is_empty());
+        assert!(sdjwt.hash_to_disclosure.is_empty());
+        assert!(sdjwt.input_disclosures.is_empty());
+    }
+
+    #[test]
+    fn create_hash_mappings_does_not_mutate_input_on_success_or_failure() {
+        for disclosures in [
+            vec![OBJECT_DISCLOSURE, ARRAY_DISCLOSURE],
+            vec![OBJECT_DISCLOSURE, INVALID_JSON_DISCLOSURE],
+        ] {
+            let mut sdjwt = common_with_disclosures(&disclosures);
+            let original = sdjwt.input_disclosures.clone();
+
+            let _ = sdjwt.create_hash_mappings();
+
+            assert_eq!(sdjwt.input_disclosures, original);
+        }
+    }
 
     #[test]
     fn test_parse_compact_sd_jwt() {
