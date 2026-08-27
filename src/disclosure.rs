@@ -88,6 +88,8 @@ mod tests {
 
     #[test]
     fn test_sdjwt_disclosure_when_key_is_none() {
+        #[cfg(feature = "mock_salts")]
+        let _mock_salt_guard = crate::utils::seed_mock_salts_for_test();
         let sdjwt_disclosure = SDJWTDisclosure::new(None, "test");
         let decoded_disclosure: String =
             String::from_utf8(base64url_decode(&sdjwt_disclosure.raw_b64).unwrap()).unwrap();
@@ -98,6 +100,8 @@ mod tests {
 
     #[test]
     fn test_sdjwt_disclosure_when_key_is_present() {
+        #[cfg(feature = "mock_salts")]
+        let _mock_salt_guard = crate::utils::seed_mock_salts_for_test();
         let sdjwt_disclosure = SDJWTDisclosure::new(Some("key".to_string()), "test");
         let decoded =
             String::from_utf8(base64url_decode(&sdjwt_disclosure.raw_b64).unwrap()).unwrap();
