@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::error::Error;
-use crate::utils::{base64_hash, base64url_decode, jwt_payload_decode};
+use crate::utils::{base64url_decode, jwt_payload_decode};
 
 use error::Result;
 use jsonwebtoken::{Algorithm, DecodingKey, Header, Validation};
@@ -20,6 +20,7 @@ pub use {
 pub type KeyResolver = dyn Fn(&str, &Header) -> DecodingKey;
 
 mod disclosure;
+mod disclosure_preprocessing;
 pub mod error;
 pub mod holder;
 pub mod issuer;
@@ -133,30 +134,9 @@ impl SDJWTCommon {
         self.hash_to_decoded_disclosure = HashMap::new();
         self.hash_to_disclosure = HashMap::new();
 
-        for disclosure in &self.input_disclosures {
-            let decoded_disclosure = base64url_decode(disclosure).map_err(|err| {
-                Error::InvalidDisclosure(format!(
-                    "Error decoding disclosure {}: {}",
-                    disclosure, err
-                ))
-            })?;
-            let decoded_disclosure: Value =
-                serde_json::from_slice(&decoded_disclosure).map_err(|err| {
-                    Error::InvalidDisclosure(format!(
-                        "Error parsing disclosure {}: {}",
-                        disclosure, err
-                    ))
-                })?;
-
-            let hash = base64_hash(disclosure.as_bytes());
-            if self.hash_to_decoded_disclosure.contains_key(&hash) {
-                return Err(Error::DuplicateDigestError(hash));
-            }
-            self.hash_to_decoded_disclosure
-                .insert(hash.clone(), decoded_disclosure);
-            self.hash_to_disclosure
-                .insert(hash.clone(), disclosure.to_owned());
-        }
+        let mappings = disclosure_preprocessing::preprocess_disclosures(&self.input_disclosures)?;
+        self.hash_to_decoded_disclosure = mappings.hash_to_decoded_disclosure;
+        self.hash_to_disclosure = mappings.hash_to_disclosure;
 
         Ok(())
     }
@@ -548,6 +528,17 @@ mod tests {
 
             assert_eq!(sdjwt.input_disclosures, original);
         }
+    }
+
+    #[test]
+    fn create_hash_mappings_does_not_publish_partial_mappings_on_failure() {
+        let mut sdjwt = common_with_disclosures(&[OBJECT_DISCLOSURE, INVALID_JSON_DISCLOSURE]);
+
+        let error = sdjwt.create_hash_mappings().unwrap_err();
+
+        assert_invalid_disclosure(error, INVALID_JSON_MESSAGE);
+        assert!(sdjwt.hash_to_decoded_disclosure.is_empty());
+        assert!(sdjwt.hash_to_disclosure.is_empty());
     }
 
     #[test]
