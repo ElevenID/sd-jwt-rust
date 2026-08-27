@@ -173,6 +173,7 @@ impl DisclosureExecutor for NativeParallelDisclosureExecutor {
 pub(super) struct DisclosureMappings {
     pub(super) hash_to_decoded_disclosure: HashMap<String, Value>,
     pub(super) hash_to_disclosure: HashMap<String, String>,
+    pub(super) ordered_disclosure_digests: Vec<String>,
 }
 
 pub(super) fn preprocess_disclosures(encoded_disclosures: &[String]) -> Result<DisclosureMappings> {
@@ -284,6 +285,7 @@ fn assemble_disclosures<'a>(
 
     let mut hash_to_decoded_disclosure = HashMap::with_capacity(jobs.len());
     let mut hash_to_disclosure = HashMap::with_capacity(jobs.len());
+    let mut ordered_disclosure_digests = Vec::with_capacity(jobs.len());
 
     for outcome in outcomes {
         let processed = outcome.result?;
@@ -295,12 +297,14 @@ fn assemble_disclosures<'a>(
             processed.digest.clone(),
             outcome.encoded_disclosure.to_owned(),
         );
+        ordered_disclosure_digests.push(processed.digest.clone());
         hash_to_decoded_disclosure.insert(processed.digest, processed.decoded_disclosure);
     }
 
     Ok(DisclosureMappings {
         hash_to_decoded_disclosure,
         hash_to_disclosure,
+        ordered_disclosure_digests,
     })
 }
 
@@ -378,6 +382,7 @@ mod tests {
     const ARRAY_DISCLOSURE: &str = "WyJhcnJheS1zYWx0Iiw0Ml0";
     const ARRAY_DISCLOSURE_HASH: &str = "GiEJkgij2cXW0bIMz3Fwi09P0ZQLSXzQ-1CpxGGfl98";
     const WHITESPACE_DISCLOSURE: &str = "WyJzYWx0IiwgIm5hbWUiLCB7InJvbGUiOiAiYWRtaW4ifV0";
+    const WHITESPACE_DISCLOSURE_HASH: &str = "heY8-8zXVWlYO5sT5PWM6IQGEGJcyW_aTHm-2D1DgTQ";
     const INVALID_BASE64_DISCLOSURE: &str = "%";
     const INVALID_BASE64_MESSAGE: &str =
         "Error decoding disclosure %: invalid input: Invalid byte 37, offset 0.";
@@ -508,6 +513,14 @@ mod tests {
 
         assert_eq!(mappings.hash_to_decoded_disclosure.len(), 3);
         assert_eq!(mappings.hash_to_disclosure.len(), 3);
+        assert_eq!(
+            mappings.ordered_disclosure_digests,
+            [
+                OBJECT_DISCLOSURE_HASH,
+                ARRAY_DISCLOSURE_HASH,
+                WHITESPACE_DISCLOSURE_HASH,
+            ]
+        );
         assert_eq!(
             mappings
                 .hash_to_disclosure
