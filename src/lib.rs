@@ -467,6 +467,14 @@ mod tests {
     fn create_hash_mappings_preserves_mixed_fault_input_order() {
         for (disclosures, expected_message) in [
             (
+                vec![INVALID_BASE64_DISCLOSURE, INVALID_JSON_DISCLOSURE],
+                Some(INVALID_BASE64_MESSAGE),
+            ),
+            (
+                vec![INVALID_JSON_DISCLOSURE, INVALID_BASE64_DISCLOSURE],
+                Some(INVALID_JSON_MESSAGE),
+            ),
+            (
                 vec![
                     INVALID_BASE64_DISCLOSURE,
                     OBJECT_DISCLOSURE,
