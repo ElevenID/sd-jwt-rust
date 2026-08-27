@@ -12,6 +12,7 @@ homepage = "https://github.com/openwallet-foundation-labs/sd-jwt-rust"
 
 [features]
 mock_salts = ["lazy_static"]
+parallel = []
 
 [dependencies]
 base64 = "0.21"
