@@ -169,6 +169,9 @@ impl SDJWTIssuer {
         serialization_format: SDJWTSerializationFormat,
         // extra_header_parameters: Option<HashMap<String, String>>,
     ) -> Result<String> {
+        #[cfg(all(feature = "mock_salts", test))]
+        let _mock_salt_guard = crate::utils::seed_mock_salts_for_test();
+
         let inner = SDJWTCommon {
             serialization_format,
             ..Default::default()

@@ -19,8 +19,31 @@ use sd_jwt_rs::{
 use sd_jwt_rs::{COMBINED_SERIALIZATION_FORMAT_SEPARATOR, DEFAULT_SIGNING_ALG};
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
+#[cfg(feature = "mock_salts")]
+use std::sync::{Mutex, MutexGuard};
+
+#[cfg(feature = "mock_salts")]
+use sd_jwt_rs::utils::SALTS;
 
 mod utils;
+
+#[cfg(feature = "mock_salts")]
+static MOCK_SALT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(feature = "mock_salts")]
+fn seed_mock_salts() -> MutexGuard<'static, ()> {
+    let guard = MOCK_SALT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    {
+        let mut salts = SALTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        salts.clear();
+        salts.extend((0..4096).map(|ordinal| format!("test-salt-{ordinal:04}")));
+    }
+    guard
+}
 
 #[fixture]
 fn issuer_key() -> EncodingKey {
@@ -317,6 +340,9 @@ fn demo_positive_cases(
     #[values(None, Some(DEFAULT_SIGNING_ALG.to_owned()))] sign_algo: Option<String>,
     #[values(true, false)] add_decoy: bool,
 ) {
+    #[cfg(feature = "mock_salts")]
+    let _mock_salt_guard = seed_mock_salts();
+
     let (user_claims, strategy, holder_disclosed_claims, number_of_revealed_sds) = data;
     let (nonce, aud, holder_key, holder_jwk) = presentation_metadata;
     // Issuer issues SD-JWT
