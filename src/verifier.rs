@@ -261,8 +261,9 @@ impl SDJWTVerifier {
         // `duplicate_hash_check` accumulates every digest encountered during
         // the recursive unpack, so any disclosure whose hash is absent from
         // that list is unreferenced.
-        for disclosure_hash in self.sd_jwt_engine.hash_to_decoded_disclosure.keys() {
-            if !self.duplicate_hash_check.contains(disclosure_hash) {
+        for disclosure in &self.sd_jwt_engine.input_disclosures {
+            let disclosure_hash = base64_hash(disclosure.as_bytes());
+            if !self.duplicate_hash_check.contains(&disclosure_hash) {
                 return Err(Error::InvalidDisclosure(format!(
                     "Disclosure was not referenced by any digest in the SD-JWT: {}",
                     disclosure_hash
@@ -747,6 +748,62 @@ mod tests {
                 "family_name": "Miller",
                 "given_name": "Erika",
             })
+        );
+    }
+
+    #[test]
+    fn unreferenced_disclosure_error_follows_presentation_order() {
+        let (first, first_digest) = encoded_disclosure(&json!(["salt-a", "first_claim", "first"]));
+        let (second, second_digest) =
+            encoded_disclosure(&json!(["salt-b", "second_claim", "second"]));
+        let payload = json!({
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "_sd_alg": "sha-256",
+        });
+
+        for (disclosures, expected_digest) in [
+            (vec![first.clone(), second.clone()], first_digest.clone()),
+            (vec![second, first], second_digest),
+        ] {
+            let error = compact_verification_error(compact_presentation(&payload, &disclosures));
+            let expected_message = format!(
+                "Disclosure was not referenced by any digest in the SD-JWT: {expected_digest}"
+            );
+
+            match &error {
+                Error::InvalidDisclosure(message) => assert_eq!(message, &expected_message),
+                other => panic!("expected InvalidDisclosure, got {other:?}"),
+            }
+            assert_eq!(
+                error.to_string(),
+                format!("invalid disclosure: {expected_message}")
+            );
+        }
+    }
+
+    #[test]
+    fn reconstruction_error_precedes_unreferenced_disclosure_selection() {
+        let (unreferenced, _) = encoded_disclosure(&json!(["extra-salt", "extra_claim", "extra"]));
+        let (scalar, scalar_digest) = encoded_disclosure(&json!("not-an-array"));
+        let payload = json!({
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "_sd_alg": "sha-256",
+            "_sd": [scalar_digest],
+        });
+
+        let error =
+            compact_verification_error(compact_presentation(&payload, &[unreferenced, scalar]));
+        match &error {
+            Error::InvalidArrayDisclosureObject(actual) => {
+                assert_eq!(actual, "\"not-an-array\"")
+            }
+            other => panic!("expected InvalidArrayDisclosureObject, got {other:?}"),
+        }
+        assert_eq!(
+            error.to_string(),
+            "invalid array disclosure: \"not-an-array\""
         );
     }
 
