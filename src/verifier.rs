@@ -442,8 +442,9 @@ impl SDJWTVerifier {
 
 #[cfg(test)]
 mod tests {
+    use crate::error::Error;
     use crate::issuer::ClaimsForSelectiveDisclosureStrategy;
-    use crate::utils::{base64url_decode, base64url_encode};
+    use crate::utils::{base64_hash, base64url_decode, base64url_encode};
     use crate::{
         SDJWTFlattenedJson, SDJWTGeneralJson, SDJWTHolder, SDJWTIssuer, SDJWTSerializationFormat,
         SDJWTVerifier, COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
@@ -467,6 +468,287 @@ mod tests {
         "kty": "OKP",
         "x": "24QLWXJ18wtbg3k_MDGhGM17Xh39UftuxbwJZzRLzkA"
     }"#;
+
+    fn compact_presentation(payload: &Value, disclosures: &[String]) -> String {
+        let issuer_key = EncodingKey::from_ec_pem(PRIVATE_ISSUER_PEM.as_bytes()).unwrap();
+        let signed =
+            jsonwebtoken::encode(&Header::new(Algorithm::ES256), payload, &issuer_key).unwrap();
+        let mut parts = Vec::with_capacity(disclosures.len() + 1);
+        parts.push(signed);
+        parts.extend(disclosures.iter().cloned());
+        format!(
+            "{}{}",
+            parts.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR),
+            COMBINED_SERIALIZATION_FORMAT_SEPARATOR
+        )
+    }
+
+    fn corrupt_compact_signature(presentation: &str) -> String {
+        let (signed, disclosures) = presentation
+            .split_once(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
+            .expect("compact test presentation must contain a separator");
+        let mut jwt_parts = signed.split('.');
+        let protected = jwt_parts.next().unwrap();
+        let payload = jwt_parts.next().unwrap();
+        assert!(jwt_parts.next().is_some());
+        assert!(jwt_parts.next().is_none());
+        format!("{protected}.{payload}.AA~{disclosures}")
+    }
+
+    fn encoded_disclosure(value: &Value) -> (String, String) {
+        let encoded = base64url_encode(&serde_json::to_vec(value).unwrap());
+        let digest = base64_hash(encoded.as_bytes());
+        (encoded, digest)
+    }
+
+    fn verify_compact(presentation: String) -> crate::error::Result<SDJWTVerifier> {
+        SDJWTVerifier::new(
+            presentation,
+            Box::new(|_, _| DecodingKey::from_ec_pem(PUBLIC_ISSUER_PEM.as_bytes()).unwrap()),
+            None,
+            None,
+            SDJWTSerializationFormat::Compact,
+        )
+    }
+
+    fn compact_verification_error(presentation: String) -> Error {
+        match verify_compact(presentation) {
+            Ok(_) => panic!("verifier unexpectedly accepted the test presentation"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn duplicate_referenced_digest_is_rejected_when_disclosure_is_present_or_absent() {
+        let (disclosure, digest) = encoded_disclosure(&json!(["salt", "family_name", "Miller"]));
+
+        for disclosures in [vec![disclosure], Vec::new()] {
+            let payload = json!({
+                "iss": "https://example.com/issuer",
+                "iat": 1683000000,
+                "_sd_alg": "sha-256",
+                "_sd": [digest, digest],
+            });
+            let error = compact_verification_error(compact_presentation(&payload, &disclosures));
+
+            match &error {
+                Error::DuplicateDigestError(actual) => assert_eq!(actual, &digest),
+                other => panic!("expected DuplicateDigestError, got {other:?}"),
+            }
+            assert_eq!(
+                error.to_string(),
+                format!("Digest {digest} appears multiple times")
+            );
+        }
+    }
+
+    #[test]
+    fn disclosed_claim_cannot_replace_a_visible_claim() {
+        let (disclosure, digest) = encoded_disclosure(&json!(["salt", "family_name", "Disclosed"]));
+        let payload = json!({
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "family_name": "Visible",
+            "_sd_alg": "sha-256",
+            "_sd": [digest],
+        });
+
+        let error = compact_verification_error(compact_presentation(&payload, &[disclosure]));
+        match &error {
+            Error::DuplicateKeyError(key) => assert_eq!(key, "family_name"),
+            other => panic!("expected DuplicateKeyError, got {other:?}"),
+        }
+        assert_eq!(error.to_string(), "Key family_name appears multiple times");
+    }
+
+    #[test]
+    fn two_disclosures_cannot_create_the_same_claim_name() {
+        let (first, first_digest) = encoded_disclosure(&json!(["salt-a", "family_name", "First"]));
+        let (second, second_digest) =
+            encoded_disclosure(&json!(["salt-b", "family_name", "Second"]));
+        let payload = json!({
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "_sd_alg": "sha-256",
+            "_sd": [first_digest, second_digest],
+        });
+
+        let error = compact_verification_error(compact_presentation(&payload, &[first, second]));
+        match &error {
+            Error::DuplicateKeyError(key) => assert_eq!(key, "family_name"),
+            other => panic!("expected DuplicateKeyError, got {other:?}"),
+        }
+        assert_eq!(error.to_string(), "Key family_name appears multiple times");
+    }
+
+    #[test]
+    fn non_string_digest_and_disclosed_name_keep_conversion_error_contract() {
+        let non_string_digest_payload = json!({
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "_sd_alg": "sha-256",
+            "_sd": [42],
+        });
+        let error =
+            compact_verification_error(compact_presentation(&non_string_digest_payload, &[]));
+        assert!(matches!(&error, Error::ConversionError(target) if target == "str"));
+        assert_eq!(error.to_string(), "conversion error: Cannot convert to str");
+
+        let (disclosure, digest) = encoded_disclosure(&json!(["salt", 42, "not-a-named-claim"]));
+        let non_string_name_payload = json!({
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "_sd_alg": "sha-256",
+            "_sd": [digest],
+        });
+        let error = compact_verification_error(compact_presentation(
+            &non_string_name_payload,
+            &[disclosure],
+        ));
+        assert!(matches!(&error, Error::ConversionError(target) if target == "str"));
+        assert_eq!(error.to_string(), "conversion error: Cannot convert to str");
+    }
+
+    #[test]
+    fn scalar_and_object_disclosures_keep_invalid_array_error_contract() {
+        for decoded in [json!("scalar disclosure"), json!({"salt": "value"})] {
+            let (disclosure, digest) = encoded_disclosure(&decoded);
+            let payload = json!({
+                "iss": "https://example.com/issuer",
+                "iat": 1683000000,
+                "_sd_alg": "sha-256",
+                "_sd": [digest],
+            });
+
+            let error = compact_verification_error(compact_presentation(&payload, &[disclosure]));
+            match &error {
+                Error::InvalidArrayDisclosureObject(actual) => {
+                    assert_eq!(actual, &decoded.to_string())
+                }
+                other => panic!("expected InvalidArrayDisclosureObject, got {other:?}"),
+            }
+            assert_eq!(
+                error.to_string(),
+                format!("invalid array disclosure: {decoded}")
+            );
+        }
+    }
+
+    #[test]
+    fn missing_object_and_array_disclosures_are_accepted_as_decoys() {
+        let payload = json!({
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "_sd_alg": "sha-256",
+            "_sd": ["missing-object-disclosure"],
+            "items": [{"...": "missing-array-disclosure"}],
+        });
+
+        let verifier = verify_compact(compact_presentation(&payload, &[])).unwrap();
+        assert_eq!(
+            verifier.verified_claims,
+            json!({
+                "iss": "https://example.com/issuer",
+                "iat": 1683000000,
+                "items": [],
+            })
+        );
+    }
+
+    #[test]
+    fn verifier_error_precedence_is_preprocessing_then_signature_then_reconstruction() {
+        let (scalar_disclosure, digest) = encoded_disclosure(&json!("not-an-array"));
+        let payload = json!({
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "_sd_alg": "sha-256",
+            "_sd": [digest],
+        });
+        let valid = compact_presentation(&payload, std::slice::from_ref(&scalar_disclosure));
+        let invalid_signature = corrupt_compact_signature(&valid);
+
+        let malformed_disclosure = "%".to_string();
+        let malformed_and_invalid_signature = corrupt_compact_signature(&compact_presentation(
+            &payload,
+            &[malformed_disclosure.clone(), scalar_disclosure],
+        ));
+        let preprocessing_error = compact_verification_error(malformed_and_invalid_signature);
+        match &preprocessing_error {
+            Error::InvalidDisclosure(message) => assert!(
+                message.starts_with(&format!(
+                    "Error decoding disclosure {malformed_disclosure}:"
+                )),
+                "unexpected preprocessing message: {message}"
+            ),
+            other => panic!("expected InvalidDisclosure, got {other:?}"),
+        }
+        assert!(
+            preprocessing_error
+                .to_string()
+                .starts_with("invalid disclosure: Error decoding disclosure %:"),
+            "unexpected preprocessing error: {preprocessing_error}"
+        );
+
+        let signature_error = compact_verification_error(invalid_signature);
+        match &signature_error {
+            Error::DeserializationError(message) => assert!(
+                message.starts_with("Cannot decode jwt:"),
+                "unexpected signature message: {message}"
+            ),
+            other => panic!("expected DeserializationError, got {other:?}"),
+        }
+        assert!(
+            signature_error
+                .to_string()
+                .starts_with("invalid input: Cannot decode jwt:"),
+            "unexpected signature error: {signature_error}"
+        );
+
+        let reconstruction_error = compact_verification_error(valid);
+        match &reconstruction_error {
+            Error::InvalidArrayDisclosureObject(actual) => {
+                assert_eq!(actual, "\"not-an-array\"")
+            }
+            other => panic!("expected InvalidArrayDisclosureObject, got {other:?}"),
+        }
+        assert_eq!(
+            reconstruction_error.to_string(),
+            "invalid array disclosure: \"not-an-array\""
+        );
+    }
+
+    #[test]
+    fn disclosure_presentation_order_does_not_change_reconstructed_claims_without_kb_jwt() {
+        let (family_name, family_name_digest) =
+            encoded_disclosure(&json!(["salt-a", "family_name", "Miller"]));
+        let (given_name, given_name_digest) =
+            encoded_disclosure(&json!(["salt-b", "given_name", "Erika"]));
+        let payload = json!({
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "_sd_alg": "sha-256",
+            "_sd": [family_name_digest, given_name_digest],
+        });
+
+        let forward = verify_compact(compact_presentation(
+            &payload,
+            &[family_name.clone(), given_name.clone()],
+        ))
+        .unwrap();
+        let reversed =
+            verify_compact(compact_presentation(&payload, &[given_name, family_name])).unwrap();
+
+        assert_eq!(forward.verified_claims, reversed.verified_claims);
+        assert_eq!(
+            forward.verified_claims,
+            json!({
+                "iss": "https://example.com/issuer",
+                "iat": 1683000000,
+                "family_name": "Miller",
+                "given_name": "Erika",
+            })
+        );
+    }
 
     #[test]
     fn reject_sd_jwt_with_nested_sd_alg() {
