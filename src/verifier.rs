@@ -8,6 +8,7 @@ use crate::SDJWTSerializationFormat;
 use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde_json::{Map, Value};
+use std::collections::HashSet;
 use std::ops::Add;
 use std::option::Option;
 use std::str::FromStr;
@@ -26,7 +27,7 @@ pub struct SDJWTVerifier {
 
     sd_jwt_payload: Map<String, Value>,
     _holder_public_key_payload: Option<Map<String, Value>>,
-    duplicate_hash_check: Vec<String>,
+    duplicate_hash_check: HashSet<String>,
     pub verified_claims: Value,
 
     cb_get_issuer_key: Box<KeyResolver>,
@@ -54,7 +55,7 @@ impl SDJWTVerifier {
         let mut verifier = SDJWTVerifier {
             sd_jwt_payload: serde_json::Map::new(),
             _holder_public_key_payload: None,
-            duplicate_hash_check: Vec::new(),
+            duplicate_hash_check: HashSet::new(),
             cb_get_issuer_key,
             sd_jwt_engine: SDJWTCommon {
                 serialization_format,
@@ -250,7 +251,8 @@ impl SDJWTVerifier {
             Self::reject_nested_sd_alg(value)?;
         }
 
-        self.duplicate_hash_check = Vec::new();
+        self.duplicate_hash_check =
+            HashSet::with_capacity(self.sd_jwt_engine.input_disclosures.len());
         let claims: Value = self.sd_jwt_payload.clone().into_iter().collect();
         let unpacked = self.unpack_disclosed_claims(&claims)?;
 
@@ -259,10 +261,10 @@ impl SDJWTVerifier {
         // recursively via other Disclosures), the SD-JWT MUST be rejected.
         // `duplicate_hash_check` accumulates every digest encountered during
         // the recursive unpack, so any disclosure whose hash is absent from
-        // that list is unreferenced.
+        // that set is unreferenced.
         for disclosure in &self.sd_jwt_engine.input_disclosures {
             let disclosure_hash = base64_hash(disclosure.as_bytes());
-            if !self.duplicate_hash_check.contains(&disclosure_hash) {
+            if !self.duplicate_hash_check.contains(disclosure_hash.as_str()) {
                 return Err(Error::InvalidDisclosure(format!(
                     "Disclosure was not referenced by any digest in the SD-JWT: {}",
                     disclosure_hash
@@ -287,6 +289,14 @@ impl SDJWTVerifier {
             Value::Array(arr) => arr.iter().try_for_each(Self::reject_nested_sd_alg),
             _ => Ok(()),
         }
+    }
+
+    fn record_digest(&mut self, digest: &str) -> Result<()> {
+        if self.duplicate_hash_check.contains(digest) {
+            return Err(Error::DuplicateDigestError(digest.to_owned()));
+        }
+        self.duplicate_hash_check.insert(digest.to_owned());
+        Ok(())
     }
 
     fn unpack_disclosed_claims(&mut self, sd_jwt_claims: &Value) -> Result<Value> {
@@ -362,10 +372,7 @@ impl SDJWTVerifier {
             let digest = digest
                 .as_str()
                 .ok_or(Error::ConversionError("str".to_string()))?;
-            if self.duplicate_hash_check.contains(&digest.to_string()) {
-                return Err(Error::DuplicateDigestError(digest.to_string()));
-            }
-            self.duplicate_hash_check.push(digest.to_string());
+            self.record_digest(digest)?;
 
             if let Some(value_for_digest) =
                 self.sd_jwt_engine.hash_to_decoded_disclosure.get(digest)
@@ -408,10 +415,7 @@ impl SDJWTVerifier {
         let digest = digest
             .as_str()
             .ok_or(Error::ConversionError("str".to_string()))?;
-        if self.duplicate_hash_check.contains(&digest.to_string()) {
-            return Err(Error::DuplicateDigestError(digest.to_string()));
-        }
-        self.duplicate_hash_check.push(digest.to_string());
+        self.record_digest(digest)?;
 
         if let Some(value_for_digest) = self.sd_jwt_engine.hash_to_decoded_disclosure.get(digest) {
             let disclosure =
