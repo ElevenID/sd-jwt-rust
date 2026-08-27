@@ -7,7 +7,6 @@ use crate::error::Result;
 use crate::SDJWTSerializationFormat;
 use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
-use log::debug;
 use serde_json::{Map, Value};
 use std::ops::Add;
 use std::option::Option;
@@ -399,8 +398,6 @@ impl SDJWTVerifier {
                 }
                 let unpacked_value = self.unpack_disclosed_claims(&value)?;
                 pre_output.insert(key, unpacked_value);
-            } else {
-                debug!("Digest {:?} skipped as decoy", digest)
             }
         }
 
@@ -433,8 +430,6 @@ impl SDJWTVerifier {
             let value = disclosure[1].clone();
             let unpacked_value = self.unpack_disclosed_claims(&value)?;
             return Ok(Some(unpacked_value));
-        } else {
-            debug!("Digest {:?} skipped as decoy", digest)
         }
 
         Ok(None)
