@@ -22,6 +22,9 @@ use crate::{
     SD_LIST_PREFIX,
 };
 
+const DISCLOSURE_PREPROCESSING_STATE_FAILURE: &str =
+    "Disclosure preprocessing state is inconsistent";
+
 pub struct SDJWTVerifier {
     sd_jwt_engine: SDJWTCommon,
 
@@ -256,14 +259,21 @@ impl SDJWTVerifier {
         let claims: Value = self.sd_jwt_payload.clone().into_iter().collect();
         let unpacked = self.unpack_disclosed_claims(&claims)?;
 
+        if self.sd_jwt_engine.ordered_disclosure_digests.len()
+            != self.sd_jwt_engine.input_disclosures.len()
+        {
+            return Err(Error::InvalidState(
+                DISCLOSURE_PREPROCESSING_STATE_FAILURE.to_owned(),
+            ));
+        }
+
         // Draft-07 section 8.1 step 5: if any presented Disclosure was not
         // referenced by digest value in the Issuer-signed JWT (directly or
         // recursively via other Disclosures), the SD-JWT MUST be rejected.
         // `duplicate_hash_check` accumulates every digest encountered during
         // the recursive unpack, so any disclosure whose hash is absent from
         // that set is unreferenced.
-        for disclosure in &self.sd_jwt_engine.input_disclosures {
-            let disclosure_hash = base64_hash(disclosure.as_bytes());
+        for disclosure_hash in &self.sd_jwt_engine.ordered_disclosure_digests {
             if !self.duplicate_hash_check.contains(disclosure_hash.as_str()) {
                 return Err(Error::InvalidDisclosure(format!(
                     "Disclosure was not referenced by any digest in the SD-JWT: {}",
@@ -778,6 +788,37 @@ mod tests {
                 error.to_string(),
                 format!("invalid disclosure: {expected_message}")
             );
+        }
+    }
+
+    #[test]
+    fn inconsistent_preprocessed_digest_cardinality_fails_closed_without_item_data() {
+        let (disclosure, digest) = encoded_disclosure(&json!(["salt", "family_name", "Miller"]));
+        let payload = json!({
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "_sd_alg": "sha-256",
+            "_sd": [digest],
+        });
+        let presentation = compact_presentation(&payload, std::slice::from_ref(&disclosure));
+
+        for retained_digests in [Vec::new(), vec![digest.clone(), digest.clone()]] {
+            let mut verifier = verify_compact(presentation.clone()).unwrap();
+            verifier.sd_jwt_engine.ordered_disclosure_digests = retained_digests;
+
+            let error = verifier.extract_sd_claims().unwrap_err();
+            match &error {
+                Error::InvalidState(message) => {
+                    assert_eq!(message, super::DISCLOSURE_PREPROCESSING_STATE_FAILURE)
+                }
+                other => panic!("expected InvalidState, got {other:?}"),
+            }
+            assert_eq!(
+                error.to_string(),
+                "invalid state: Disclosure preprocessing state is inconsistent"
+            );
+            assert!(!error.to_string().contains(&digest));
+            assert!(!error.to_string().contains(&disclosure));
         }
     }
 

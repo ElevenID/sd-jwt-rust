@@ -68,6 +68,7 @@ pub(crate) struct SDJWTCommon {
     hash_to_decoded_disclosure: HashMap<String, Value>,
     hash_to_disclosure: HashMap<String, String>,
     input_disclosures: Vec<String>,
+    ordered_disclosure_digests: Vec<String>,
     sign_alg: Option<String>,
 }
 
@@ -133,10 +134,12 @@ impl SDJWTCommon {
     fn create_hash_mappings(&mut self) -> Result<()> {
         self.hash_to_decoded_disclosure = HashMap::new();
         self.hash_to_disclosure = HashMap::new();
+        self.ordered_disclosure_digests = Vec::new();
 
         let mappings = disclosure_preprocessing::preprocess_disclosures(&self.input_disclosures)?;
         self.hash_to_decoded_disclosure = mappings.hash_to_decoded_disclosure;
         self.hash_to_disclosure = mappings.hash_to_disclosure;
+        self.ordered_disclosure_digests = mappings.ordered_disclosure_digests;
 
         Ok(())
     }
@@ -360,6 +363,10 @@ mod tests {
         assert_eq!(sdjwt.hash_to_decoded_disclosure.len(), 2);
         assert_eq!(sdjwt.hash_to_disclosure.len(), 2);
         assert_eq!(
+            sdjwt.ordered_disclosure_digests,
+            [OBJECT_DISCLOSURE_HASH, ARRAY_DISCLOSURE_HASH]
+        );
+        assert_eq!(
             sdjwt.hash_to_decoded_disclosure.get(OBJECT_DISCLOSURE_HASH),
             Some(&json!(["salt", "name", { "role": "admin" }]))
         );
@@ -507,11 +514,13 @@ mod tests {
         sdjwt
             .hash_to_disclosure
             .insert("stale".to_owned(), "stale".to_owned());
+        sdjwt.ordered_disclosure_digests.push("stale".to_owned());
 
         sdjwt.create_hash_mappings().unwrap();
 
         assert!(sdjwt.hash_to_decoded_disclosure.is_empty());
         assert!(sdjwt.hash_to_disclosure.is_empty());
+        assert!(sdjwt.ordered_disclosure_digests.is_empty());
         assert!(sdjwt.input_disclosures.is_empty());
     }
 
@@ -539,6 +548,7 @@ mod tests {
         assert_invalid_disclosure(error, INVALID_JSON_MESSAGE);
         assert!(sdjwt.hash_to_decoded_disclosure.is_empty());
         assert!(sdjwt.hash_to_disclosure.is_empty());
+        assert!(sdjwt.ordered_disclosure_digests.is_empty());
     }
 
     #[test]
