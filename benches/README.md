@@ -34,15 +34,20 @@ PowerShell:
 ```powershell
 $featureWorktree = git rev-parse --show-toplevel
 $baselineWorktree = "C:\tmp\sd-jwt-verification-baseline"
-$baseCommit = "origin/main"
-$harnessCommit = "<full 40-character SHA of the benchmark-only harness commit>"
+$baseCommit = "88587cb23a814e5c6271bb781235f8f29027020b"
+$harnessCommit = "99756cbc682f5b9874834255f20a32618ff0e57e"
 $oldCriterionHome = [Environment]::GetEnvironmentVariable("CRITERION_HOME", "Process")
 $oldCargoTargetDir = [Environment]::GetEnvironmentVariable("CARGO_TARGET_DIR", "Process")
 $baselineAdded = $false
 
+if ($baseCommit -notmatch '^[0-9a-fA-F]{40}$') {
+    throw "Set baseCommit to the exact full baseline commit SHA"
+}
 if ($harnessCommit -notmatch '^[0-9a-fA-F]{40}$') {
     throw "Set harnessCommit to the exact full benchmark-harness commit SHA"
 }
+git cat-file -e "${baseCommit}^{commit}"
+if ($LASTEXITCODE -ne 0) { throw "Baseline commit is unavailable" }
 git cat-file -e "${harnessCommit}^{commit}"
 if ($LASTEXITCODE -ne 0) { throw "Benchmark-harness commit is unavailable" }
 if (Test-Path -LiteralPath $baselineWorktree) {
@@ -80,8 +85,8 @@ set -eu
 
 feature_worktree=$(git rev-parse --show-toplevel)
 baseline_worktree=/tmp/sd-jwt-verification-baseline
-base_commit=origin/main
-harness_commit='<full 40-character SHA of the benchmark-only harness commit>'
+base_commit='88587cb23a814e5c6271bb781235f8f29027020b'
+harness_commit='99756cbc682f5b9874834255f20a32618ff0e57e'
 old_criterion_home_is_set=${CRITERION_HOME+x}
 old_criterion_home=${CRITERION_HOME-}
 old_cargo_target_dir_is_set=${CARGO_TARGET_DIR+x}
@@ -109,6 +114,16 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' HUP INT TERM
 
+if [ "${#base_commit}" -ne 40 ]; then
+  echo "Set base_commit to the exact full baseline commit SHA" >&2
+  exit 1
+fi
+case "$base_commit" in
+  *[!0-9a-fA-F]*)
+    echo "Set base_commit to the exact full baseline commit SHA" >&2
+    exit 1
+    ;;
+esac
 if [ "${#harness_commit}" -ne 40 ]; then
   echo "Set harness_commit to the exact full benchmark-harness commit SHA" >&2
   exit 1
@@ -119,6 +134,7 @@ case "$harness_commit" in
     exit 1
     ;;
 esac
+git cat-file -e "$base_commit^{commit}"
 git cat-file -e "$harness_commit^{commit}"
 if [ -e "$baseline_worktree" ]; then
   echo "Baseline worktree path already exists: $baseline_worktree" >&2
