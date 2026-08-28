@@ -40,6 +40,29 @@ const JWT_SEPARATOR: &str = ".";
 const CNF_KEY: &str = "cnf";
 const JWK_KEY: &str = "jwk";
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DisclosurePreprocessingRoute {
+    Serial,
+    Adaptive,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static LAST_DISCLOSURE_PREPROCESSING_ROUTE: std::cell::Cell<Option<DisclosurePreprocessingRoute>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn record_disclosure_preprocessing_route(route: DisclosurePreprocessingRoute) {
+    LAST_DISCLOSURE_PREPROCESSING_ROUTE.with(|last_route| last_route.set(Some(route)));
+}
+
+#[cfg(test)]
+pub(crate) fn take_disclosure_preprocessing_route() -> Option<DisclosurePreprocessingRoute> {
+    LAST_DISCLOSURE_PREPROCESSING_ROUTE.with(std::cell::Cell::take)
+}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct SDJWTHasSDClaimException(String);
@@ -132,6 +155,28 @@ impl SDJWTCommon {
     }
 
     fn create_hash_mappings(&mut self) -> Result<()> {
+        #[cfg(test)]
+        record_disclosure_preprocessing_route(DisclosurePreprocessingRoute::Serial);
+
+        self.hash_to_decoded_disclosure = HashMap::new();
+        self.hash_to_disclosure = HashMap::new();
+        self.ordered_disclosure_digests = Vec::new();
+
+        // Holder construction intentionally retains the serial behavioral
+        // oracle. Parallel disclosure preprocessing is scoped to verification.
+        let mappings =
+            disclosure_preprocessing::preprocess_disclosures_serial(&self.input_disclosures)?;
+        self.hash_to_decoded_disclosure = mappings.hash_to_decoded_disclosure;
+        self.hash_to_disclosure = mappings.hash_to_disclosure;
+        self.ordered_disclosure_digests = mappings.ordered_disclosure_digests;
+
+        Ok(())
+    }
+
+    fn create_verifier_hash_mappings(&mut self) -> Result<()> {
+        #[cfg(test)]
+        record_disclosure_preprocessing_route(DisclosurePreprocessingRoute::Adaptive);
+
         self.hash_to_decoded_disclosure = HashMap::new();
         self.hash_to_disclosure = HashMap::new();
         self.ordered_disclosure_digests = Vec::new();
