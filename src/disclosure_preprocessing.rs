@@ -7,6 +7,8 @@ use crate::utils::{base64_hash, base64url_decode};
 use serde_json::Value;
 use std::collections::HashMap;
 #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
 use std::thread;
 
 // Provisional opt-in policy. These cutoffs deliberately favor the serial
@@ -41,13 +43,17 @@ struct ProcessedDisclosure {
 }
 
 /// A worker outcome retains identity even when decoding or parsing fails.
+/// A missing result is reserved for executor-contract validation.
 #[derive(Debug)]
 struct DisclosureOutcome<'a> {
     ordinal: usize,
     encoded_disclosure: &'a str,
-    result: Result<ProcessedDisclosure>,
+    result: Option<Result<ProcessedDisclosure>>,
 }
 
+type DisclosureWorker = for<'a> fn(&DisclosureJob<'a>) -> DisclosureOutcome<'a>;
+
+#[cfg(any(test, all(feature = "parallel", target_arch = "x86_64")))]
 trait DisclosureExecutor {
     fn execute<'a>(&self, jobs: &[DisclosureJob<'a>]) -> Result<Vec<DisclosureOutcome<'a>>>;
 }
@@ -56,12 +62,105 @@ trait DisclosureExecutor {
 /// unavailable or below its measured workload threshold.
 struct SerialDisclosureExecutor;
 
-impl DisclosureExecutor for SerialDisclosureExecutor {
-    fn execute<'a>(&self, jobs: &[DisclosureJob<'a>]) -> Result<Vec<DisclosureOutcome<'a>>> {
-        Ok(jobs.iter().map(process_disclosure).collect())
+impl SerialDisclosureExecutor {
+    /// Process and assemble disclosures incrementally so the default and
+    /// fallback paths retain the legacy fail-fast resource behavior. No
+    /// attacker-controlled tail is planned, padded, sorted, or preallocated
+    /// after an earlier malformed or duplicate disclosure.
+    fn preprocess(encoded_disclosures: &[String]) -> Result<DisclosureMappings> {
+        Self::preprocess_with_worker(encoded_disclosures, process_disclosure)
+    }
+
+    fn preprocess_with_worker(
+        encoded_disclosures: &[String],
+        worker: DisclosureWorker,
+    ) -> Result<DisclosureMappings> {
+        let mut hash_to_decoded_disclosure = HashMap::new();
+        let mut hash_to_disclosure = HashMap::new();
+        let mut ordered_disclosure_digests = Vec::new();
+
+        for (ordinal, encoded_disclosure) in encoded_disclosures.iter().enumerate() {
+            let job = DisclosureJob {
+                ordinal,
+                encoded_disclosure,
+            };
+            let outcome = worker(&job);
+
+            if outcome.ordinal != ordinal {
+                return Err(executor_contract_error(format!(
+                    "outcome ordinal {} does not match planned ordinal {ordinal}",
+                    outcome.ordinal
+                )));
+            }
+            if outcome.encoded_disclosure != encoded_disclosure {
+                return Err(executor_contract_error(format!(
+                    "encoded identity changed for ordinal {ordinal}"
+                )));
+            }
+
+            let processed = match outcome.result {
+                Some(result) => result?,
+                None => {
+                    return Err(executor_contract_error(format!(
+                        "no preprocessing result was returned for ordinal {ordinal}"
+                    )))
+                }
+            };
+            if hash_to_decoded_disclosure.contains_key(&processed.digest) {
+                return Err(Error::DuplicateDigestError(processed.digest));
+            }
+
+            hash_to_disclosure.insert(processed.digest.clone(), encoded_disclosure.to_owned());
+            ordered_disclosure_digests.push(processed.digest.clone());
+            hash_to_decoded_disclosure.insert(processed.digest, processed.decoded_disclosure);
+        }
+
+        Ok(DisclosureMappings {
+            hash_to_decoded_disclosure,
+            hash_to_disclosure,
+            ordered_disclosure_digests,
+        })
+    }
+
+    #[cfg(test)]
+    fn execute_with_worker<'a>(
+        jobs: &[DisclosureJob<'a>],
+        worker: DisclosureWorker,
+    ) -> Result<Vec<DisclosureOutcome<'a>>> {
+        let mut outcomes = Vec::new();
+
+        for job in jobs {
+            let outcome = worker(job);
+            match outcome {
+                DisclosureOutcome {
+                    result: Some(Err(error)),
+                    ..
+                } => return Err(error),
+                DisclosureOutcome {
+                    ordinal,
+                    result: None,
+                    ..
+                } => {
+                    return Err(executor_contract_error(format!(
+                        "no preprocessing result was returned for ordinal {ordinal}"
+                    )))
+                }
+                outcome => outcomes.push(outcome),
+            }
+        }
+
+        Ok(outcomes)
     }
 }
 
+#[cfg(test)]
+impl DisclosureExecutor for SerialDisclosureExecutor {
+    fn execute<'a>(&self, jobs: &[DisclosureJob<'a>]) -> Result<Vec<DisclosureOutcome<'a>>> {
+        Self::execute_with_worker(jobs, process_disclosure)
+    }
+}
+
+#[cfg(any(test, all(feature = "parallel", target_arch = "x86_64")))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DisclosureExecutionMode {
     Serial,
@@ -70,9 +169,6 @@ enum DisclosureExecutionMode {
         worker_count: usize,
     },
 }
-
-#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
-type DisclosureWorker = for<'a> fn(&DisclosureJob<'a>) -> DisclosureOutcome<'a>;
 
 /// A bounded native executor. It divides the immutable job slice into at most
 /// `MAX_PARALLEL_WORKERS` chunks and uses scoped threads so disclosures do not
@@ -120,6 +216,97 @@ fn static_chunk_size(job_count: usize, worker_count: usize) -> usize {
     debug_assert!(job_count > 0);
     debug_assert!(worker_count > 0);
     job_count / worker_count + usize::from(job_count % worker_count != 0)
+}
+
+/// A non-blocking, process-wide cap on OS threads spawned by disclosure
+/// preprocessing. When an exact lease is unavailable, the request uses the
+/// serial oracle instead of waiting or changing the measured chunk layout.
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+struct ParallelWorkerBudget {
+    available: AtomicUsize,
+    capacity: usize,
+}
+
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+impl ParallelWorkerBudget {
+    const fn new(capacity: usize) -> Self {
+        Self {
+            available: AtomicUsize::new(capacity),
+            capacity,
+        }
+    }
+
+    fn try_acquire(&self, worker_count: usize) -> Option<ParallelWorkerLease<'_>> {
+        if worker_count < 2 || worker_count > self.capacity {
+            return None;
+        }
+
+        let mut available = self.available.load(Ordering::Acquire);
+        loop {
+            if available < worker_count {
+                return None;
+            }
+
+            match self.available.compare_exchange_weak(
+                available,
+                available - worker_count,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(ParallelWorkerLease {
+                        budget: self,
+                        worker_count,
+                    })
+                }
+                Err(observed) => available = observed,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn available(&self) -> usize {
+        self.available.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+struct ParallelWorkerLease<'a> {
+    budget: &'a ParallelWorkerBudget,
+    worker_count: usize,
+}
+
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+impl ParallelWorkerLease<'_> {
+    fn worker_count(&self) -> usize {
+        self.worker_count
+    }
+}
+
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+impl Drop for ParallelWorkerLease<'_> {
+    fn drop(&mut self) {
+        let previously_available = self
+            .budget
+            .available
+            .fetch_add(self.worker_count, Ordering::Release);
+        debug_assert!(
+            previously_available <= self.budget.capacity - self.worker_count,
+            "parallel worker budget over-release"
+        );
+    }
+}
+
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+static PARALLEL_WORKER_BUDGET: ParallelWorkerBudget =
+    ParallelWorkerBudget::new(MAX_PARALLEL_WORKERS);
+
+#[cfg(all(test, feature = "parallel", target_arch = "x86_64"))]
+std::thread_local! {
+    static POLICY_TOTAL_SCAN_COUNT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static POLICY_BALANCE_SCAN_COUNT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
@@ -176,6 +363,90 @@ impl DisclosureExecutor for NativeParallelDisclosureExecutor {
     }
 }
 
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+fn execute_parallel_with_lease<'a>(
+    jobs: &[DisclosureJob<'a>],
+    lease: ParallelWorkerLease<'_>,
+) -> Result<Vec<DisclosureOutcome<'a>>> {
+    let outcomes = NativeParallelDisclosureExecutor::new(lease.worker_count()).execute(jobs);
+    // Every scoped worker has joined when `execute` returns. Release the
+    // process-wide thread permits before deterministic serial assembly.
+    drop(lease);
+    outcomes
+}
+
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+fn preprocess_parallel_with_lease(
+    encoded_disclosures: &[String],
+    lease: ParallelWorkerLease<'_>,
+) -> Result<DisclosureMappings> {
+    let jobs = plan_disclosures(encoded_disclosures);
+    let outcomes = execute_parallel_with_lease(&jobs, lease)?;
+    assemble_disclosures(&jobs, outcomes)
+}
+
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+fn preprocess_disclosures_with_budget_and_thread_supplier<F>(
+    encoded_disclosures: &[String],
+    budget: &ParallelWorkerBudget,
+    available_threads: F,
+) -> Result<DisclosureMappings>
+where
+    F: FnOnce() -> usize,
+{
+    if encoded_disclosures.len() < PARALLEL_MIN_DISCLOSURES {
+        return SerialDisclosureExecutor::preprocess(encoded_disclosures);
+    }
+
+    #[cfg(test)]
+    POLICY_TOTAL_SCAN_COUNT.with(|count| count.set(count.get() + 1));
+    let total_encoded_bytes = match eligible_total_encoded_bytes(
+        encoded_disclosures.len(),
+        encoded_disclosures
+            .iter()
+            .map(|encoded_disclosure| encoded_disclosure.len()),
+    ) {
+        Some(total_encoded_bytes) => total_encoded_bytes,
+        None => return SerialDisclosureExecutor::preprocess(encoded_disclosures),
+    };
+
+    let available_threads = available_threads();
+    let worker_count = match bounded_worker_count(encoded_disclosures.len(), available_threads) {
+        Some(worker_count) => worker_count,
+        None => return SerialDisclosureExecutor::preprocess(encoded_disclosures),
+    };
+
+    // Acquire the exact measured worker layout before scanning aggregate
+    // balance. A contended request therefore skips the second length pass and
+    // reaches the serial fail-fast path without reserving outcome storage.
+    let lease = match budget.try_acquire(worker_count) {
+        Some(lease) => lease,
+        None => return SerialDisclosureExecutor::preprocess(encoded_disclosures),
+    };
+
+    #[cfg(test)]
+    POLICY_BALANCE_SCAN_COUNT.with(|count| count.set(count.get() + 1));
+    match select_execution_mode_for_balanced_lengths(
+        encoded_disclosures.len(),
+        encoded_disclosures
+            .iter()
+            .map(|encoded_disclosure| encoded_disclosure.len()),
+        total_encoded_bytes,
+        available_threads,
+    ) {
+        DisclosureExecutionMode::Serial => {
+            drop(lease);
+            SerialDisclosureExecutor::preprocess(encoded_disclosures)
+        }
+        DisclosureExecutionMode::NativeParallel {
+            worker_count: selected_worker_count,
+        } => {
+            debug_assert_eq!(selected_worker_count, lease.worker_count());
+            preprocess_parallel_with_lease(encoded_disclosures, lease)
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub(super) struct DisclosureMappings {
     pub(super) hash_to_decoded_disclosure: HashMap<String, Value>,
@@ -184,15 +455,25 @@ pub(super) struct DisclosureMappings {
 }
 
 pub(super) fn preprocess_disclosures(encoded_disclosures: &[String]) -> Result<DisclosureMappings> {
-    let jobs = plan_disclosures(encoded_disclosures);
-    let outcomes = match select_execution_mode(&jobs) {
-        DisclosureExecutionMode::Serial => SerialDisclosureExecutor.execute(&jobs),
-        #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
-        DisclosureExecutionMode::NativeParallel { worker_count } => {
-            NativeParallelDisclosureExecutor::new(worker_count).execute(&jobs)
-        }
-    }?;
-    assemble_disclosures(&jobs, outcomes)
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+    {
+        preprocess_disclosures_with_budget_and_thread_supplier(
+            encoded_disclosures,
+            &PARALLEL_WORKER_BUDGET,
+            available_worker_threads,
+        )
+    }
+
+    #[cfg(not(all(feature = "parallel", target_arch = "x86_64")))]
+    {
+        SerialDisclosureExecutor::preprocess(encoded_disclosures)
+    }
+}
+
+pub(super) fn preprocess_disclosures_serial(
+    encoded_disclosures: &[String],
+) -> Result<DisclosureMappings> {
+    SerialDisclosureExecutor::preprocess(encoded_disclosures)
 }
 
 #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
@@ -200,26 +481,6 @@ fn available_worker_threads() -> usize {
     thread::available_parallelism()
         .map(|parallelism| parallelism.get())
         .unwrap_or(1)
-}
-
-#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
-fn select_execution_mode(jobs: &[DisclosureJob<'_>]) -> DisclosureExecutionMode {
-    select_execution_mode_with_thread_supplier(jobs, available_worker_threads)
-}
-
-#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
-fn select_execution_mode_with_thread_supplier<F>(
-    jobs: &[DisclosureJob<'_>],
-    available_threads: F,
-) -> DisclosureExecutionMode
-where
-    F: FnOnce() -> usize,
-{
-    select_execution_mode_for_lengths_with_thread_supplier(
-        jobs.len(),
-        jobs.iter().map(|job| job.encoded_disclosure.len()),
-        available_threads,
-    )
 }
 
 #[cfg(all(test, feature = "parallel", target_arch = "x86_64"))]
@@ -238,7 +499,7 @@ where
     )
 }
 
-#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+#[cfg(all(test, feature = "parallel", target_arch = "x86_64"))]
 fn select_execution_mode_for_lengths_with_thread_supplier<I, F>(
     disclosure_count: usize,
     encoded_lengths: I,
@@ -248,45 +509,79 @@ where
     I: Clone + IntoIterator<Item = usize>,
     F: FnOnce() -> usize,
 {
+    let total_encoded_bytes =
+        match eligible_total_encoded_bytes(disclosure_count, encoded_lengths.clone()) {
+            Some(total_encoded_bytes) => total_encoded_bytes,
+            None => return DisclosureExecutionMode::Serial,
+        };
+
+    select_execution_mode_for_balanced_lengths(
+        disclosure_count,
+        encoded_lengths,
+        total_encoded_bytes,
+        available_threads(),
+    )
+}
+
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+fn eligible_total_encoded_bytes<I>(disclosure_count: usize, encoded_lengths: I) -> Option<u128>
+where
+    I: IntoIterator<Item = usize>,
+{
     if disclosure_count < PARALLEL_MIN_DISCLOSURES {
-        return DisclosureExecutionMode::Serial;
+        return None;
     }
 
     let mut observed_count = 0usize;
     let mut total_encoded_bytes = 0u128;
-
-    for encoded_length in encoded_lengths.clone() {
+    for encoded_length in encoded_lengths {
         if observed_count == disclosure_count {
-            return DisclosureExecutionMode::Serial;
+            return None;
         }
-
-        let encoded_length = encoded_length as u128;
-        total_encoded_bytes = total_encoded_bytes.saturating_add(encoded_length);
+        total_encoded_bytes = total_encoded_bytes.saturating_add(encoded_length as u128);
         observed_count += 1;
     }
 
-    if observed_count != disclosure_count {
-        return DisclosureExecutionMode::Serial;
+    if observed_count != disclosure_count
+        || total_encoded_bytes < PARALLEL_MIN_TOTAL_ENCODED_BYTES as u128
+    {
+        None
+    } else {
+        Some(total_encoded_bytes)
     }
+}
 
-    if total_encoded_bytes < PARALLEL_MIN_TOTAL_ENCODED_BYTES as u128 {
-        return DisclosureExecutionMode::Serial;
-    }
-
-    let available_threads = available_threads();
-    if available_threads <= 1 {
-        return DisclosureExecutionMode::Serial;
-    }
-
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+fn bounded_worker_count(disclosure_count: usize, available_threads: usize) -> Option<usize> {
     let worker_count = available_threads
         .min(disclosure_count)
         .min(MAX_PARALLEL_WORKERS);
+    (worker_count > 1).then_some(worker_count)
+}
+
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+fn select_execution_mode_for_balanced_lengths<I>(
+    disclosure_count: usize,
+    encoded_lengths: I,
+    total_encoded_bytes: u128,
+    available_threads: usize,
+) -> DisclosureExecutionMode
+where
+    I: IntoIterator<Item = usize>,
+{
+    let worker_count = match bounded_worker_count(disclosure_count, available_threads) {
+        Some(worker_count) => worker_count,
+        None => return DisclosureExecutionMode::Serial,
+    };
     let chunk_size = static_chunk_size(disclosure_count, worker_count);
     let mut observed_count = 0usize;
     let mut current_chunk_bytes = 0u128;
     let mut largest_chunk_bytes = 0u128;
 
     for encoded_length in encoded_lengths {
+        if observed_count == disclosure_count {
+            return DisclosureExecutionMode::Serial;
+        }
         current_chunk_bytes = current_chunk_bytes.saturating_add(encoded_length as u128);
         observed_count += 1;
 
@@ -294,6 +589,9 @@ where
             largest_chunk_bytes = largest_chunk_bytes.max(current_chunk_bytes);
             current_chunk_bytes = 0;
         }
+    }
+    if observed_count != disclosure_count {
+        return DisclosureExecutionMode::Serial;
     }
     largest_chunk_bytes = largest_chunk_bytes.max(current_chunk_bytes);
 
@@ -308,11 +606,12 @@ where
     DisclosureExecutionMode::NativeParallel { worker_count }
 }
 
-#[cfg(not(all(feature = "parallel", target_arch = "x86_64")))]
-fn select_execution_mode(_jobs: &[DisclosureJob<'_>]) -> DisclosureExecutionMode {
+#[cfg(all(test, not(all(feature = "parallel", target_arch = "x86_64"))))]
+fn select_execution_mode(_encoded_disclosures: &[String]) -> DisclosureExecutionMode {
     DisclosureExecutionMode::Serial
 }
 
+#[cfg(any(test, all(feature = "parallel", target_arch = "x86_64")))]
 fn plan_disclosures(encoded_disclosures: &[String]) -> Vec<DisclosureJob<'_>> {
     encoded_disclosures
         .iter()
@@ -350,12 +649,13 @@ fn process_disclosure<'a>(job: &DisclosureJob<'a>) -> DisclosureOutcome<'a> {
     DisclosureOutcome {
         ordinal: job.ordinal,
         encoded_disclosure: job.encoded_disclosure,
-        result,
+        result: Some(result),
     }
 }
 
 /// Restore worker outcomes to input order, validate the executor contract, and
 /// only then publish complete mappings. Any failure discards all partial state.
+#[cfg(any(test, all(feature = "parallel", target_arch = "x86_64")))]
 fn assemble_disclosures<'a>(
     jobs: &[DisclosureJob<'a>],
     mut outcomes: Vec<DisclosureOutcome<'a>>,
@@ -368,7 +668,15 @@ fn assemble_disclosures<'a>(
     let mut ordered_disclosure_digests = Vec::with_capacity(jobs.len());
 
     for outcome in outcomes {
-        let processed = outcome.result?;
+        let processed = match outcome.result {
+            Some(result) => result?,
+            None => {
+                return Err(executor_contract_error(format!(
+                    "no preprocessing result was returned for ordinal {}",
+                    outcome.ordinal
+                )))
+            }
+        };
         if hash_to_decoded_disclosure.contains_key(&processed.digest) {
             return Err(Error::DuplicateDigestError(processed.digest));
         }
@@ -388,6 +696,7 @@ fn assemble_disclosures<'a>(
     })
 }
 
+#[cfg(any(test, all(feature = "parallel", target_arch = "x86_64")))]
 fn validate_outcome_contract(
     jobs: &[DisclosureJob<'_>],
     outcomes: &[DisclosureOutcome<'_>],
@@ -582,7 +891,7 @@ mod tests {
 
         assert_eq!(outcome.ordinal, 0);
         assert_eq!(outcome.encoded_disclosure, OBJECT_DISCLOSURE);
-        let processed = outcome.result.unwrap();
+        let processed = outcome.result.unwrap().unwrap();
         assert_eq!(processed.digest, OBJECT_DISCLOSURE_HASH);
         assert_eq!(
             processed.decoded_disclosure,
@@ -602,6 +911,29 @@ mod tests {
             assert_eq!(outcome.ordinal, job.ordinal);
             assert_eq!(outcome.encoded_disclosure, job.encoded_disclosure);
         }
+    }
+
+    #[test]
+    fn serial_preprocessing_skips_large_tail_after_first_malformed_disclosure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static WORKER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        fn counting_worker<'a>(job: &DisclosureJob<'a>) -> DisclosureOutcome<'a> {
+            WORKER_CALLS.fetch_add(1, Ordering::SeqCst);
+            process_disclosure(job)
+        }
+
+        WORKER_CALLS.store(0, Ordering::SeqCst);
+        let mut disclosures = Vec::with_capacity(100_001);
+        disclosures.push(INVALID_BASE64_DISCLOSURE.to_owned());
+        disclosures.extend((0..100_000).map(|_| OBJECT_DISCLOSURE.to_owned()));
+
+        let error = SerialDisclosureExecutor::preprocess_with_worker(&disclosures, counting_worker)
+            .unwrap_err();
+
+        assert_eq!(WORKER_CALLS.load(Ordering::SeqCst), 1);
+        assert_invalid_disclosure(error, INVALID_BASE64_MESSAGE);
     }
 
     #[test]
@@ -643,7 +975,7 @@ mod tests {
     fn assembler_uses_lowest_ordinal_malformed_error_after_shuffle() {
         let disclosures = owned(&[INVALID_JSON_DISCLOSURE, INVALID_BASE64_DISCLOSURE]);
         let jobs = plan_disclosures(&disclosures);
-        let mut outcomes = SerialDisclosureExecutor.execute(&jobs).unwrap();
+        let mut outcomes = jobs.iter().map(process_disclosure).collect::<Vec<_>>();
         outcomes.reverse();
 
         let error = assemble_disclosures(&jobs, outcomes).unwrap_err();
@@ -659,7 +991,7 @@ mod tests {
             OBJECT_DISCLOSURE,
         ]);
         let jobs = plan_disclosures(&disclosures);
-        let mut outcomes = SerialDisclosureExecutor.execute(&jobs).unwrap();
+        let mut outcomes = jobs.iter().map(process_disclosure).collect::<Vec<_>>();
         outcomes.reverse();
 
         let error = assemble_disclosures(&jobs, outcomes).unwrap_err();
@@ -675,7 +1007,7 @@ mod tests {
             INVALID_JSON_DISCLOSURE,
         ]);
         let jobs = plan_disclosures(&disclosures);
-        let mut outcomes = SerialDisclosureExecutor.execute(&jobs).unwrap();
+        let mut outcomes = jobs.iter().map(process_disclosure).collect::<Vec<_>>();
         outcomes.reverse();
 
         let error = assemble_disclosures(&jobs, outcomes).unwrap_err();
@@ -737,6 +1069,18 @@ mod tests {
     }
 
     #[test]
+    fn assembler_rejects_skipped_result_without_an_earlier_error() {
+        let disclosures = owned(&[OBJECT_DISCLOSURE]);
+        let jobs = plan_disclosures(&disclosures);
+        let mut outcomes = SerialDisclosureExecutor.execute(&jobs).unwrap();
+        outcomes[0].result = None;
+
+        let error = assemble_disclosures(&jobs, outcomes).unwrap_err();
+
+        assert_contract_violation(error, "no preprocessing result was returned for ordinal 0");
+    }
+
+    #[test]
     fn worker_preserves_legacy_malformed_disclosure_errors() {
         for (disclosure, expected_message) in [
             (INVALID_BASE64_DISCLOSURE, INVALID_BASE64_MESSAGE),
@@ -746,7 +1090,7 @@ mod tests {
             let jobs = plan_disclosures(&disclosures);
             let outcome = process_disclosure(&jobs[0]);
 
-            assert_invalid_disclosure(outcome.result.unwrap_err(), expected_message);
+            assert_invalid_disclosure(outcome.result.unwrap().unwrap_err(), expected_message);
         }
     }
 
@@ -784,9 +1128,7 @@ mod tests {
             ]),
         ] {
             let jobs = plan_disclosures(&disclosures);
-            let serial_error =
-                assemble_disclosures(&jobs, SerialDisclosureExecutor.execute(&jobs).unwrap())
-                    .unwrap_err();
+            let serial_error = SerialDisclosureExecutor::preprocess(&disclosures).unwrap_err();
             let mut parallel_outcomes = NativeParallelDisclosureExecutor::new(3)
                 .execute(&jobs)
                 .unwrap();
@@ -831,6 +1173,106 @@ mod tests {
             .unwrap_err();
 
         assert_parallel_executor_failure(error, PARALLEL_SPAWN_FAILURE);
+    }
+
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+    #[test]
+    fn parallel_worker_budget_caps_overlapping_exact_leases() {
+        let budget = ParallelWorkerBudget::new(MAX_PARALLEL_WORKERS);
+
+        let first = budget.try_acquire(3).unwrap();
+        assert_eq!(first.worker_count(), 3);
+        assert_eq!(budget.available(), 1);
+        assert!(budget.try_acquire(2).is_none());
+        assert_eq!(budget.available(), 1);
+        drop(first);
+        assert_eq!(budget.available(), MAX_PARALLEL_WORKERS);
+
+        let second = budget.try_acquire(2).unwrap();
+        let third = budget.try_acquire(2).unwrap();
+        assert_eq!(budget.available(), 0);
+        assert!(budget.try_acquire(2).is_none());
+
+        drop(second);
+        assert_eq!(budget.available(), 2);
+        drop(third);
+        assert_eq!(budget.available(), MAX_PARALLEL_WORKERS);
+    }
+
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+    #[test]
+    fn parallel_worker_lease_is_released_before_serial_assembly() {
+        let budget = ParallelWorkerBudget::new(MAX_PARALLEL_WORKERS);
+        let lease = budget.try_acquire(MAX_PARALLEL_WORKERS).unwrap();
+        let disclosures = generated_disclosures(PARALLEL_MIN_DISCLOSURES, 64);
+        let jobs = plan_disclosures(&disclosures);
+
+        let outcomes = execute_parallel_with_lease(&jobs, lease).unwrap();
+
+        assert_eq!(budget.available(), MAX_PARALLEL_WORKERS);
+        assert_eq!(
+            assemble_disclosures(&jobs, outcomes)
+                .unwrap()
+                .ordered_disclosure_digests
+                .len(),
+            disclosures.len()
+        );
+    }
+
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+    #[test]
+    fn exhausted_parallel_budget_uses_fail_fast_serial_fallback() {
+        use std::cell::Cell;
+
+        let budget = ParallelWorkerBudget::new(MAX_PARALLEL_WORKERS);
+        let held_lease = budget.try_acquire(MAX_PARALLEL_WORKERS).unwrap();
+        let mut disclosures = Vec::with_capacity(100_001);
+        disclosures.push(INVALID_BASE64_DISCLOSURE.to_owned());
+        disclosures.extend((0..100_000).map(|_| OBJECT_DISCLOSURE.to_owned()));
+        let thread_query_count = Cell::new(0usize);
+        POLICY_TOTAL_SCAN_COUNT.with(|count| count.set(0));
+        POLICY_BALANCE_SCAN_COUNT.with(|count| count.set(0));
+
+        let error =
+            preprocess_disclosures_with_budget_and_thread_supplier(&disclosures, &budget, || {
+                thread_query_count.set(thread_query_count.get() + 1);
+                MAX_PARALLEL_WORKERS
+            })
+            .unwrap_err();
+
+        assert_eq!(budget.available(), 0);
+        assert_eq!(thread_query_count.get(), 1);
+        assert_eq!(POLICY_TOTAL_SCAN_COUNT.with(std::cell::Cell::get), 1);
+        assert_eq!(POLICY_BALANCE_SCAN_COUNT.with(std::cell::Cell::get), 0);
+        assert_invalid_disclosure(error, INVALID_BASE64_MESSAGE);
+
+        drop(held_lease);
+        assert_eq!(budget.available(), MAX_PARALLEL_WORKERS);
+    }
+
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+    #[test]
+    fn budgeted_policy_skips_thread_query_below_byte_cutoff() {
+        use std::cell::Cell;
+
+        let budget = ParallelWorkerBudget::new(MAX_PARALLEL_WORKERS);
+        let disclosures = generated_disclosures(PARALLEL_MIN_DISCLOSURES, 64);
+        let thread_query_count = Cell::new(0usize);
+        POLICY_TOTAL_SCAN_COUNT.with(|count| count.set(0));
+        POLICY_BALANCE_SCAN_COUNT.with(|count| count.set(0));
+
+        let mappings =
+            preprocess_disclosures_with_budget_and_thread_supplier(&disclosures, &budget, || {
+                thread_query_count.set(thread_query_count.get() + 1);
+                MAX_PARALLEL_WORKERS
+            })
+            .unwrap();
+
+        assert_eq!(mappings.ordered_disclosure_digests.len(), disclosures.len());
+        assert_eq!(thread_query_count.get(), 0);
+        assert_eq!(POLICY_TOTAL_SCAN_COUNT.with(std::cell::Cell::get), 1);
+        assert_eq!(POLICY_BALANCE_SCAN_COUNT.with(std::cell::Cell::get), 0);
+        assert_eq!(budget.available(), MAX_PARALLEL_WORKERS);
     }
 
     #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
@@ -967,10 +1409,9 @@ mod tests {
     #[test]
     fn feature_off_always_selects_serial_execution() {
         let disclosures = owned(&[OBJECT_DISCLOSURE, ARRAY_DISCLOSURE]);
-        let jobs = plan_disclosures(&disclosures);
 
         assert_eq!(
-            select_execution_mode(&jobs),
+            select_execution_mode(&disclosures),
             DisclosureExecutionMode::Serial
         );
     }
@@ -979,10 +1420,9 @@ mod tests {
     #[test]
     fn unmeasured_architecture_parallel_feature_still_selects_serial_execution() {
         let disclosures = owned(&[OBJECT_DISCLOSURE, ARRAY_DISCLOSURE]);
-        let jobs = plan_disclosures(&disclosures);
 
         assert_eq!(
-            select_execution_mode(&jobs),
+            select_execution_mode(&disclosures),
             DisclosureExecutionMode::Serial
         );
     }

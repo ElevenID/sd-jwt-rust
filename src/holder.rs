@@ -433,7 +433,8 @@ impl SDJWTHolder {
 mod tests {
     use crate::issuer::ClaimsForSelectiveDisclosureStrategy;
     use crate::{
-        SDJWTHolder, SDJWTIssuer, SDJWTSerializationFormat, COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
+        take_disclosure_preprocessing_route, DisclosurePreprocessingRoute, SDJWTHolder,
+        SDJWTIssuer, SDJWTSerializationFormat, COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
     };
     use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header};
     use serde_json::{json, Map, Value};
@@ -474,6 +475,45 @@ mod tests {
             issuer_key_resolver(),
         );
         assert!(holder.is_ok());
+    }
+
+    #[test]
+    fn verified_and_unverified_holder_construction_use_serial_preprocessing() {
+        let user_claims = json!({
+            "sub": "6c5c0a49-b589-431d-bae7-219122a9ec2c",
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "exp": 1883000000,
+            "address": { "country": "DE" }
+        });
+        let issuer_key = EncodingKey::from_ec_pem(PRIVATE_ISSUER_PEM.as_bytes()).unwrap();
+        let sd_jwt = SDJWTIssuer::new(issuer_key, None)
+            .issue_sd_jwt(
+                user_claims,
+                ClaimsForSelectiveDisclosureStrategy::AllLevels,
+                None,
+                false,
+                SDJWTSerializationFormat::Compact,
+            )
+            .unwrap();
+
+        take_disclosure_preprocessing_route();
+        SDJWTHolder::new(
+            sd_jwt.clone(),
+            SDJWTSerializationFormat::Compact,
+            issuer_key_resolver(),
+        )
+        .unwrap();
+        assert_eq!(
+            take_disclosure_preprocessing_route(),
+            Some(DisclosurePreprocessingRoute::Serial)
+        );
+
+        SDJWTHolder::new_unverified(sd_jwt, SDJWTSerializationFormat::Compact).unwrap();
+        assert_eq!(
+            take_disclosure_preprocessing_route(),
+            Some(DisclosurePreprocessingRoute::Serial)
+        );
     }
 
     #[test]

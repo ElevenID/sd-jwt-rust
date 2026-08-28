@@ -68,7 +68,7 @@ impl SDJWTVerifier {
         };
 
         verifier.sd_jwt_engine.parse_sd_jwt(sd_jwt_presentation)?;
-        verifier.sd_jwt_engine.create_hash_mappings()?;
+        verifier.sd_jwt_engine.create_verifier_hash_mappings()?;
         let sign_alg = verifier.sd_jwt_engine.sign_alg.clone();
         verifier.verify_sd_jwt(sign_alg.clone())?;
         verifier.verified_claims = verifier.extract_sd_claims()?;
@@ -456,8 +456,9 @@ mod tests {
     use crate::issuer::ClaimsForSelectiveDisclosureStrategy;
     use crate::utils::{base64_hash, base64url_decode, base64url_encode};
     use crate::{
-        SDJWTFlattenedJson, SDJWTGeneralJson, SDJWTHolder, SDJWTIssuer, SDJWTSerializationFormat,
-        SDJWTVerifier, COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
+        take_disclosure_preprocessing_route, DisclosurePreprocessingRoute, SDJWTFlattenedJson,
+        SDJWTGeneralJson, SDJWTHolder, SDJWTIssuer, SDJWTSerializationFormat, SDJWTVerifier,
+        COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
     };
     use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header};
     use rstest::rstest;
@@ -526,6 +527,22 @@ mod tests {
             Ok(_) => panic!("verifier unexpectedly accepted the test presentation"),
             Err(error) => error,
         }
+    }
+
+    #[test]
+    fn verifier_construction_uses_adaptive_preprocessing() {
+        let payload = json!({
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "_sd_alg": "sha-256",
+        });
+
+        take_disclosure_preprocessing_route();
+        verify_compact(compact_presentation(&payload, &[])).unwrap();
+        assert_eq!(
+            take_disclosure_preprocessing_route(),
+            Some(DisclosurePreprocessingRoute::Adaptive)
+        );
     }
 
     #[test]
