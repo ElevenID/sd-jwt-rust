@@ -16,9 +16,21 @@ jobs:
 
     steps:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
+    - name: Install serial-fallback targets
+      run: rustup target add aarch64-unknown-linux-gnu wasm32-unknown-unknown
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --locked --verbose
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test --locked --verbose
+    - name: Run parallel-feature tests
+      run: cargo test --locked --no-default-features --features parallel --verbose
+    - name: Run all-feature interaction tests
+      run: cargo test --locked --all-features --verbose
     - name: Smoke-test benchmarks
-      run: cargo test --benches --verbose
+      run: cargo test --locked --benches --verbose
+    - name: Smoke-test parallel-feature benchmarks
+      run: cargo test --locked --no-default-features --features parallel --benches --verbose
+    - name: Check ARM64 serial fallback
+      run: cargo check --locked --target aarch64-unknown-linux-gnu --no-default-features --features parallel --verbose
+    - name: Check parallel feature uses WASM serial fallback
+      run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features parallel --verbose
