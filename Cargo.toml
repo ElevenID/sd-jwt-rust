@@ -27,6 +27,12 @@ sha2 = "0.10"
 thiserror = "1.0.51"
 strum = { version = "0.25", default-features = false, features = ["std", "derive"] }
 
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+# Avoid JS binding releases whose declared MSRV exceeds this package's floor.
+js-sys = "=0.3.69"
+wasm-bindgen = "=0.2.92"
+
 [dev-dependencies]
 criterion = { version = "=0.5.1", default-features = false }
 rstest = "0.18.2"
