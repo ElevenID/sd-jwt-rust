@@ -124,6 +124,12 @@ trait IssuanceRandomSource {
 
 struct LegacyIssuanceRandomSource;
 
+struct IssuanceOptions {
+    holder_key: Option<Jwk>,
+    add_decoy_claims: bool,
+    serialization_format: SDJWTSerializationFormat,
+}
+
 impl IssuanceRandomSource for LegacyIssuanceRandomSource {
     fn disclosure_salt(&mut self) -> String {
         #[cfg(not(feature = "mock_salts"))]
@@ -219,14 +225,39 @@ impl SDJWTIssuer {
     fn issue_sd_jwt_with_random_source<R: IssuanceRandomSource>(
         &mut self,
         user_claims: Value,
-        mut sd_strategy: ClaimsForSelectiveDisclosureStrategy,
+        sd_strategy: ClaimsForSelectiveDisclosureStrategy,
         holder_key: Option<Jwk>,
         add_decoy_claims: bool,
         serialization_format: SDJWTSerializationFormat,
         random_source: &mut R,
     ) -> Result<String> {
+        self.issue_sd_jwt_with_plan_executor(
+            user_claims,
+            sd_strategy,
+            IssuanceOptions {
+                holder_key,
+                add_decoy_claims,
+                serialization_format,
+            },
+            random_source,
+            IssuancePlan::execute,
+        )
+    }
+
+    fn issue_sd_jwt_with_plan_executor<R, F>(
+        &mut self,
+        user_claims: Value,
+        mut sd_strategy: ClaimsForSelectiveDisclosureStrategy,
+        options: IssuanceOptions,
+        random_source: &mut R,
+        execute_plan: F,
+    ) -> Result<String>
+    where
+        R: IssuanceRandomSource,
+        F: FnOnce(IssuancePlan) -> Result<issuance_plan::IssuanceAssembly>,
+    {
         let inner = SDJWTCommon {
-            serialization_format,
+            serialization_format: options.serialization_format,
             ..Default::default()
         };
 
@@ -236,22 +267,27 @@ impl SDJWTIssuer {
 
         self.reset();
         self.inner = inner;
-        self.holder_key = holder_key;
-        self.add_decoy_claims = add_decoy_claims;
+        self.holder_key = options.holder_key;
+        self.add_decoy_claims = options.add_decoy_claims;
 
-        self.assemble_sd_jwt_payload(user_claims, sd_strategy, random_source)?;
+        self.assemble_sd_jwt_payload(user_claims, sd_strategy, random_source, execute_plan)?;
         self.create_signed_jws()?;
         self.create_combined()?;
 
         Ok(self.serialized_sd_jwt.clone())
     }
 
-    fn assemble_sd_jwt_payload<R: IssuanceRandomSource>(
+    fn assemble_sd_jwt_payload<R, F>(
         &mut self,
         mut user_claims: Value,
         sd_strategy: ClaimsForSelectiveDisclosureStrategy,
         random_source: &mut R,
-    ) -> Result<()> {
+        execute_plan: F,
+    ) -> Result<()>
+    where
+        R: IssuanceRandomSource,
+        F: FnOnce(IssuancePlan) -> Result<issuance_plan::IssuanceAssembly>,
+    {
         let claims_obj_ref = user_claims
             .as_object_mut()
             .ok_or(Error::ConversionError("json object".to_string()))?;
@@ -261,13 +297,13 @@ impl SDJWTIssuer {
             .filter_map(|key| claims_obj_ref.shift_remove_entry(key))
             .collect();
 
-        let assembly = IssuancePlan::create(
+        let plan = IssuancePlan::create(
             user_claims,
             sd_strategy,
             self.add_decoy_claims,
             random_source,
-        )?
-        .execute_serial()?;
+        )?;
+        let assembly = execute_plan(plan)?;
         self.all_disclosures = assembly.disclosures;
         self.sd_jwt_payload = assembly
             .claims
