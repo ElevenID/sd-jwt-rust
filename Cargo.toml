@@ -51,3 +51,7 @@ harness = false
 name = "sd_jwt_issuance"
 harness = false
 required-features = ["issuance_bench"]
+
+[[example]]
+name = "issuance_qualification_manifest"
+required-features = ["issuance_bench"]

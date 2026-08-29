@@ -15,9 +15,10 @@ use jsonwebtoken::EncodingKey;
 use serde_json::{json, Map, Value};
 
 use super::issuance_plan::{
-    BenchmarkBudgetAcquisitionResult, BenchmarkExecutionTraceSummary, BenchmarkReadyBatchTrace,
-    BenchmarkSelectedMode, BenchmarkSelectionReason, BenchmarkWorkEstimateStatus, IssuanceAssembly,
-    IssuancePlan, BENCHMARK_ISSUANCE_WORKER_CAP, BENCHMARK_STATIC_PARTITION_RULE_VERSION,
+    benchmark_issuance_policy_facts, BenchmarkBudgetAcquisitionResult,
+    BenchmarkExecutionTraceSummary, BenchmarkReadyBatchTrace, BenchmarkSelectedMode,
+    BenchmarkSelectionReason, BenchmarkWorkEstimateStatus, IssuanceAssembly, IssuancePlan,
+    BENCHMARK_ISSUANCE_WORKER_CAP, BENCHMARK_STATIC_PARTITION_RULE_VERSION,
     BENCHMARK_WORK_ESTIMATOR_VERSION,
 };
 use super::{
@@ -35,11 +36,17 @@ pub const ISSUANCE_LARGE_PAYLOAD_BYTES: usize = 64 * 1024;
 /// Stable Criterion group prefix used in route evidence.
 pub const ISSUANCE_BENCHMARK_GROUP_ID: &str = "sd_jwt_issuance";
 
+const ISSUANCE_ROUTE_SCHEMA: &str = "sd_jwt_issuance_route_v2";
+const ISSUANCE_QUALIFICATION_MANIFEST_SCHEMA: &str = "sd_jwt_issuance_qualification_manifest_v1";
+
 /// Twenty core cases, ten focused decoy cases, and three structural cases.
 pub const ISSUANCE_FIXTURE_CASE_COUNT: usize = 33;
 
 /// Two stages times two requested routes for every fixture case.
 pub const ISSUANCE_BENCHMARK_ID_COUNT: usize = ISSUANCE_FIXTURE_CASE_COUNT * 2 * 2;
+
+/// One serial/candidate pair for each fixture and timed stage.
+pub const ISSUANCE_PAIRED_CELL_COUNT: usize = ISSUANCE_FIXTURE_CASE_COUNT * 2;
 
 /// Payload shape used by an issuance benchmark fixture.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -303,6 +310,123 @@ pub fn issuance_benchmark_cases() -> Vec<IssuanceBenchmarkCase> {
 
     debug_assert_eq!(cases.len(), ISSUANCE_FIXTURE_CASE_COUNT);
     cases
+}
+
+fn full_criterion_id(
+    case: IssuanceBenchmarkCase,
+    stage: IssuanceBenchmarkStage,
+    route: IssuanceBenchmarkRoute,
+) -> String {
+    format!(
+        "{}/{}",
+        ISSUANCE_BENCHMARK_GROUP_ID,
+        case.benchmark_id(stage, route)
+    )
+}
+
+fn qualification_criterion_ids(cases: &[IssuanceBenchmarkCase]) -> Vec<String> {
+    let mut ids = Vec::with_capacity(ISSUANCE_BENCHMARK_ID_COUNT);
+    for case in cases {
+        // This is the exact route-then-stage registration order in the
+        // Criterion target.
+        for route in [
+            IssuanceBenchmarkRoute::SerialOracle,
+            IssuanceBenchmarkRoute::AdaptiveCandidate,
+        ] {
+            for stage in [
+                IssuanceBenchmarkStage::ExecutorAssembly,
+                IssuanceBenchmarkStage::FullIssuance,
+            ] {
+                ids.push(full_criterion_id(*case, stage, route));
+            }
+        }
+    }
+    debug_assert_eq!(ids.len(), ISSUANCE_BENCHMARK_ID_COUNT);
+    ids
+}
+
+fn qualification_paired_cells(cases: &[IssuanceBenchmarkCase]) -> Vec<Value> {
+    let mut cells = Vec::with_capacity(ISSUANCE_PAIRED_CELL_COUNT);
+    for case in cases {
+        for stage in [
+            IssuanceBenchmarkStage::ExecutorAssembly,
+            IssuanceBenchmarkStage::FullIssuance,
+        ] {
+            cells.push(json!({
+                "fixture_id": case.fixture_id(),
+                "stage": stage.label(),
+                "serial_id": full_criterion_id(
+                    *case,
+                    stage,
+                    IssuanceBenchmarkRoute::SerialOracle,
+                ),
+                "adaptive_id": full_criterion_id(
+                    *case,
+                    stage,
+                    IssuanceBenchmarkRoute::AdaptiveCandidate,
+                ),
+            }));
+        }
+    }
+    debug_assert_eq!(cells.len(), ISSUANCE_PAIRED_CELL_COUNT);
+    cells
+}
+
+fn issuance_qualification_manifest_value() -> Value {
+    let cases = issuance_benchmark_cases();
+    let case_records = cases
+        .iter()
+        .map(|case| {
+            json!({
+                "fixture_id": case.fixture_id(),
+                "disclosure_count": case.disclosure_count,
+            })
+        })
+        .collect::<Vec<_>>();
+    let criterion_ids = qualification_criterion_ids(&cases);
+    let paired_cells = qualification_paired_cells(&cases);
+    let policy = benchmark_issuance_policy_facts();
+    let qualified_issuance_thresholds = match (
+        policy.qualified_min_jobs,
+        policy.qualified_min_estimated_work_bytes,
+    ) {
+        (Some(min_jobs), Some(min_estimated_work_bytes)) => json!({
+            "min_jobs": min_jobs,
+            "min_estimated_work_bytes": min_estimated_work_bytes,
+        }),
+        (None, None) => Value::Null,
+        _ => unreachable!("qualified issuance policy facts must be all present or all absent"),
+    };
+
+    json!({
+        "schema": ISSUANCE_QUALIFICATION_MANIFEST_SCHEMA,
+        "benchmark_group_id": ISSUANCE_BENCHMARK_GROUP_ID,
+        "fixture_case_count": ISSUANCE_FIXTURE_CASE_COUNT,
+        "benchmark_id_count": ISSUANCE_BENCHMARK_ID_COUNT,
+        "paired_cell_count": ISSUANCE_PAIRED_CELL_COUNT,
+        "cases": case_records,
+        "criterion_ids": criterion_ids,
+        "paired_cells": paired_cells,
+        "route_schema": ISSUANCE_ROUTE_SCHEMA,
+        "work_estimator_version": BENCHMARK_WORK_ESTIMATOR_VERSION,
+        "static_partition_rule_version": BENCHMARK_STATIC_PARTITION_RULE_VERSION,
+        "worker_cap": BENCHMARK_ISSUANCE_WORKER_CAP,
+        "mechanical_benchmark_thresholds": {
+            "min_jobs": policy.mechanical_min_jobs,
+            "min_estimated_work_bytes": policy.mechanical_min_estimated_work_bytes,
+        },
+        "qualified_issuance_thresholds": qualified_issuance_thresholds,
+    })
+}
+
+/// Canonical qualification matrix and policy facts for a frozen benchmark
+/// runner. The returned UTF-8 JSON is deterministic, BOM-less, and terminated
+/// by exactly one line feed.
+pub fn issuance_qualification_manifest_json() -> String {
+    let mut manifest = serde_json::to_string_pretty(&issuance_qualification_manifest_value())
+        .expect("issuance qualification manifest must serialize");
+    manifest.push('\n');
+    manifest
 }
 
 /// Exact claims and deterministic randomness shared by both requested routes.
@@ -706,7 +830,7 @@ impl IssuanceBenchmarkRouteRecord {
                 .collect::<Vec<_>>()
         });
         let record = json!({
-            "schema": "sd_jwt_issuance_route_v2",
+            "schema": ISSUANCE_ROUTE_SCHEMA,
             "benchmark_id": format!(
                 "{}/{}",
                 ISSUANCE_BENCHMARK_GROUP_ID,
@@ -1143,6 +1267,154 @@ mod tests {
                 panic!("standard case has no structural weight contract")
             }
         }
+    }
+
+    #[test]
+    fn qualification_manifest_schema_order_and_policy_facts_are_exact() {
+        let encoded = issuance_qualification_manifest_json();
+        assert!(encoded.starts_with('{'));
+        assert!(!encoded.starts_with('\u{feff}'));
+        assert!(encoded.ends_with('\n'));
+        assert!(!encoded.ends_with("\n\n"));
+        assert!(!encoded.contains('\r'));
+        assert_eq!(encoded, issuance_qualification_manifest_json());
+
+        let manifest: Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            manifest
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "schema",
+                "benchmark_group_id",
+                "fixture_case_count",
+                "benchmark_id_count",
+                "paired_cell_count",
+                "cases",
+                "criterion_ids",
+                "paired_cells",
+                "route_schema",
+                "work_estimator_version",
+                "static_partition_rule_version",
+                "worker_cap",
+                "mechanical_benchmark_thresholds",
+                "qualified_issuance_thresholds",
+            ]
+        );
+        assert_eq!(
+            manifest["schema"],
+            "sd_jwt_issuance_qualification_manifest_v1"
+        );
+        assert_eq!(manifest["benchmark_group_id"], "sd_jwt_issuance");
+        assert_eq!(manifest["fixture_case_count"], 33);
+        assert_eq!(manifest["benchmark_id_count"], 132);
+        assert_eq!(manifest["paired_cell_count"], 66);
+        assert_eq!(manifest["route_schema"], "sd_jwt_issuance_route_v2");
+        assert_eq!(manifest["work_estimator_version"], "issuance_work_bytes_v1");
+        assert_eq!(
+            manifest["static_partition_rule_version"],
+            "contiguous_ceil_chunks_v1"
+        );
+        assert_eq!(manifest["worker_cap"], BENCHMARK_ISSUANCE_WORKER_CAP);
+        assert_eq!(
+            manifest["mechanical_benchmark_thresholds"],
+            json!({"min_jobs": 2, "min_estimated_work_bytes": 1})
+        );
+        assert!(manifest["qualified_issuance_thresholds"].is_null());
+
+        let cases = manifest["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 33);
+        assert_eq!(
+            cases[0],
+            json!({
+                "fixture_id": "payload_small__decoys_off__n_0001",
+                "disclosure_count": 1,
+            })
+        );
+        assert_eq!(
+            cases[32],
+            json!({
+                "fixture_id": "tl_imbalanced_n0008",
+                "disclosure_count": 8,
+            })
+        );
+        assert!(cases.iter().all(|case| {
+            case.as_object()
+                .map(|case| {
+                    case.keys().map(String::as_str).collect::<Vec<_>>()
+                        == ["fixture_id", "disclosure_count"]
+                })
+                .unwrap_or(false)
+        }));
+
+        let criterion_ids = manifest["criterion_ids"].as_array().unwrap();
+        assert_eq!(criterion_ids.len(), 132);
+        assert_eq!(
+            &criterion_ids[..4],
+            &[
+                json!("sd_jwt_issuance/v2__s_ea__r_so__p_s__d_0__n_0001"),
+                json!("sd_jwt_issuance/v2__s_fi__r_so__p_s__d_0__n_0001"),
+                json!("sd_jwt_issuance/v2__s_ea__r_ac__p_s__d_0__n_0001"),
+                json!("sd_jwt_issuance/v2__s_fi__r_ac__p_s__d_0__n_0001"),
+            ]
+        );
+        assert_eq!(
+            &criterion_ids[128..],
+            &[
+                json!("sd_jwt_issuance/v2__s_ea__r_so__f_tl_imbalanced_n0008"),
+                json!("sd_jwt_issuance/v2__s_fi__r_so__f_tl_imbalanced_n0008"),
+                json!("sd_jwt_issuance/v2__s_ea__r_ac__f_tl_imbalanced_n0008"),
+                json!("sd_jwt_issuance/v2__s_fi__r_ac__f_tl_imbalanced_n0008"),
+            ]
+        );
+        let unique_ids = criterion_ids
+            .iter()
+            .map(|id| id.as_str().unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(unique_ids.len(), 132);
+
+        let paired_cells = manifest["paired_cells"].as_array().unwrap();
+        assert_eq!(paired_cells.len(), 66);
+        assert_eq!(
+            paired_cells[0],
+            json!({
+                "fixture_id": "payload_small__decoys_off__n_0001",
+                "stage": "executor_assembly",
+                "serial_id": "sd_jwt_issuance/v2__s_ea__r_so__p_s__d_0__n_0001",
+                "adaptive_id": "sd_jwt_issuance/v2__s_ea__r_ac__p_s__d_0__n_0001",
+            })
+        );
+        assert_eq!(
+            paired_cells[65],
+            json!({
+                "fixture_id": "tl_imbalanced_n0008",
+                "stage": "full_issuance",
+                "serial_id": "sd_jwt_issuance/v2__s_fi__r_so__f_tl_imbalanced_n0008",
+                "adaptive_id": "sd_jwt_issuance/v2__s_fi__r_ac__f_tl_imbalanced_n0008",
+            })
+        );
+        let mut unique_cells = BTreeSet::new();
+        for cell in paired_cells {
+            let cell = cell.as_object().unwrap();
+            assert_eq!(
+                cell.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["fixture_id", "stage", "serial_id", "adaptive_id"]
+            );
+            assert!(unique_cells.insert((
+                cell["fixture_id"].as_str().unwrap(),
+                cell["stage"].as_str().unwrap(),
+            )));
+            assert!(unique_ids.contains(cell["serial_id"].as_str().unwrap()));
+            assert!(unique_ids.contains(cell["adaptive_id"].as_str().unwrap()));
+        }
+        assert_eq!(unique_cells.len(), 66);
+
+        let mut roundtrip = serde_json::to_string_pretty(&manifest).unwrap();
+        roundtrip.push('\n');
+        assert_eq!(roundtrip, encoded);
     }
 
     #[test]
