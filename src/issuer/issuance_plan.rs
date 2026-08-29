@@ -1614,6 +1614,73 @@ mod tests {
             .collect()
     }
 
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+    fn selector_accounting_jobs() -> Vec<IssuanceJob> {
+        vec![
+            IssuanceJob {
+                identity: IssuanceJobIdentity {
+                    job_id: 0,
+                    location_id: 0,
+                    kind: PlannedJobKind::ObjectDisclosure,
+                    disclosure_ordinal: Some(0),
+                },
+                operation: IssuanceJobOperation::ObjectDisclosure {
+                    key: "k".to_owned(),
+                    salt: "s".to_owned(),
+                    value: Value::Bool(true),
+                },
+            },
+            IssuanceJob {
+                identity: IssuanceJobIdentity {
+                    job_id: 1,
+                    location_id: 1,
+                    kind: PlannedJobKind::ArrayDisclosure,
+                    disclosure_ordinal: Some(1),
+                },
+                operation: IssuanceJobOperation::ArrayDisclosure {
+                    salt: "s".to_owned(),
+                    value: Value::Bool(false),
+                },
+            },
+            IssuanceJob {
+                identity: IssuanceJobIdentity {
+                    job_id: 2,
+                    location_id: 2,
+                    kind: PlannedJobKind::Decoy,
+                    disclosure_ordinal: None,
+                },
+                operation: IssuanceJobOperation::Decoy {
+                    salt: "xyz".to_owned(),
+                },
+            },
+            IssuanceJob {
+                identity: IssuanceJobIdentity {
+                    job_id: 3,
+                    location_id: 3,
+                    kind: PlannedJobKind::ObjectDisclosure,
+                    disclosure_ordinal: Some(2),
+                },
+                operation: IssuanceJobOperation::ObjectDisclosure {
+                    key: "k".to_owned(),
+                    salt: "s".to_owned(),
+                    value: Value::Bool(true),
+                },
+            },
+            IssuanceJob {
+                identity: IssuanceJobIdentity {
+                    job_id: 4,
+                    location_id: 4,
+                    kind: PlannedJobKind::ArrayDisclosure,
+                    disclosure_ordinal: Some(3),
+                },
+                operation: IssuanceJobOperation::ArrayDisclosure {
+                    salt: "s".to_owned(),
+                    value: Value::Bool(false),
+                },
+            },
+        ]
+    }
+
     fn assert_assemblies_equal(expected: &IssuanceAssembly, actual: &IssuanceAssembly) {
         assert_eq!(actual.claims, expected.claims);
         assert_eq!(actual.disclosures.len(), expected.disclosures.len());
@@ -2293,6 +2360,124 @@ mod tests {
                 other => panic!("unexpected native executor error: {other:?}"),
             }
         }
+    }
+
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+    #[test]
+    fn ready_job_estimator_accounts_for_each_operation_exactly() {
+        let jobs = selector_accounting_jobs();
+        let estimates = jobs[..3]
+            .iter()
+            .map(|job| estimate_ready_job_work_bytes(std::slice::from_ref(job)).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(estimates, [16, 12, 3]);
+        assert_eq!(estimate_ready_job_work_bytes(&jobs[..3]), Some(31));
+    }
+
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+    #[test]
+    fn selector_and_static_layout_account_for_non_divisible_ready_batch() {
+        let jobs = selector_accounting_jobs();
+        let job_weights = jobs
+            .iter()
+            .map(|job| estimate_ready_job_work_bytes(std::slice::from_ref(job)).unwrap())
+            .collect::<Vec<_>>();
+        let thresholds = IssuancePolicyThresholds {
+            min_jobs: 1,
+            min_estimated_work_bytes: 1,
+        };
+        let mode = select_execution_mode(&jobs, thresholds, || 4);
+        let IssuanceExecutionMode::NativeParallel { worker_count } = mode else {
+            panic!("accounting fixture must select native execution");
+        };
+
+        let chunk_size = static_chunk_size(jobs.len(), worker_count);
+        let chunk_counts = jobs.chunks(chunk_size).map(<[_]>::len).collect::<Vec<_>>();
+        let chunk_loads = jobs
+            .chunks(chunk_size)
+            .map(|chunk| estimate_ready_job_work_bytes(chunk).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(worker_count, 4);
+        assert_eq!(chunk_size, 2);
+        assert_eq!(job_weights, [16, 12, 3, 16, 12]);
+        assert_eq!(chunk_counts, [2, 2, 1]);
+        assert_eq!(chunk_loads, [28, 19, 12]);
+    }
+
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+    #[test]
+    fn selector_applies_count_then_work_before_querying_available_parallelism() {
+        use std::cell::Cell;
+
+        let jobs = selector_accounting_jobs();
+        let available_parallelism_queries = Cell::new(0usize);
+        let query_available_parallelism = || {
+            available_parallelism_queries.set(available_parallelism_queries.get() + 1);
+            4
+        };
+
+        assert_eq!(
+            select_execution_mode(
+                &jobs[..2],
+                IssuancePolicyThresholds {
+                    min_jobs: 3,
+                    min_estimated_work_bytes: 1,
+                },
+                query_available_parallelism,
+            ),
+            IssuanceExecutionMode::Serial
+        );
+        assert_eq!(available_parallelism_queries.get(), 0);
+
+        assert_eq!(
+            select_execution_mode(
+                &jobs[..3],
+                IssuancePolicyThresholds {
+                    min_jobs: 3,
+                    min_estimated_work_bytes: 32,
+                },
+                query_available_parallelism,
+            ),
+            IssuanceExecutionMode::Serial
+        );
+        assert_eq!(available_parallelism_queries.get(), 0);
+
+        assert_eq!(
+            select_execution_mode(
+                &jobs,
+                IssuancePolicyThresholds {
+                    min_jobs: 3,
+                    min_estimated_work_bytes: 31,
+                },
+                query_available_parallelism,
+            ),
+            IssuanceExecutionMode::NativeParallel { worker_count: 4 }
+        );
+        assert_eq!(available_parallelism_queries.get(), 1);
+    }
+
+    #[cfg(all(
+        feature = "issuance_bench",
+        feature = "parallel",
+        target_arch = "x86_64"
+    ))]
+    #[test]
+    fn benchmark_tracing_is_observational_for_fixed_nested_decoy_plan() {
+        let serial = nested_plan(true).execute_serial().unwrap();
+        let untraced = nested_plan(true).execute_benchmark_candidate().unwrap();
+        let (traced, trace) = nested_plan(true)
+            .execute_benchmark_candidate_with_trace()
+            .unwrap();
+
+        assert_assemblies_equal(&serial, &untraced);
+        assert_assemblies_equal(&serial, &traced);
+        assert_eq!(
+            trace.executor_batches,
+            trace.serial_batches + trace.native_batches
+        );
+        assert!(trace.executor_batches > 0);
     }
 
     #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
