@@ -2,9 +2,9 @@
 // https://www.dsr-corporation.com
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(not(feature = "mock_salts"))]
+#[cfg(all(test, not(feature = "mock_salts")))]
 use crate::utils::generate_salt;
-#[cfg(feature = "mock_salts")]
+#[cfg(all(test, feature = "mock_salts"))]
 use crate::utils::generate_salt_mock;
 use crate::utils::{base64_hash, base64url_encode};
 use serde_json::Value;
@@ -16,23 +16,34 @@ pub(crate) struct SDJWTDisclosure {
 }
 
 impl SDJWTDisclosure {
+    #[cfg(test)]
     pub(crate) fn new<V>(key: Option<String>, value: V) -> Self
     where
         V: ToString,
     {
         #[cfg(not(feature = "mock_salts"))]
         let salt = generate_salt();
+
+        #[cfg(feature = "mock_salts")]
+        let salt = generate_salt_mock();
+
+        Self::new_with_salt(key, value, salt)
+    }
+
+    pub(crate) fn new_with_salt<V>(key: Option<String>, value: V, salt: String) -> Self
+    where
+        V: ToString,
+    {
         let mut value_str = value.to_string();
 
         #[cfg(feature = "mock_salts")]
-        let salt = {
+        {
             value_str = value_str
                 .replace(":[", ": [")
                 .replace(',', ", ")
                 .replace("\":", "\": ")
                 .replace("\":  ", "\": ");
-            generate_salt_mock()
-        };
+        }
 
         if !value_str.is_ascii() {
             value_str = escape_unicode_chars(&value_str);

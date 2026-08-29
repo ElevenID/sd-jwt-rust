@@ -2,6 +2,8 @@
 // https://www.dsr-corporation.com
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(not(feature = "mock_salts"))]
+use super::IssuanceRandomSource;
 use super::{ClaimsForSelectiveDisclosureStrategy, SDJWTIssuer};
 use crate::utils::{base64_hash, base64url_decode, base64url_encode};
 #[cfg(feature = "mock_salts")]
@@ -11,6 +13,8 @@ use crate::{SDJWTSerializationFormat, DEFAULT_DIGEST_ALG, SD_DIGESTS_KEY};
 use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::EncodingKey;
 use serde_json::{json, Value};
+#[cfg(not(feature = "mock_salts"))]
+use std::{collections::VecDeque, ops::Range};
 
 const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
 #[cfg(feature = "mock_salts")]
@@ -37,6 +41,34 @@ const GOLDEN_COMPACT_WITH_HOLDER_KEY: &str = concat!(
     "WyJ0ZXN0LXNhbHQtMDAwMyIsICJhZG1pbiJd",
     "~",
     "WyJ0ZXN0LXNhbHQtMDAwNCIsICJyb2xlcyIsIFt7Ii4uLiI6ICJyc0NicGNhZGZ2VVJmTi1OLVIyVzlMMlRLSEFsNXNsSlIwUUdyalczWjJVIn1dXQ",
+    "~",
+);
+#[cfg(not(feature = "mock_salts"))]
+const GOLDEN_COMPACT_WITH_DECOYS: &str = concat!(
+    "eyJhbGciOiJFUzI1NiJ9",
+    ".",
+    "eyJfc2QiOlsiM2pJWi15UzhxUDgzRU03S3hOY1o3dlIyQmg3c3RvRmlFMVdsZFhmV1BwYyIsIll2VGotY29DbVBILUhlbklYQVE1bXo2Z0Y0NVc2VlZvcVVWMGdnVnJkMlkiLCJ2dGdsbFJ1bG43ZGdOdDhZMkhFNXBQcDVkMGlCcndQUnZma0taTHV4OHhjIiwid0c1ODcwZW5vd2xrZVoyS2wtdUxfWC1xU3JiZ3Bka054dERtU3FuN1RrYyJdLCJfc2RfYWxnIjoic2hhLTI1NiJ9",
+    ".",
+    "GcJ0HDlqMWPJZqNou1dT1cK8BkqF28NnUutqE370JWxbvLj4mvlcadIEI-BY6SwkeV1EX2bR7YXlfXsSW_bk4w",
+    "~",
+    "WyJFUkVSRVJFUkVSRVJFUkVSRVJFUkVRIiwgIm5hbWUiLCAiQWxpY2UiXQ",
+    "~",
+);
+#[cfg(not(feature = "mock_salts"))]
+const GOLDEN_NESTED_COMPACT_WITH_DECOYS: &str = concat!(
+    "eyJhbGciOiJFUzI1NiJ9",
+    ".",
+    "eyJfc2QiOlsiLTlUZ3RRb1RsR3VybGxFNExJeXZtSWVDTll3ZjVrWU0wS19KRWJtbzFnbyIsIkZqX1hVOVVlLTZPNEw3d2wyVUVEUWtGakhwTHhDcTlMazdRZnBaMHpFOTAiLCJwaXRwREw0cUxtUlpnNmtoVmlGOG55OUV3bUQzbDREZkN1RFdJWU5QQVdvIiwicVB0cEpmSkh1OWVod18zdVdtM21rM1F1cmhMRGhSdEVsZW5IMlJwd0FiRSIsInJfZjJaSXZIUUkyNk9YT3pobEQybFRJVzhYM0RXV2ZYUDhJQTZydGZhQ00iLCJ6WEJKS0wtTmdpNTdYSUdsN0IybUxPOUowR2FkZ2RZMFAtZTlvLUYwd0tnIl0sIl9zZF9hbGciOiJzaGEtMjU2In0",
+    ".",
+    "5zlxqmX49L32pV1b1j4hyzMhYyp7F3gibglcjtBhfXtkgOfa7OeawFHKDK1TiUpiStePh9cGVYTu8gAXZoF8Mw",
+    "~",
+    "WyJNVEV4TVRFeE1URXhNVEV4TVRFeE1RIiwgImNpdHkiLCAiRGVudmVyIl0",
+    "~",
+    "WyJNakl5TWpJeU1qSXlNakl5TWpJeU1nIiwgInByb2ZpbGUiLCB7Il9zZCI6WyJncXhLeEpoUEYtMDl1MmhOQ3hkbGFZeEFFaUNpM1BNTHJZbGVHcHIxdDBrIiwiaWY1N3puQlNjOFpTaFB1blFXTzZkVGZWai1qN2ZrU05zRXZYMDZ0T3lfSSIsInZpUlY3OVpHa1FmTTVNcjByM1YzcVphRU1KWWN2Zm54T2hPZlNTX1lCTXciXX1d",
+    "~",
+    "WyJNek16TXpNek16TXpNek16TXpNek13IiwgImFkbWluIl0",
+    "~",
+    "WyJORFEwTkRRME5EUTBORFEwTkRRME5BIiwgInJvbGVzIiwgW3siLi4uIjoiZTVaVnp5dzFhT1hSZG4tQWg4Qkl6WnFvZnpLZ2h2R2lNZFlHdXo1QURqdyJ9XV0",
     "~",
 );
 
@@ -73,6 +105,88 @@ fn nested_claims() -> Value {
         "address": { "city": "Denver" },
         "roles": ["admin"]
     })
+}
+
+#[cfg(not(feature = "mock_salts"))]
+#[derive(Debug, Eq, PartialEq)]
+enum RandomCall {
+    DisclosureSalt,
+    DecoyCount(Range<u32>),
+    DecoySalt,
+}
+
+#[cfg(not(feature = "mock_salts"))]
+struct FixedIssuanceRandomSource {
+    disclosure_salts: VecDeque<String>,
+    decoy_counts: VecDeque<u32>,
+    decoy_salts: VecDeque<String>,
+    calls: Vec<RandomCall>,
+}
+
+#[cfg(not(feature = "mock_salts"))]
+impl FixedIssuanceRandomSource {
+    fn decoy_fixture() -> Self {
+        Self {
+            disclosure_salts: [base64url_encode(&[0x11; 16])].into_iter().collect(),
+            decoy_counts: [3].into_iter().collect(),
+            decoy_salts: [
+                base64url_encode(&[0x21; 16]),
+                base64url_encode(&[0x22; 16]),
+                base64url_encode(&[0x23; 16]),
+            ]
+            .into_iter()
+            .collect(),
+            calls: Vec::new(),
+        }
+    }
+
+    fn nested_decoy_fixture() -> Self {
+        Self {
+            disclosure_salts: [0x31, 0x32, 0x33, 0x34]
+                .into_iter()
+                .map(|byte| base64url_encode(&[byte; 16]))
+                .collect(),
+            decoy_counts: [2, 4].into_iter().collect(),
+            decoy_salts: [0x41, 0x42, 0x43, 0x44, 0x45, 0x46]
+                .into_iter()
+                .map(|byte| base64url_encode(&[byte; 16]))
+                .collect(),
+            calls: Vec::new(),
+        }
+    }
+
+    fn assert_exhausted(&self) {
+        assert!(self.disclosure_salts.is_empty());
+        assert!(self.decoy_counts.is_empty());
+        assert!(self.decoy_salts.is_empty());
+    }
+}
+
+#[cfg(not(feature = "mock_salts"))]
+impl IssuanceRandomSource for FixedIssuanceRandomSource {
+    fn disclosure_salt(&mut self) -> String {
+        self.calls.push(RandomCall::DisclosureSalt);
+        self.disclosure_salts
+            .pop_front()
+            .expect("fixed disclosure-salt tape must not be exhausted")
+    }
+
+    fn decoy_count(&mut self, range: Range<u32>) -> u32 {
+        self.calls.push(RandomCall::DecoyCount(range.clone()));
+        let count = self
+            .decoy_counts
+            .pop_front()
+            .expect("fixed decoy-count tape must not be exhausted");
+        assert!(range.contains(&count));
+        count
+    }
+
+    fn decoy_salt(&mut self) -> String {
+        self.calls.push(RandomCall::DecoySalt);
+        self.decoy_salts
+            .pop_front()
+            .expect("fixed decoy-salt tape must not be exhausted")
+    }
 }
 
 #[test]
@@ -343,6 +457,159 @@ fn production_salts_preserve_compact_json_and_bmp_disclosure_bytes() {
         root_digests[0], root_digests[1], root_digests[2], DEFAULT_DIGEST_ALG
     );
     assert_eq!(decoded_jwt_payload(&issuer.signed_sd_jwt), expected_payload);
+}
+
+#[test]
+#[cfg(not(feature = "mock_salts"))]
+fn fixed_random_tape_replays_decoys_and_their_allocation_order() {
+    let mut random_source = FixedIssuanceRandomSource::decoy_fixture();
+    let mut issuer = new_issuer();
+    let serialized = issuer
+        .issue_sd_jwt_with_random_source(
+            json!({ "name": "Alice" }),
+            ClaimsForSelectiveDisclosureStrategy::TopLevel,
+            None,
+            true,
+            SDJWTSerializationFormat::Compact,
+            &mut random_source,
+        )
+        .expect("fixed-tape issuance with decoys must succeed");
+
+    random_source.assert_exhausted();
+    assert_eq!(
+        random_source.calls,
+        vec![
+            RandomCall::DisclosureSalt,
+            RandomCall::DecoyCount(2..5),
+            RandomCall::DecoySalt,
+            RandomCall::DecoySalt,
+            RandomCall::DecoySalt,
+        ]
+    );
+    assert_eq!(issuer.all_disclosures.len(), 1);
+    let digests = issuer.sd_jwt_payload[SD_DIGESTS_KEY]
+        .as_array()
+        .expect("root _sd must be an array");
+    assert_eq!(digests.len(), 4);
+    let digest_strings = digests
+        .iter()
+        .map(|digest| digest.as_str().expect("every _sd entry must be a string"))
+        .collect::<Vec<_>>();
+    assert!(digest_strings.windows(2).all(|pair| pair[0] <= pair[1]));
+    for digest in digest_strings {
+        assert_eq!(digest.len(), 43);
+        assert_eq!(
+            base64url_decode(digest)
+                .expect("every _sd entry must be valid Base64url")
+                .len(),
+            32
+        );
+    }
+    assert_eq!(serialized, GOLDEN_COMPACT_WITH_DECOYS);
+}
+
+#[test]
+#[cfg(not(feature = "mock_salts"))]
+fn nested_random_tape_locks_child_decoys_before_parent_disclosures() {
+    let mut random_source = FixedIssuanceRandomSource::nested_decoy_fixture();
+    let mut issuer = new_issuer();
+    let serialized = issuer
+        .issue_sd_jwt_with_random_source(
+            json!({
+                "profile": { "city": "Denver" },
+                "roles": ["admin"]
+            }),
+            ClaimsForSelectiveDisclosureStrategy::AllLevels,
+            None,
+            true,
+            SDJWTSerializationFormat::Compact,
+            &mut random_source,
+        )
+        .expect("nested fixed-tape issuance with decoys must succeed");
+
+    random_source.assert_exhausted();
+    assert_eq!(
+        random_source.calls,
+        vec![
+            RandomCall::DisclosureSalt,
+            RandomCall::DecoyCount(2..5),
+            RandomCall::DecoySalt,
+            RandomCall::DecoySalt,
+            RandomCall::DisclosureSalt,
+            RandomCall::DisclosureSalt,
+            RandomCall::DisclosureSalt,
+            RandomCall::DecoyCount(2..5),
+            RandomCall::DecoySalt,
+            RandomCall::DecoySalt,
+            RandomCall::DecoySalt,
+            RandomCall::DecoySalt,
+        ]
+    );
+    assert_eq!(issuer.all_disclosures.len(), 4);
+    assert_eq!(
+        issuer.sd_jwt_payload[SD_DIGESTS_KEY]
+            .as_array()
+            .map(Vec::len),
+        Some(6)
+    );
+
+    let profile_disclosure = String::from_utf8(
+        base64url_decode(&issuer.all_disclosures[1].raw_b64)
+            .expect("profile disclosure must be valid Base64url"),
+    )
+    .expect("profile disclosure must be UTF-8 JSON");
+    let profile_disclosure: Value =
+        serde_json::from_str(&profile_disclosure).expect("profile disclosure must be valid JSON");
+    assert_eq!(
+        profile_disclosure[2][SD_DIGESTS_KEY]
+            .as_array()
+            .map(Vec::len),
+        Some(3)
+    );
+    assert_eq!(serialized, GOLDEN_NESTED_COMPACT_WITH_DECOYS);
+}
+
+#[test]
+#[cfg(not(feature = "mock_salts"))]
+fn public_legacy_random_source_preserves_decoy_shape() {
+    let mut issuer = new_issuer();
+    issuer
+        .issue_sd_jwt(
+            json!({ "name": "Alice" }),
+            ClaimsForSelectiveDisclosureStrategy::TopLevel,
+            None,
+            true,
+            SDJWTSerializationFormat::Compact,
+        )
+        .expect("public issuance with decoys must succeed");
+
+    assert_eq!(issuer.all_disclosures.len(), 1);
+    let real_digest = issuer.all_disclosures[0].hash.as_str();
+    let digests = issuer.sd_jwt_payload[SD_DIGESTS_KEY]
+        .as_array()
+        .expect("root _sd must be an array");
+    assert!((3..=5).contains(&digests.len()));
+    let digest_strings = digests
+        .iter()
+        .map(|digest| digest.as_str().expect("every _sd entry must be a string"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        digest_strings
+            .iter()
+            .filter(|digest| **digest == real_digest)
+            .count(),
+        1
+    );
+    assert!(digest_strings.windows(2).all(|pair| pair[0] <= pair[1]));
+    for digest in digest_strings {
+        assert_eq!(digest.len(), 43);
+        assert_eq!(
+            base64url_decode(digest)
+                .expect("every _sd entry must be valid Base64url")
+                .len(),
+            32
+        );
+    }
 }
 
 #[test]
