@@ -39,6 +39,23 @@ To run tests:
 cargo test
 ```
 
+### Issuance qualification evidence
+
+The opt-in `issuance_bench` feature exposes a deterministic qualification
+manifest without enabling the production adaptive route:
+
+```shell
+cargo run --features issuance_bench --example issuance_qualification_manifest -- --output /absolute/new/manifest.json
+```
+
+The output path must be absolute and must not already exist. To retain the
+aggregate preflight route records produced by the issuance Criterion target,
+set `SD_JWT_ISSUANCE_ROUTE_NDJSON` to a different absolute, nonexistent file
+before starting the benchmark. A successful benchmark process writes exactly
+132 LF-terminated JSON records and durably syncs the file. Route records are
+never mixed into Criterion's standard output; when the variable is absent no
+route-evidence file is created.
+
 ### Interoperability testing tool
 See [Generate tool README](./generate/README.md) document.
 

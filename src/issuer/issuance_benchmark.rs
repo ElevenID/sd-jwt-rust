@@ -8,8 +8,13 @@
 //! The public facade is necessary because Cargo compiles a Criterion target as
 //! a separate crate; all executor controls behind it remain crate-private.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
+use std::env;
+use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
 use std::ops::Range;
+use std::path::PathBuf;
 
 use jsonwebtoken::EncodingKey;
 use serde_json::{json, Map, Value};
@@ -35,6 +40,9 @@ pub const ISSUANCE_LARGE_PAYLOAD_BYTES: usize = 64 * 1024;
 
 /// Stable Criterion group prefix used in route evidence.
 pub const ISSUANCE_BENCHMARK_GROUP_ID: &str = "sd_jwt_issuance";
+
+/// Optional absolute create-new destination for aggregate route evidence.
+pub const ISSUANCE_ROUTE_NDJSON_ENV: &str = "SD_JWT_ISSUANCE_ROUTE_NDJSON";
 
 const ISSUANCE_ROUTE_SCHEMA: &str = "sd_jwt_issuance_route_v2";
 const ISSUANCE_QUALIFICATION_MANIFEST_SCHEMA: &str = "sd_jwt_issuance_qualification_manifest_v1";
@@ -427,6 +435,123 @@ pub fn issuance_qualification_manifest_json() -> String {
         .expect("issuance qualification manifest must serialize");
     manifest.push('\n');
     manifest
+}
+
+/// A create-new destination reserved before Criterion starts measuring.
+///
+/// Holding the reserved write-only file handle does not add work to any timed
+/// closure. A process that exits before [`Self::finish`] leaves an empty file,
+/// which a qualification controller must reject rather than mistake for
+/// complete evidence.
+#[derive(Debug)]
+pub struct IssuanceBenchmarkRouteSink {
+    file: File,
+}
+
+impl IssuanceBenchmarkRouteSink {
+    /// Validate all route records and durably write one LF-terminated JSON
+    /// object per line.
+    pub fn finish(mut self, records: &[String]) -> io::Result<()> {
+        let payload = validated_route_payload(records)?;
+        self.file.write_all(&payload)?;
+        self.file.flush()?;
+        self.file.sync_all()
+    }
+}
+
+/// Reserve the optional route-evidence file named by
+/// [`ISSUANCE_ROUTE_NDJSON_ENV`].
+///
+/// The environment variable may be absent. When present, it must contain an
+/// absolute path that does not already exist; existing evidence is never
+/// replaced.
+pub fn prepare_issuance_route_sink_from_env() -> io::Result<Option<IssuanceBenchmarkRouteSink>> {
+    prepare_issuance_route_sink(env::var_os(ISSUANCE_ROUTE_NDJSON_ENV))
+}
+
+fn prepare_issuance_route_sink(
+    destination: Option<OsString>,
+) -> io::Result<Option<IssuanceBenchmarkRouteSink>> {
+    let Some(destination) = destination else {
+        return Ok(None);
+    };
+    let destination = PathBuf::from(destination);
+    if !destination.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "issuance route evidence destination must be absolute",
+        ));
+    }
+
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    Ok(Some(IssuanceBenchmarkRouteSink { file }))
+}
+
+fn validated_route_payload(records: &[String]) -> io::Result<Vec<u8>> {
+    if records.len() != ISSUANCE_BENCHMARK_ID_COUNT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "issuance route evidence must contain exactly {ISSUANCE_BENCHMARK_ID_COUNT} records"
+            ),
+        ));
+    }
+
+    let expected_ids = qualification_criterion_ids(&issuance_benchmark_cases())
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let mut observed_ids = BTreeSet::new();
+    let mut payload = Vec::with_capacity(records.iter().map(|record| record.len() + 1).sum());
+
+    for record in records {
+        if record.contains('\r') || record.contains('\n') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "issuance route record must occupy exactly one line",
+            ));
+        }
+        let value: Value = serde_json::from_str(record).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "issuance route record must be valid JSON",
+            )
+        })?;
+        if value.get("schema").and_then(Value::as_str) != Some(ISSUANCE_ROUTE_SCHEMA) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "issuance route record has an unexpected schema",
+            ));
+        }
+        let benchmark_id = value
+            .get("benchmark_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "issuance route record is missing its benchmark ID",
+                )
+            })?;
+        if !observed_ids.insert(benchmark_id.to_owned()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "issuance route evidence contains a duplicate benchmark ID",
+            ));
+        }
+
+        payload.extend_from_slice(record.as_bytes());
+        payload.push(b'\n');
+    }
+
+    if observed_ids != expected_ids {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "issuance route evidence does not cover the canonical benchmark IDs",
+        ));
+    }
+    Ok(payload)
 }
 
 /// Exact claims and deterministic randomness shared by both requested routes.
@@ -1214,12 +1339,15 @@ fn available_parallelism() -> usize {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, MutexGuard};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
     use crate::issuer::issuance_plan::BenchmarkStaticChunkTrace;
 
     static BENCHMARK_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static NEXT_ROUTE_PATH: AtomicUsize = AtomicUsize::new(0);
 
     fn benchmark_test_guard() -> MutexGuard<'static, ()> {
         BENCHMARK_TEST_LOCK
@@ -1266,6 +1394,102 @@ mod tests {
             IssuanceBenchmarkFixtureKind::Standard { .. } => {
                 panic!("standard case has no structural weight contract")
             }
+        }
+    }
+
+    fn unique_route_path(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock must follow the Unix epoch")
+            .as_nanos();
+        env::temp_dir().join(format!(
+            "sd-jwt-issuance-{label}-{}-{nonce}-{}.ndjson",
+            std::process::id(),
+            NEXT_ROUTE_PATH.fetch_add(1, Ordering::Relaxed),
+        ))
+    }
+
+    fn minimal_route_records() -> Vec<String> {
+        qualification_criterion_ids(&issuance_benchmark_cases())
+            .into_iter()
+            .map(|benchmark_id| {
+                serde_json::to_string(&json!({
+                    "schema": ISSUANCE_ROUTE_SCHEMA,
+                    "benchmark_id": benchmark_id,
+                }))
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn route_sink_is_optional_and_rejects_relative_destinations() {
+        assert!(prepare_issuance_route_sink(None).unwrap().is_none());
+
+        let error =
+            prepare_issuance_route_sink(Some(OsString::from("relative.ndjson"))).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn route_sink_creates_once_and_writes_the_exact_canonical_id_set() {
+        let destination = unique_route_path("valid");
+        let records = minimal_route_records();
+        let sink = prepare_issuance_route_sink(Some(destination.clone().into_os_string()))
+            .unwrap()
+            .unwrap();
+        sink.finish(&records).unwrap();
+
+        let bytes = std::fs::read(&destination).unwrap();
+        assert!(!bytes.starts_with(&[0xef, 0xbb, 0xbf]));
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        assert!(!bytes.contains(&b'\r'));
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            format!("{}\n", records.join("\n"))
+        );
+
+        let error =
+            prepare_issuance_route_sink(Some(destination.clone().into_os_string())).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        std::fs::remove_file(destination).unwrap();
+    }
+
+    #[test]
+    fn route_sink_rejects_incomplete_ambiguous_or_wrong_id_evidence_before_writing() {
+        let records = minimal_route_records();
+        let invalid_sets = [
+            records[..records.len() - 1].to_vec(),
+            {
+                let mut multiline = records.clone();
+                multiline[0].push('\n');
+                multiline
+            },
+            {
+                let mut duplicate = records.clone();
+                duplicate[0] = duplicate[1].clone();
+                duplicate
+            },
+            {
+                let mut wrong_schema = records.clone();
+                wrong_schema[0] = serde_json::to_string(&json!({
+                    "schema": "sd_jwt_issuance_route_unknown",
+                    "benchmark_id": qualification_criterion_ids(&issuance_benchmark_cases())[0],
+                }))
+                .unwrap();
+                wrong_schema
+            },
+        ];
+
+        for (ordinal, invalid) in invalid_sets.into_iter().enumerate() {
+            let destination = unique_route_path(&format!("invalid-{ordinal}"));
+            let sink = prepare_issuance_route_sink(Some(destination.clone().into_os_string()))
+                .unwrap()
+                .unwrap();
+            let error = sink.finish(&invalid).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(std::fs::read(&destination).unwrap().is_empty());
+            std::fs::remove_file(destination).unwrap();
         }
     }
 
