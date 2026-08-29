@@ -30,7 +30,13 @@ jobs:
       run: cargo test --locked --benches --verbose
     - name: Smoke-test parallel-feature benchmarks
       run: cargo test --locked --no-default-features --features parallel --benches --verbose
+    - name: Smoke-test issuance executor benchmark
+      run: cargo test --locked --no-default-features --features issuance_bench --bench sd_jwt_issuance --verbose
     - name: Check ARM64 serial fallback
       run: cargo check --locked --target aarch64-unknown-linux-gnu --no-default-features --features parallel --verbose
+    - name: Check ARM64 issuance benchmark fallback
+      run: cargo check --locked --target aarch64-unknown-linux-gnu --no-default-features --features issuance_bench --lib --tests --verbose
     - name: Check parallel feature uses WASM serial fallback
       run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features parallel --verbose
+    - name: Check issuance benchmark uses WASM serial fallback
+      run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features issuance_bench --lib --tests --verbose

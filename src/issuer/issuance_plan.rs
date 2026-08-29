@@ -14,6 +14,12 @@
 //! duplicate, swapped, or misplaced jobs before the issuer signs.
 
 use serde_json::{json, Map, Value};
+#[cfg(all(
+    feature = "issuance_bench",
+    feature = "parallel",
+    target_arch = "x86_64"
+))]
+use std::cell::Cell;
 #[cfg(any(test, all(feature = "parallel", target_arch = "x86_64")))]
 use std::collections::HashMap;
 #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
@@ -46,6 +52,32 @@ const PARALLEL_ISSUANCE_SPAWN_FAILURE: &str =
 /// enablement an isolated change.
 #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
 const QUALIFIED_ISSUANCE_THRESHOLDS: Option<IssuancePolicyThresholds> = None;
+
+/// Mechanical eligibility only: this is not a qualified production policy.
+/// It exists solely so the opt-in benchmark exercises the complete adaptive
+/// selector, process-wide worker lease, and bounded native executor.
+#[cfg(all(
+    feature = "issuance_bench",
+    feature = "parallel",
+    target_arch = "x86_64"
+))]
+const BENCHMARK_ISSUANCE_THRESHOLDS: IssuancePolicyThresholds = IssuancePolicyThresholds {
+    min_jobs: 2,
+    min_estimated_work_bytes: 1,
+};
+
+#[cfg(all(
+    feature = "issuance_bench",
+    feature = "parallel",
+    target_arch = "x86_64"
+))]
+pub(super) const BENCHMARK_ISSUANCE_WORKER_CAP: usize = MAX_PARALLEL_ISSUANCE_WORKERS;
+
+#[cfg(all(
+    feature = "issuance_bench",
+    not(all(feature = "parallel", target_arch = "x86_64"))
+))]
+pub(super) const BENCHMARK_ISSUANCE_WORKER_CAP: usize = 1;
 
 struct PlannedJob {
     job_id: JobId,
@@ -131,6 +163,74 @@ pub(super) struct IssuanceAssembly {
     pub(super) disclosures: Vec<SDJWTDisclosure>,
 }
 
+#[cfg(feature = "issuance_bench")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct BenchmarkExecutionTraceSummary {
+    pub(super) executor_batches: usize,
+    pub(super) serial_batches: usize,
+    pub(super) native_batches: usize,
+    pub(super) budget_fallback_batches: usize,
+    pub(super) max_worker_count: usize,
+    pub(super) target_serial_fallback: bool,
+}
+
+#[cfg(all(
+    feature = "issuance_bench",
+    feature = "parallel",
+    target_arch = "x86_64"
+))]
+#[derive(Default)]
+struct BenchmarkExecutionTrace {
+    executor_batches: Cell<usize>,
+    serial_batches: Cell<usize>,
+    native_batches: Cell<usize>,
+    budget_fallback_batches: Cell<usize>,
+    max_worker_count: Cell<usize>,
+}
+
+#[cfg(all(
+    feature = "issuance_bench",
+    feature = "parallel",
+    target_arch = "x86_64"
+))]
+impl BenchmarkExecutionTrace {
+    fn record_serial(&self) {
+        self.executor_batches
+            .set(self.executor_batches.get().saturating_add(1));
+        self.serial_batches
+            .set(self.serial_batches.get().saturating_add(1));
+    }
+
+    fn record_native(&self, worker_count: usize) {
+        self.executor_batches
+            .set(self.executor_batches.get().saturating_add(1));
+        self.native_batches
+            .set(self.native_batches.get().saturating_add(1));
+        self.max_worker_count
+            .set(self.max_worker_count.get().max(worker_count));
+    }
+
+    fn record_budget_fallback(&self) {
+        self.executor_batches
+            .set(self.executor_batches.get().saturating_add(1));
+        self.serial_batches
+            .set(self.serial_batches.get().saturating_add(1));
+        self.budget_fallback_batches
+            .set(self.budget_fallback_batches.get().saturating_add(1));
+    }
+
+    fn summary(&self) -> BenchmarkExecutionTraceSummary {
+        BenchmarkExecutionTraceSummary {
+            executor_batches: self.executor_batches.get(),
+            serial_batches: self.serial_batches.get(),
+            native_batches: self.native_batches.get(),
+            budget_fallback_batches: self.budget_fallback_batches.get(),
+            max_worker_count: self.max_worker_count.get(),
+            target_serial_fallback: false,
+        }
+    }
+}
+
 impl IssuancePlan {
     pub(super) fn create<'a, R: IssuanceRandomSource>(
         claims: Value,
@@ -179,6 +279,58 @@ impl IssuancePlan {
         assembler.finish(claims)
     }
 
+    /// Exercise the candidate through the exact adaptive production machinery,
+    /// but with mechanical benchmark eligibility rather than a production
+    /// threshold. This method does not exist without the benchmark feature.
+    #[cfg(feature = "issuance_bench")]
+    pub(super) fn execute_benchmark_candidate(self) -> Result<IssuanceAssembly> {
+        #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+        {
+            self.execute_adaptively(
+                Some(BENCHMARK_ISSUANCE_THRESHOLDS),
+                &PARALLEL_ISSUANCE_WORKER_BUDGET,
+                available_worker_threads,
+            )
+        }
+
+        #[cfg(not(all(feature = "parallel", target_arch = "x86_64")))]
+        {
+            self.execute_serial()
+        }
+    }
+
+    /// Untimed benchmark preflight variant that records the route selected for
+    /// each ready batch. Timed iterations use `execute_benchmark_candidate`
+    /// and therefore pay no tracing cost.
+    #[cfg(feature = "issuance_bench")]
+    pub(super) fn execute_benchmark_candidate_with_trace(
+        self,
+    ) -> Result<(IssuanceAssembly, BenchmarkExecutionTraceSummary)> {
+        #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+        {
+            let trace = BenchmarkExecutionTrace::default();
+            let assembly = self.execute_with_executor(&AdaptiveIssuanceExecutor {
+                thresholds: BENCHMARK_ISSUANCE_THRESHOLDS,
+                budget: &PARALLEL_ISSUANCE_WORKER_BUDGET,
+                available_threads: available_worker_threads,
+                trace: Some(&trace),
+            })?;
+            Ok((assembly, trace.summary()))
+        }
+
+        #[cfg(not(all(feature = "parallel", target_arch = "x86_64")))]
+        {
+            let assembly = self.execute_serial()?;
+            Ok((
+                assembly,
+                BenchmarkExecutionTraceSummary {
+                    target_serial_fallback: true,
+                    ..BenchmarkExecutionTraceSummary::default()
+                },
+            ))
+        }
+    }
+
     #[cfg(any(test, all(feature = "parallel", target_arch = "x86_64")))]
     fn execute_with_executor<E: IssuanceExecutor>(self, executor: &E) -> Result<IssuanceAssembly> {
         let mut assembler = SerialAssembler::new(self.jobs, self.disclosure_job_ids)?;
@@ -203,6 +355,8 @@ impl IssuancePlan {
             thresholds,
             budget,
             available_threads,
+            #[cfg(feature = "issuance_bench")]
+            trace: None,
         })
     }
 }
@@ -775,6 +929,8 @@ struct AdaptiveIssuanceExecutor<'a, F> {
     thresholds: IssuancePolicyThresholds,
     budget: &'a ParallelIssuanceWorkerBudget,
     available_threads: F,
+    #[cfg(feature = "issuance_bench")]
+    trace: Option<&'a BenchmarkExecutionTrace>,
 }
 
 #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
@@ -785,11 +941,24 @@ where
     fn execute(&self, jobs: Vec<IssuanceJob>) -> Result<Vec<IssuanceOutcome>> {
         let mode = select_execution_mode(&jobs, self.thresholds, || (self.available_threads)());
         let IssuanceExecutionMode::NativeParallel { worker_count } = mode else {
+            #[cfg(feature = "issuance_bench")]
+            if let Some(trace) = self.trace {
+                trace.record_serial();
+            }
             return SerialIssuanceExecutor::default().execute(jobs);
         };
         let Some(lease) = self.budget.try_acquire(worker_count) else {
+            #[cfg(feature = "issuance_bench")]
+            if let Some(trace) = self.trace {
+                trace.record_budget_fallback();
+            }
             return SerialIssuanceExecutor::default().execute(jobs);
         };
+
+        #[cfg(feature = "issuance_bench")]
+        if let Some(trace) = self.trace {
+            trace.record_native(lease.worker_count());
+        }
 
         let outcomes = NativeParallelIssuanceExecutor::new(lease.worker_count()).execute(jobs);
         // Every scoped worker has joined. Release permits before deterministic
@@ -1908,6 +2077,20 @@ mod tests {
 
     #[test]
     fn production_policy_is_the_exact_serial_oracle_until_thresholds_are_qualified() {
+        let expected = nested_plan(true).execute_serial().unwrap();
+        let actual = nested_plan(true).execute().unwrap();
+
+        assert_assemblies_equal(&expected, &actual);
+    }
+
+    #[cfg(all(
+        feature = "parallel",
+        not(feature = "issuance_bench"),
+        target_arch = "x86_64"
+    ))]
+    #[test]
+    fn parallel_feature_alone_does_not_activate_benchmark_routing() {
+        assert!(QUALIFIED_ISSUANCE_THRESHOLDS.is_none());
         let expected = nested_plan(true).execute_serial().unwrap();
         let actual = nested_plan(true).execute().unwrap();
 

@@ -13,6 +13,11 @@ homepage = "https://github.com/openwallet-foundation-labs/sd-jwt-rust"
 [features]
 mock_salts = ["lazy_static"]
 parallel = []
+# Criterion is compiled as a separate crate and cannot reach the private
+# issuance executor. This opt-in feature exposes only the deterministic
+# benchmark fixture; ordinary builds, including `parallel`-only builds, do not
+# compile the fixture or alter production routing.
+issuance_bench = ["parallel"]
 
 [dependencies]
 base64 = "0.21"
@@ -41,3 +46,8 @@ regex = "1.10"
 [[bench]]
 name = "sd_jwt_verification"
 harness = false
+
+[[bench]]
+name = "sd_jwt_issuance"
+harness = false
+required-features = ["issuance_bench"]
