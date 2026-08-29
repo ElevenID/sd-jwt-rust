@@ -35,8 +35,8 @@ pub const ISSUANCE_LARGE_PAYLOAD_BYTES: usize = 64 * 1024;
 /// Stable Criterion group prefix used in route evidence.
 pub const ISSUANCE_BENCHMARK_GROUP_ID: &str = "sd_jwt_issuance";
 
-/// Twenty core cases plus ten focused root/nested-decoy cases.
-pub const ISSUANCE_FIXTURE_CASE_COUNT: usize = 30;
+/// Twenty core cases, ten focused decoy cases, and three structural cases.
+pub const ISSUANCE_FIXTURE_CASE_COUNT: usize = 33;
 
 /// Two stages times two requested routes for every fixture case.
 pub const ISSUANCE_BENCHMARK_ID_COUNT: usize = ISSUANCE_FIXTURE_CASE_COUNT * 2 * 2;
@@ -157,24 +157,44 @@ impl IssuanceBenchmarkEffectiveRoute {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IssuanceBenchmarkFixtureKind {
+    Standard {
+        payload_class: IssuancePayloadClass,
+        add_decoy_claims: bool,
+    },
+    AllLevelsNestedObjects,
+    AllLevelsArrayDag,
+    TopLevelImbalanced,
+}
+
 /// Stable fixture descriptor. Fields remain private so the matrix can only be
 /// constructed through the reviewed generator below.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IssuanceBenchmarkCase {
     disclosure_count: usize,
-    payload_class: IssuancePayloadClass,
-    add_decoy_claims: bool,
+    kind: IssuanceBenchmarkFixtureKind,
 }
 
 impl IssuanceBenchmarkCase {
     /// Stable fixture ID independent of host and Criterion configuration.
     pub fn fixture_id(self) -> String {
-        format!(
-            "payload_{}__decoys_{}__n_{:04}",
-            self.payload_class.label(),
-            if self.add_decoy_claims { "on" } else { "off" },
-            self.disclosure_count
-        )
+        match self.kind {
+            IssuanceBenchmarkFixtureKind::Standard {
+                payload_class,
+                add_decoy_claims,
+            } => format!(
+                "payload_{}__decoys_{}__n_{:04}",
+                payload_class.label(),
+                if add_decoy_claims { "on" } else { "off" },
+                self.disclosure_count
+            ),
+            IssuanceBenchmarkFixtureKind::AllLevelsNestedObjects => {
+                "al_nested_obj_n0007".to_owned()
+            }
+            IssuanceBenchmarkFixtureKind::AllLevelsArrayDag => "al_array_dag_n0008".to_owned(),
+            IssuanceBenchmarkFixtureKind::TopLevelImbalanced => "tl_imbalanced_n0008".to_owned(),
+        }
     }
 
     /// Stable machine-readable Criterion ID, versioned for frozen runners.
@@ -183,14 +203,50 @@ impl IssuanceBenchmarkCase {
         stage: IssuanceBenchmarkStage,
         route: IssuanceBenchmarkRoute,
     ) -> String {
-        format!(
-            "v1__s_{}__r_{}__p_{}__d_{}__n_{:04}",
-            stage.code(),
-            route.code(),
-            self.payload_class.code(),
-            usize::from(self.add_decoy_claims),
-            self.disclosure_count,
+        match self.kind {
+            IssuanceBenchmarkFixtureKind::Standard {
+                payload_class,
+                add_decoy_claims,
+            } => format!(
+                "v2__s_{}__r_{}__p_{}__d_{}__n_{:04}",
+                stage.code(),
+                route.code(),
+                payload_class.code(),
+                usize::from(add_decoy_claims),
+                self.disclosure_count,
+            ),
+            IssuanceBenchmarkFixtureKind::AllLevelsNestedObjects
+            | IssuanceBenchmarkFixtureKind::AllLevelsArrayDag
+            | IssuanceBenchmarkFixtureKind::TopLevelImbalanced => format!(
+                "v2__s_{}__r_{}__f_{}",
+                stage.code(),
+                route.code(),
+                self.fixture_id(),
+            ),
+        }
+    }
+
+    fn add_decoy_claims(self) -> bool {
+        matches!(
+            self.kind,
+            IssuanceBenchmarkFixtureKind::Standard {
+                add_decoy_claims: true,
+                ..
+            }
         )
+    }
+
+    fn disclosure_strategy(self) -> ClaimsForSelectiveDisclosureStrategy<'static> {
+        match self.kind {
+            IssuanceBenchmarkFixtureKind::AllLevelsNestedObjects
+            | IssuanceBenchmarkFixtureKind::AllLevelsArrayDag => {
+                ClaimsForSelectiveDisclosureStrategy::AllLevels
+            }
+            IssuanceBenchmarkFixtureKind::Standard { .. }
+            | IssuanceBenchmarkFixtureKind::TopLevelImbalanced => {
+                ClaimsForSelectiveDisclosureStrategy::TopLevel
+            }
+        }
     }
 }
 
@@ -208,8 +264,10 @@ pub fn issuance_benchmark_cases() -> Vec<IssuanceBenchmarkCase> {
         for disclosure_count in ISSUANCE_DISCLOSURE_COUNTS {
             cases.push(IssuanceBenchmarkCase {
                 disclosure_count,
-                payload_class,
-                add_decoy_claims: false,
+                kind: IssuanceBenchmarkFixtureKind::Standard {
+                    payload_class,
+                    add_decoy_claims: false,
+                },
             });
         }
     }
@@ -220,11 +278,28 @@ pub fn issuance_benchmark_cases() -> Vec<IssuanceBenchmarkCase> {
         for disclosure_count in ISSUANCE_DISCLOSURE_COUNTS {
             cases.push(IssuanceBenchmarkCase {
                 disclosure_count,
-                payload_class,
-                add_decoy_claims: true,
+                kind: IssuanceBenchmarkFixtureKind::Standard {
+                    payload_class,
+                    add_decoy_claims: true,
+                },
             });
         }
     }
+
+    cases.extend([
+        IssuanceBenchmarkCase {
+            disclosure_count: 7,
+            kind: IssuanceBenchmarkFixtureKind::AllLevelsNestedObjects,
+        },
+        IssuanceBenchmarkCase {
+            disclosure_count: 8,
+            kind: IssuanceBenchmarkFixtureKind::AllLevelsArrayDag,
+        },
+        IssuanceBenchmarkCase {
+            disclosure_count: 8,
+            kind: IssuanceBenchmarkFixtureKind::TopLevelImbalanced,
+        },
+    ]);
 
     debug_assert_eq!(cases.len(), ISSUANCE_FIXTURE_CASE_COUNT);
     cases
@@ -284,8 +359,8 @@ impl IssuanceBenchmarkFixture {
         let mut random_tape = self.random_tape.clone();
         let plan = IssuancePlan::create(
             self.selective_claims.clone(),
-            ClaimsForSelectiveDisclosureStrategy::TopLevel,
-            self.case.add_decoy_claims,
+            self.case.disclosure_strategy(),
+            self.case.add_decoy_claims(),
             &mut random_tape,
         )?;
         random_tape.finish()?;
@@ -299,7 +374,7 @@ impl IssuanceBenchmarkFixture {
             claims: self.full_claims.clone(),
             random_tape: self.random_tape.clone(),
             issuer: SDJWTIssuer::new(self.issuer_key.clone(), Some(self.sign_alg.clone())),
-            add_decoy_claims: self.case.add_decoy_claims,
+            case: self.case,
         }
     }
 
@@ -369,6 +444,20 @@ impl PreparedExecutorBenchmark {
             IssuanceBenchmarkRouteRecord::candidate(summary),
         ))
     }
+
+    #[cfg(all(test, target_arch = "x86_64"))]
+    fn execute_candidate_with_isolated_trace(
+        self,
+        available_parallelism: usize,
+    ) -> Result<(IssuanceBenchmarkAssembly, IssuanceBenchmarkRouteRecord)> {
+        let (assembly, summary) = self
+            .plan
+            .execute_benchmark_candidate_with_isolated_trace(available_parallelism)?;
+        Ok((
+            IssuanceBenchmarkAssembly::from(assembly),
+            IssuanceBenchmarkRouteRecord::candidate(summary),
+        ))
+    }
 }
 
 /// Cloned claims, random tape, and parsed signing key used by full issuance.
@@ -376,7 +465,7 @@ pub struct PreparedFullIssuanceBenchmark {
     claims: Value,
     random_tape: BenchmarkRandomTape,
     issuer: SDJWTIssuer,
-    add_decoy_claims: bool,
+    case: IssuanceBenchmarkCase,
 }
 
 impl PreparedFullIssuanceBenchmark {
@@ -384,13 +473,13 @@ impl PreparedFullIssuanceBenchmark {
     pub fn execute(mut self, route: IssuanceBenchmarkRoute) -> Result<String> {
         let options = IssuanceOptions {
             holder_key: None,
-            add_decoy_claims: self.add_decoy_claims,
+            add_decoy_claims: self.case.add_decoy_claims(),
             serialization_format: SDJWTSerializationFormat::Compact,
         };
         let credential = match route {
             IssuanceBenchmarkRoute::SerialOracle => self.issuer.issue_sd_jwt_with_plan_executor(
                 self.claims,
-                ClaimsForSelectiveDisclosureStrategy::TopLevel,
+                self.case.disclosure_strategy(),
                 options,
                 &mut self.random_tape,
                 IssuancePlan::execute_serial,
@@ -398,7 +487,7 @@ impl PreparedFullIssuanceBenchmark {
             IssuanceBenchmarkRoute::AdaptiveCandidate => {
                 self.issuer.issue_sd_jwt_with_plan_executor(
                     self.claims,
-                    ClaimsForSelectiveDisclosureStrategy::TopLevel,
+                    self.case.disclosure_strategy(),
                     options,
                     &mut self.random_tape,
                     IssuancePlan::execute_benchmark_candidate,
@@ -412,17 +501,47 @@ impl PreparedFullIssuanceBenchmark {
     fn execute_candidate_with_trace(mut self) -> Result<(String, IssuanceBenchmarkRouteRecord)> {
         let options = IssuanceOptions {
             holder_key: None,
-            add_decoy_claims: self.add_decoy_claims,
+            add_decoy_claims: self.case.add_decoy_claims(),
             serialization_format: SDJWTSerializationFormat::Compact,
         };
         let mut trace_summary = None;
         let credential = self.issuer.issue_sd_jwt_with_plan_executor(
             self.claims,
-            ClaimsForSelectiveDisclosureStrategy::TopLevel,
+            self.case.disclosure_strategy(),
             options,
             &mut self.random_tape,
             |plan| {
                 let (assembly, summary) = plan.execute_benchmark_candidate_with_trace()?;
+                trace_summary = Some(summary);
+                Ok(assembly)
+            },
+        )?;
+        self.random_tape.finish()?;
+        let summary = trace_summary.ok_or_else(|| {
+            Error::InvalidState("full issuance benchmark route was not recorded".to_owned())
+        })?;
+        Ok((credential, IssuanceBenchmarkRouteRecord::candidate(summary)))
+    }
+
+    #[cfg(all(test, target_arch = "x86_64"))]
+    fn execute_candidate_with_isolated_trace(
+        mut self,
+        available_parallelism: usize,
+    ) -> Result<(String, IssuanceBenchmarkRouteRecord)> {
+        let options = IssuanceOptions {
+            holder_key: None,
+            add_decoy_claims: self.case.add_decoy_claims(),
+            serialization_format: SDJWTSerializationFormat::Compact,
+        };
+        let mut trace_summary = None;
+        let credential = self.issuer.issue_sd_jwt_with_plan_executor(
+            self.claims,
+            self.case.disclosure_strategy(),
+            options,
+            &mut self.random_tape,
+            |plan| {
+                let (assembly, summary) =
+                    plan.execute_benchmark_candidate_with_isolated_trace(available_parallelism)?;
                 trace_summary = Some(summary);
                 Ok(assembly)
             },
@@ -790,7 +909,7 @@ impl BenchmarkRandomTape {
             .collect();
         let mut decoy_counts = VecDeque::new();
         let mut decoy_salt_count = 0usize;
-        if case.add_decoy_claims {
+        if case.add_decoy_claims() {
             for ordinal in 0..object_count(selective_claims) {
                 let count = 2 + u32::try_from(ordinal % 3).expect("ordinal remainder fits u32");
                 decoy_counts.push_back(count);
@@ -854,12 +973,58 @@ fn deterministic_salt(domain: u8, ordinal: usize) -> String {
 }
 
 fn selective_claims(case: IssuanceBenchmarkCase) -> Value {
+    match case.kind {
+        IssuanceBenchmarkFixtureKind::Standard { payload_class, .. } => {
+            let mut claims = Map::new();
+            for ordinal in 0..case.disclosure_count {
+                claims.insert(format!("claim_{ordinal:04}"), payload_class.value(ordinal));
+            }
+            Value::Object(claims)
+        }
+        IssuanceBenchmarkFixtureKind::AllLevelsNestedObjects => all_levels_nested_object_claims(),
+        IssuanceBenchmarkFixtureKind::AllLevelsArrayDag => all_levels_array_dag_claims(),
+        IssuanceBenchmarkFixtureKind::TopLevelImbalanced => top_level_imbalanced_claims(),
+    }
+}
+
+fn all_levels_nested_object_claims() -> Value {
+    fn two_scalar_claims(first: &str, second: &str) -> Value {
+        let mut claims = Map::new();
+        claims.insert(first.to_owned(), Value::String("x".to_owned()));
+        claims.insert(second.to_owned(), Value::String("x".to_owned()));
+        Value::Object(claims)
+    }
+
     let mut claims = Map::new();
-    for ordinal in 0..case.disclosure_count {
-        claims.insert(
-            format!("claim_{ordinal:04}"),
-            case.payload_class.value(ordinal),
-        );
+    claims.insert("left".to_owned(), two_scalar_claims("a", "b"));
+    claims.insert("right".to_owned(), two_scalar_claims("c", "d"));
+    claims.insert("tail".to_owned(), Value::String("x".to_owned()));
+    Value::Object(claims)
+}
+
+fn all_levels_array_dag_claims() -> Value {
+    fn two_scalar_entries() -> Value {
+        Value::Array(vec![
+            Value::String("x".to_owned()),
+            Value::String("x".to_owned()),
+        ])
+    }
+
+    let groups = Value::Array(vec![two_scalar_entries(), two_scalar_entries()]);
+    let mut claims = Map::new();
+    claims.insert("groups".to_owned(), groups);
+    claims.insert("tag".to_owned(), Value::String("x".to_owned()));
+    Value::Object(claims)
+}
+
+fn top_level_imbalanced_claims() -> Value {
+    let mut claims = Map::new();
+    // Explicit insertion is part of this fixture's contract: contiguous
+    // static chunks must see both deliberately heavy jobs next to each other.
+    claims.insert("h0".to_owned(), Value::String("H".repeat(4 * 1024)));
+    claims.insert("h1".to_owned(), Value::String("H".repeat(4 * 1024)));
+    for ordinal in 0..6 {
+        claims.insert(format!("s{ordinal}"), Value::String(String::new()));
     }
     Value::Object(claims)
 }
@@ -947,18 +1112,95 @@ mod tests {
         .unwrap()
     }
 
+    fn structural_case(kind: IssuanceBenchmarkFixtureKind) -> IssuanceBenchmarkCase {
+        issuance_benchmark_cases()
+            .into_iter()
+            .find(|case| case.kind == kind)
+            .expect("structural benchmark case must be registered")
+    }
+
+    fn structural_cases() -> [IssuanceBenchmarkCase; 3] {
+        [
+            structural_case(IssuanceBenchmarkFixtureKind::AllLevelsNestedObjects),
+            structural_case(IssuanceBenchmarkFixtureKind::AllLevelsArrayDag),
+            structural_case(IssuanceBenchmarkFixtureKind::TopLevelImbalanced),
+        ]
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn structural_job_weights(case: IssuanceBenchmarkCase) -> Vec<Vec<usize>> {
+        match case.kind {
+            IssuanceBenchmarkFixtureKind::AllLevelsNestedObjects => {
+                vec![vec![36, 36], vec![36, 36], vec![137, 138, 39]]
+            }
+            IssuanceBenchmarkFixtureKind::AllLevelsArrayDag => {
+                vec![vec![31, 31], vec![31, 31], vec![137, 137], vec![147, 38]]
+            }
+            IssuanceBenchmarkFixtureKind::TopLevelImbalanced => {
+                vec![vec![4132, 4132, 36, 36, 36, 36, 36, 36]]
+            }
+            IssuanceBenchmarkFixtureKind::Standard { .. } => {
+                panic!("standard case has no structural weight contract")
+            }
+        }
+    }
+
     #[test]
     fn matrix_cardinality_and_machine_ids_are_stable_and_unique() {
+        assert_eq!(ISSUANCE_FIXTURE_CASE_COUNT, 33);
+        assert_eq!(ISSUANCE_BENCHMARK_ID_COUNT, 132);
         let cases = issuance_benchmark_cases();
         assert_eq!(cases.len(), ISSUANCE_FIXTURE_CASE_COUNT);
         assert_eq!(
-            cases.iter().filter(|case| !case.add_decoy_claims).count(),
+            cases
+                .iter()
+                .filter(|case| matches!(
+                    case.kind,
+                    IssuanceBenchmarkFixtureKind::Standard {
+                        add_decoy_claims: false,
+                        ..
+                    }
+                ))
+                .count(),
             20
         );
         assert_eq!(
-            cases.iter().filter(|case| case.add_decoy_claims).count(),
+            cases
+                .iter()
+                .filter(|case| matches!(
+                    case.kind,
+                    IssuanceBenchmarkFixtureKind::Standard {
+                        add_decoy_claims: true,
+                        ..
+                    }
+                ))
+                .count(),
             10
         );
+        assert_eq!(
+            cases
+                .iter()
+                .filter(|case| !matches!(case.kind, IssuanceBenchmarkFixtureKind::Standard { .. }))
+                .count(),
+            3
+        );
+        assert_eq!(
+            cases
+                .iter()
+                .map(|case| case.fixture_id())
+                .skip(30)
+                .collect::<Vec<_>>(),
+            [
+                "al_nested_obj_n0007",
+                "al_array_dag_n0008",
+                "tl_imbalanced_n0008",
+            ]
+        );
+        let fixture_ids = cases
+            .iter()
+            .map(|case| case.fixture_id())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(fixture_ids.len(), ISSUANCE_FIXTURE_CASE_COUNT);
 
         let mut ids = BTreeSet::new();
         for case in cases {
@@ -972,7 +1214,7 @@ mod tests {
                 ] {
                     let id = case.benchmark_id(stage, route);
                     assert!(id.is_ascii());
-                    assert!(id.starts_with("v1__s_"));
+                    assert!(id.starts_with("v2__s_"));
                     assert!(id.len() <= 64);
                     assert!(format!("{ISSUANCE_BENCHMARK_GROUP_ID}/{id}").len() <= 100);
                     assert!(ids.insert(id));
@@ -980,8 +1222,11 @@ mod tests {
             }
         }
         assert_eq!(ids.len(), ISSUANCE_BENCHMARK_ID_COUNT);
-        assert!(ids.contains("v1__s_ea__r_so__p_s__d_0__n_0001"));
-        assert!(ids.contains("v1__s_fi__r_ac__p_mx__d_1__n_0512"));
+        assert!(ids.contains("v2__s_ea__r_so__p_s__d_0__n_0001"));
+        assert!(ids.contains("v2__s_fi__r_ac__p_mx__d_1__n_0512"));
+        assert!(ids.contains("v2__s_fi__r_ac__f_al_nested_obj_n0007"));
+        assert!(ids.contains("v2__s_fi__r_ac__f_al_array_dag_n0008"));
+        assert!(ids.contains("v2__s_fi__r_ac__f_tl_imbalanced_n0008"));
 
         let case = issuance_benchmark_cases()[0];
         let record = IssuanceBenchmarkRouteRecord::serial_oracle()
@@ -990,7 +1235,7 @@ mod tests {
         assert_eq!(record["schema"], "sd_jwt_issuance_route_v2");
         assert_eq!(
             record["benchmark_id"],
-            "sd_jwt_issuance/v1__s_ea__r_so__p_s__d_0__n_0001"
+            "sd_jwt_issuance/v2__s_ea__r_so__p_s__d_0__n_0001"
         );
         assert_eq!(
             record["host_available_parallelism"],
@@ -1027,6 +1272,305 @@ mod tests {
             .machine_record(case, IssuanceBenchmarkStage::ExecutorAssembly);
         let observed_empty: Value = serde_json::from_str(&observed_empty).unwrap();
         assert_eq!(observed_empty["ready_batches"], json!([]));
+    }
+
+    #[test]
+    fn structural_fixture_topologies_and_strategies_are_exact() {
+        let nested = structural_case(IssuanceBenchmarkFixtureKind::AllLevelsNestedObjects);
+        assert!(matches!(
+            nested.disclosure_strategy(),
+            ClaimsForSelectiveDisclosureStrategy::AllLevels
+        ));
+        assert!(!nested.add_decoy_claims());
+        let nested = selective_claims(nested);
+        let nested = nested.as_object().unwrap();
+        assert_eq!(
+            nested.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["left", "right", "tail"]
+        );
+        for (key, expected_keys) in [("left", ["a", "b"]), ("right", ["c", "d"])] {
+            let child = nested[key].as_object().unwrap();
+            assert_eq!(
+                child.keys().map(String::as_str).collect::<Vec<_>>(),
+                expected_keys
+            );
+            assert!(child.values().all(|value| value == "x"));
+        }
+        assert_eq!(nested["tail"], "x");
+
+        let array = structural_case(IssuanceBenchmarkFixtureKind::AllLevelsArrayDag);
+        assert!(matches!(
+            array.disclosure_strategy(),
+            ClaimsForSelectiveDisclosureStrategy::AllLevels
+        ));
+        assert!(!array.add_decoy_claims());
+        let array = selective_claims(array);
+        let array = array.as_object().unwrap();
+        assert_eq!(
+            array.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["groups", "tag"]
+        );
+        let groups = array["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2);
+        for leaf in groups {
+            assert_eq!(leaf, &json!(["x", "x"]));
+        }
+        assert_eq!(array["tag"], "x");
+
+        let imbalanced = structural_case(IssuanceBenchmarkFixtureKind::TopLevelImbalanced);
+        assert!(matches!(
+            imbalanced.disclosure_strategy(),
+            ClaimsForSelectiveDisclosureStrategy::TopLevel
+        ));
+        assert!(!imbalanced.add_decoy_claims());
+        let imbalanced = selective_claims(imbalanced);
+        let imbalanced = imbalanced.as_object().unwrap();
+        assert_eq!(
+            imbalanced.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["h0", "h1", "s0", "s1", "s2", "s3", "s4", "s5"]
+        );
+        assert_eq!(imbalanced["h0"].as_str().unwrap().len(), 4 * 1024);
+        assert_eq!(imbalanced["h1"].as_str().unwrap().len(), 4 * 1024);
+        assert!(imbalanced
+            .values()
+            .skip(2)
+            .all(|value| value.as_str() == Some("")));
+    }
+
+    #[test]
+    fn structural_preflight_preserves_exact_serial_candidate_equivalence() {
+        let _guard = benchmark_test_guard();
+        for case in structural_cases() {
+            let fixture = fixture(case);
+
+            let serial_assembly = fixture
+                .prepare_executor()
+                .unwrap()
+                .execute(IssuanceBenchmarkRoute::SerialOracle)
+                .unwrap();
+            let candidate_assembly = fixture
+                .prepare_executor()
+                .unwrap()
+                .execute(IssuanceBenchmarkRoute::AdaptiveCandidate)
+                .unwrap();
+            assert_eq!(candidate_assembly, serial_assembly);
+            assert_eq!(candidate_assembly.disclosure_count(), case.disclosure_count);
+
+            let serial_credential = fixture
+                .prepare_full_issuance()
+                .execute(IssuanceBenchmarkRoute::SerialOracle)
+                .unwrap();
+            let candidate_credential = fixture
+                .prepare_full_issuance()
+                .execute(IssuanceBenchmarkRoute::AdaptiveCandidate)
+                .unwrap();
+            assert_eq!(candidate_credential, serial_credential);
+            assert_eq!(
+                compact_disclosure_count(&candidate_credential).unwrap(),
+                case.disclosure_count
+            );
+
+            fixture.preflight().unwrap();
+        }
+    }
+
+    #[test]
+    fn structural_route_records_preserve_target_specific_null_semantics() {
+        let _guard = benchmark_test_guard();
+        for case in structural_cases() {
+            let preflight = fixture(case).preflight().unwrap();
+            for (stage, candidate) in [
+                (
+                    IssuanceBenchmarkStage::ExecutorAssembly,
+                    preflight.executor_candidate_route(),
+                ),
+                (
+                    IssuanceBenchmarkStage::FullIssuance,
+                    preflight.full_candidate_route(),
+                ),
+            ] {
+                let serial: Value = serde_json::from_str(
+                    &IssuanceBenchmarkRouteRecord::serial_oracle().machine_record(case, stage),
+                )
+                .unwrap();
+                for key in [
+                    "executor_batches",
+                    "serial_batches",
+                    "native_batches",
+                    "budget_fallback_batches",
+                    "ready_batches",
+                ] {
+                    assert!(serial[key].is_null(), "serial {key} must be null");
+                }
+
+                let candidate: Value =
+                    serde_json::from_str(&candidate.machine_record(case, stage)).unwrap();
+                assert_eq!(candidate["schema"], "sd_jwt_issuance_route_v2");
+                assert_eq!(
+                    candidate["work_estimator_version"],
+                    "issuance_work_bytes_v1"
+                );
+                assert_eq!(
+                    candidate["static_partition_rule_version"],
+                    "contiguous_ceil_chunks_v1"
+                );
+                #[cfg(target_arch = "x86_64")]
+                {
+                    assert!(candidate["executor_batches"].is_number());
+                    assert!(candidate["serial_batches"].is_number());
+                    assert!(candidate["native_batches"].is_number());
+                    assert!(candidate["budget_fallback_batches"].is_number());
+                    assert!(candidate["ready_batches"].is_array());
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                for key in [
+                    "executor_batches",
+                    "serial_batches",
+                    "native_batches",
+                    "budget_fallback_batches",
+                    "ready_batches",
+                ] {
+                    assert!(
+                        candidate[key].is_null(),
+                        "target fallback {key} must be null"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn structural_ready_batches_and_injected_static_layouts_are_exact() {
+        let _guard = benchmark_test_guard();
+        for case in structural_cases() {
+            let expected_batches = structural_job_weights(case);
+            for available_parallelism in [1, 2, 3, 4, 8] {
+                let fixture = fixture(case);
+                let serial_assembly = fixture
+                    .prepare_executor()
+                    .unwrap()
+                    .execute(IssuanceBenchmarkRoute::SerialOracle)
+                    .unwrap();
+                let (candidate_assembly, executor_route) = fixture
+                    .prepare_executor()
+                    .unwrap()
+                    .execute_candidate_with_isolated_trace(available_parallelism)
+                    .unwrap();
+                assert_eq!(candidate_assembly, serial_assembly);
+
+                let serial_credential = fixture
+                    .prepare_full_issuance()
+                    .execute(IssuanceBenchmarkRoute::SerialOracle)
+                    .unwrap();
+                let (candidate_credential, full_route) = fixture
+                    .prepare_full_issuance()
+                    .execute_candidate_with_isolated_trace(available_parallelism)
+                    .unwrap();
+                assert_eq!(candidate_credential, serial_credential);
+
+                for route in [executor_route, full_route] {
+                    assert_eq!(route.executor_batches, Some(expected_batches.len()));
+                    assert_eq!(route.budget_fallback_batches, Some(0));
+                    if available_parallelism < 2 {
+                        assert_eq!(
+                            route.effective,
+                            IssuanceBenchmarkEffectiveRoute::ReadyBatchSerialFallback
+                        );
+                        assert_eq!(route.serial_batches, Some(expected_batches.len()));
+                        assert_eq!(route.native_batches, Some(0));
+                        assert_eq!(route.max_native_worker_count, 0);
+                    } else {
+                        assert_eq!(
+                            route.effective,
+                            IssuanceBenchmarkEffectiveRoute::BoundedNative
+                        );
+                        assert_eq!(route.serial_batches, Some(0));
+                        assert_eq!(route.native_batches, Some(expected_batches.len()));
+                        assert_eq!(
+                            route.max_native_worker_count,
+                            expected_batches
+                                .iter()
+                                .map(|weights| {
+                                    available_parallelism
+                                        .min(BENCHMARK_ISSUANCE_WORKER_CAP)
+                                        .min(weights.len())
+                                })
+                                .max()
+                                .unwrap_or(0)
+                        );
+                    }
+
+                    let batches = route
+                        .ready_batches
+                        .as_ref()
+                        .expect("x86_64 adaptive execution must record ready batches");
+                    assert_eq!(batches.len(), expected_batches.len());
+
+                    for (batch, expected_weights) in batches.iter().zip(&expected_batches) {
+                        assert_eq!(batch.job_count, expected_weights.len());
+                        assert_eq!(
+                            batch.estimated_work_bytes,
+                            Some(expected_weights.iter().sum())
+                        );
+                        assert_eq!(
+                            batch.work_estimate_status,
+                            BenchmarkWorkEstimateStatus::Available
+                        );
+                        assert!(batch.work_gate_evaluated);
+                        assert!(batch.parallelism_gate_evaluated);
+                        assert_eq!(batch.available_parallelism, Some(available_parallelism));
+
+                        let selected_workers = available_parallelism
+                            .min(BENCHMARK_ISSUANCE_WORKER_CAP)
+                            .min(expected_weights.len());
+                        assert_eq!(batch.selected_worker_count, Some(selected_workers));
+
+                        if selected_workers < 2 {
+                            assert_eq!(batch.selected_mode, BenchmarkSelectedMode::Serial);
+                            assert_eq!(
+                                batch.selection_reason,
+                                BenchmarkSelectionReason::InsufficientAvailableParallelism
+                            );
+                            assert!(!batch.budget_gate_evaluated);
+                            assert_eq!(
+                                batch.budget_acquisition_result,
+                                BenchmarkBudgetAcquisitionResult::NotEvaluated
+                            );
+                            assert!(batch.leased_worker_count.is_none());
+                            assert!(batch.static_chunk_size.is_none());
+                            assert!(batch.static_chunks.is_none());
+                            continue;
+                        }
+
+                        assert_eq!(batch.selected_mode, BenchmarkSelectedMode::NativeParallel);
+                        assert_eq!(
+                            batch.selection_reason,
+                            BenchmarkSelectionReason::BoundedNative
+                        );
+                        assert!(batch.budget_gate_evaluated);
+                        assert_eq!(
+                            batch.budget_acquisition_result,
+                            BenchmarkBudgetAcquisitionResult::Acquired
+                        );
+                        assert_eq!(batch.leased_worker_count, Some(selected_workers));
+                        let chunk_size = expected_weights.len() / selected_workers
+                            + usize::from(expected_weights.len() % selected_workers != 0);
+                        assert_eq!(batch.static_chunk_size, Some(chunk_size));
+                        let expected_chunks = expected_weights
+                            .chunks(chunk_size)
+                            .enumerate()
+                            .map(|(ordinal, weights)| BenchmarkStaticChunkTrace {
+                                ordinal,
+                                job_count: weights.len(),
+                                estimated_work_bytes: weights.iter().sum(),
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(batch.static_chunks.as_ref(), Some(&expected_chunks));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1082,7 +1626,7 @@ mod tests {
             actual,
             json!({
                 "schema": "sd_jwt_issuance_route_v2",
-                "benchmark_id": "sd_jwt_issuance/v1__s_ea__r_ac__p_s__d_0__n_0008",
+                "benchmark_id": "sd_jwt_issuance/v2__s_ea__r_ac__p_s__d_0__n_0008",
                 "fixture_id": "payload_small__decoys_off__n_0008",
                 "stage": "executor_assembly",
                 "requested": "adaptive_candidate",
@@ -1248,9 +1792,15 @@ mod tests {
         let _guard = benchmark_test_guard();
         let representative = issuance_benchmark_cases()
             .into_iter()
-            .filter(|case| {
-                (case.disclosure_count == 1 || case.disclosure_count == 8)
-                    && (!case.add_decoy_claims || case.payload_class == IssuancePayloadClass::Mixed)
+            .filter(|case| match case.kind {
+                IssuanceBenchmarkFixtureKind::Standard {
+                    payload_class,
+                    add_decoy_claims,
+                } => {
+                    (case.disclosure_count == 1 || case.disclosure_count == 8)
+                        && (!add_decoy_claims || payload_class == IssuancePayloadClass::Mixed)
+                }
+                _ => false,
             })
             .collect::<Vec<_>>();
         assert_eq!(representative.len(), 10);
@@ -1266,10 +1816,16 @@ mod tests {
         let _guard = benchmark_test_guard();
         let case = issuance_benchmark_cases()
             .into_iter()
-            .find(|case| {
-                case.disclosure_count == 1
-                    && case.payload_class == IssuancePayloadClass::Small
-                    && !case.add_decoy_claims
+            .find(|case| match case.kind {
+                IssuanceBenchmarkFixtureKind::Standard {
+                    payload_class,
+                    add_decoy_claims,
+                } => {
+                    case.disclosure_count == 1
+                        && payload_class == IssuancePayloadClass::Small
+                        && !add_decoy_claims
+                }
+                _ => false,
             })
             .unwrap();
         let fixture = fixture(case);
@@ -1306,10 +1862,16 @@ mod tests {
         let _guard = benchmark_test_guard();
         let case = issuance_benchmark_cases()
             .into_iter()
-            .find(|case| {
-                case.disclosure_count == 8
-                    && case.payload_class == IssuancePayloadClass::Small
-                    && !case.add_decoy_claims
+            .find(|case| match case.kind {
+                IssuanceBenchmarkFixtureKind::Standard {
+                    payload_class,
+                    add_decoy_claims,
+                } => {
+                    case.disclosure_count == 8
+                        && payload_class == IssuancePayloadClass::Small
+                        && !add_decoy_claims
+                }
+                _ => false,
             })
             .unwrap();
         let preflight = fixture(case).preflight().unwrap();
@@ -1320,21 +1882,38 @@ mod tests {
         ] {
             #[cfg(target_arch = "x86_64")]
             {
-                let selected_available_parallelism = route
+                let batch = route
                     .ready_batches
                     .as_ref()
                     .and_then(|batches| batches.first())
-                    .and_then(|batch| batch.available_parallelism)
-                    .unwrap_or(1);
+                    .expect("eligible x86_64 fixture must record its ready batch");
+                let selected_available_parallelism = batch.available_parallelism.unwrap_or(1);
                 if selected_available_parallelism >= 2 {
-                    assert_eq!(
-                        route.effective(),
-                        IssuanceBenchmarkEffectiveRoute::BoundedNative
-                    );
+                    match route.effective {
+                        IssuanceBenchmarkEffectiveRoute::BoundedNative => {
+                            assert_eq!(batch.selected_mode, BenchmarkSelectedMode::NativeParallel);
+                            assert_eq!(
+                                batch.selection_reason,
+                                BenchmarkSelectionReason::BoundedNative
+                            );
+                        }
+                        IssuanceBenchmarkEffectiveRoute::BudgetSerialFallback => {
+                            assert_eq!(batch.selected_mode, BenchmarkSelectedMode::Serial);
+                            assert_eq!(
+                                batch.selection_reason,
+                                BenchmarkSelectionReason::WorkerBudgetUnavailable
+                            );
+                        }
+                        other => panic!("unexpected eligible candidate route: {other:?}"),
+                    }
                 } else {
                     assert_eq!(
-                        route.effective(),
+                        route.effective,
                         IssuanceBenchmarkEffectiveRoute::ReadyBatchSerialFallback
+                    );
+                    assert_eq!(
+                        batch.selection_reason,
+                        BenchmarkSelectionReason::InsufficientAvailableParallelism
                     );
                 }
             }

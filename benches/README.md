@@ -30,7 +30,7 @@ compile the fixture surface nor change issuer routing. In particular,
 `QUALIFIED_ISSUANCE_THRESHOLDS` remains `None` until separate benchmark evidence
 supports a production policy.
 
-The 30 fixture cases contain the required 1, 8, 32, 128, and 512 top-level
+The first 30 fixture cases contain the required 1, 8, 32, 128, and 512 top-level
 disclosures for each of small, medium nested, 64 KiB large, and mixed nested
 values. Ten additional cases enable decoys for small values (root decoys) and
 mixed values (root and nested-object decoys). Decoy counts deterministically
@@ -38,6 +38,21 @@ cycle through 2, 3, and 4 per object. Every disclosure and decoy salt starts as
 an independently domain-separated deterministic 16-byte input and is encoded
 to exactly 22 Base64url characters, matching the production salt length without
 using the process-global `mock_salts` queue.
+
+Three focused structural cases complete the 33-case matrix. The
+`al_nested_obj_n0007` AllLevels object tree has three dependency levels and
+exact ready batches `(2,72)`, `(2,72)`, and `(3,314)`. The
+`al_array_dag_n0008` AllLevels array graph has exact ready batches `(2,62)`,
+`(2,62)`, `(2,274)`, and `(2,185)`. The `tl_imbalanced_n0008` TopLevel root
+keeps two contiguous 4 KiB string jobs before six empty-string jobs, producing
+one `(8,8480)` batch with ordered job weights
+`[4132,4132,36,36,36,36,36,36]`. The order is deliberate so contiguous static
+partitioning exposes rather than hides load imbalance.
+
+Qualification of the four-worker imbalanced layout requires at least four host
+threads, no worker-budget fallback, and exact contiguous chunk loads
+`[8264,72,72,72]` in both stages. Lower-parallelism runs remain correctness
+evidence but cannot qualify that layout.
 
 Each fixture registers four IDs:
 
@@ -55,7 +70,7 @@ Each fixture registers four IDs:
   proposed production threshold.
 
 Before timing, both stages require exact serial/candidate output equality.
-The harness emits one compact JSON route record for each of the 120 exact
+The harness emits one compact JSON route record for each of the 132 exact
 Criterion IDs, including requested and effective routes, ready-batch counts,
 budget fallbacks, maximum native workers, host parallelism, and the worker cap.
 A one-job ready batch, a single-thread host, worker-budget contention, ARM64,
@@ -68,12 +83,13 @@ neither truncates directory names nor creates order-dependent collision
 suffixes. The JSON record carries the expanded labels. The ID schema is:
 
 ```text
-sd_jwt_issuance/v1__s_<ea|fi>__r_<so|ac>__p_<s|mn|l64|mx>__d_<0|1>__n_<zero-padded-count>
+sd_jwt_issuance/v2__s_<ea|fi>__r_<so|ac>__p_<s|mn|l64|mx>__d_<0|1>__n_<zero-padded-count>
+sd_jwt_issuance/v2__s_<ea|fi>__r_<so|ac>__f_<al_nested_obj_n0007|al_array_dag_n0008|tl_imbalanced_n0008>
 ```
 
 Here `ea`/`fi` select executor assembly/full issuance, `so`/`ac` select the
 serial oracle/adaptive candidate, and `s`/`mn`/`l64`/`mx` select the four
-payload classes.
+payload classes. The `f` form names one of the three exact structural fixtures.
 
 Compile and one-iteration smoke gate:
 
@@ -91,8 +107,13 @@ Keep this feature on the same exact revision for both requested routes; unlike
 the verification benchmark, it does not require two separately compiled
 feature modes. Preserve the emitted `sd_jwt_issuance_route_v2` records with the
 Criterion estimates so a later runner can reject an expected-native case that
-actually fell back to serial execution. Benchmark IDs remain `v1` because the
-matrix is unchanged; only the route-evidence schema is versioned here.
+actually fell back to serial execution. A qualification artifact is complete
+only when it contains exactly 132 route records with 132 unique expected IDs;
+missing, duplicate, or extra records invalidate the artifact. Benchmark IDs are
+`v2` because the fixture matrix changed. The route-evidence schema remains
+`sd_jwt_issuance_route_v2`, while the work estimator and contiguous static
+partition labels intentionally remain their independently versioned `v1`
+contracts.
 
 Each adaptive `ready_batches` entry records the exact selector inputs and gate
 evaluation state, selected and leased workers, stable selection reason, and,

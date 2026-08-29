@@ -442,6 +442,30 @@ impl IssuancePlan {
         }
     }
 
+    /// Unit-test-only deterministic trace seam. It exercises the exact
+    /// benchmark selector, estimator, static partitioner, and native executor
+    /// with an isolated worker budget and injected host parallelism.
+    #[cfg(all(
+        test,
+        feature = "issuance_bench",
+        feature = "parallel",
+        target_arch = "x86_64"
+    ))]
+    pub(super) fn execute_benchmark_candidate_with_isolated_trace(
+        self,
+        available_parallelism: usize,
+    ) -> Result<(IssuanceAssembly, BenchmarkExecutionTraceSummary)> {
+        let budget = ParallelIssuanceWorkerBudget::new(MAX_PARALLEL_ISSUANCE_WORKERS);
+        let trace = BenchmarkExecutionTrace::default();
+        let assembly = self.execute_with_executor(&AdaptiveIssuanceExecutor {
+            thresholds: BENCHMARK_ISSUANCE_THRESHOLDS,
+            budget: &budget,
+            available_threads: || available_parallelism,
+            trace: Some(&trace),
+        })?;
+        Ok((assembly, trace.summary()))
+    }
+
     #[cfg(any(test, all(feature = "parallel", target_arch = "x86_64")))]
     fn execute_with_executor<E: IssuanceExecutor>(self, executor: &E) -> Result<IssuanceAssembly> {
         let mut assembler = SerialAssembler::new(self.jobs, self.disclosure_job_ids)?;
