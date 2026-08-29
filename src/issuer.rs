@@ -478,3 +478,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod issuance_contract_tests;
