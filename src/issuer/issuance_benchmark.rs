@@ -15,7 +15,10 @@ use jsonwebtoken::EncodingKey;
 use serde_json::{json, Map, Value};
 
 use super::issuance_plan::{
-    BenchmarkExecutionTraceSummary, IssuanceAssembly, IssuancePlan, BENCHMARK_ISSUANCE_WORKER_CAP,
+    BenchmarkBudgetAcquisitionResult, BenchmarkExecutionTraceSummary, BenchmarkReadyBatchTrace,
+    BenchmarkSelectedMode, BenchmarkSelectionReason, BenchmarkWorkEstimateStatus, IssuanceAssembly,
+    IssuancePlan, BENCHMARK_ISSUANCE_WORKER_CAP, BENCHMARK_STATIC_PARTITION_RULE_VERSION,
+    BENCHMARK_WORK_ESTIMATOR_VERSION,
 };
 use super::{
     ClaimsForSelectiveDisclosureStrategy, IssuanceOptions, IssuanceRandomSource, SDJWTIssuer,
@@ -468,17 +471,17 @@ pub struct IssuanceBenchmarkPreflight {
 impl IssuanceBenchmarkPreflight {
     /// Candidate route observed for the already-planned executor stage.
     pub fn executor_candidate_route(&self) -> IssuanceBenchmarkRouteRecord {
-        self.executor_candidate_route
+        self.executor_candidate_route.clone()
     }
 
     /// Candidate route observed while running the full issuance boundary.
     pub fn full_candidate_route(&self) -> IssuanceBenchmarkRouteRecord {
-        self.full_candidate_route
+        self.full_candidate_route.clone()
     }
 }
 
 /// Machine-readable requested/effective route evidence from untimed preflight.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IssuanceBenchmarkRouteRecord {
     requested: IssuanceBenchmarkRoute,
     effective: IssuanceBenchmarkEffectiveRoute,
@@ -487,7 +490,8 @@ pub struct IssuanceBenchmarkRouteRecord {
     native_batches: Option<usize>,
     budget_fallback_batches: Option<usize>,
     max_native_worker_count: usize,
-    available_parallelism: usize,
+    host_available_parallelism: usize,
+    ready_batches: Option<Vec<BenchmarkReadyBatchTrace>>,
 }
 
 impl IssuanceBenchmarkRouteRecord {
@@ -501,11 +505,17 @@ impl IssuanceBenchmarkRouteRecord {
             native_batches: None,
             budget_fallback_batches: None,
             max_native_worker_count: 0,
-            available_parallelism: available_parallelism(),
+            host_available_parallelism: available_parallelism(),
+            ready_batches: None,
         }
     }
 
     fn candidate(summary: BenchmarkExecutionTraceSummary) -> Self {
+        assert_eq!(
+            summary.target_serial_fallback,
+            summary.ready_batches.is_none(),
+            "whole-target fallback must be the only candidate route without ready-batch evidence"
+        );
         let effective = if summary.target_serial_fallback {
             IssuanceBenchmarkEffectiveRoute::TargetSerialFallback
         } else if summary.native_batches != 0 && summary.serial_batches != 0 {
@@ -517,6 +527,34 @@ impl IssuanceBenchmarkRouteRecord {
         } else {
             IssuanceBenchmarkEffectiveRoute::ReadyBatchSerialFallback
         };
+
+        if let Some(ready_batches) = &summary.ready_batches {
+            for (ordinal, batch) in ready_batches.iter().enumerate() {
+                assert_ready_batch_trace(ordinal, batch);
+            }
+            let native_batches = ready_batches
+                .iter()
+                .filter(|batch| batch.selected_mode == BenchmarkSelectedMode::NativeParallel)
+                .count();
+            let serial_batches = ready_batches.len().saturating_sub(native_batches);
+            let budget_fallback_batches = ready_batches
+                .iter()
+                .filter(|batch| {
+                    batch.selection_reason == BenchmarkSelectionReason::WorkerBudgetUnavailable
+                })
+                .count();
+            let max_worker_count = ready_batches
+                .iter()
+                .filter_map(|batch| batch.leased_worker_count)
+                .max()
+                .unwrap_or(0);
+            assert_eq!(summary.executor_batches, ready_batches.len());
+            assert_eq!(summary.serial_batches, serial_batches);
+            assert_eq!(summary.native_batches, native_batches);
+            assert_eq!(summary.budget_fallback_batches, budget_fallback_batches);
+            assert_eq!(summary.max_worker_count, max_worker_count);
+        }
+
         Self {
             requested: IssuanceBenchmarkRoute::AdaptiveCandidate,
             effective,
@@ -526,7 +564,8 @@ impl IssuanceBenchmarkRouteRecord {
             budget_fallback_batches: (!summary.target_serial_fallback)
                 .then_some(summary.budget_fallback_batches),
             max_native_worker_count: summary.max_worker_count,
-            available_parallelism: available_parallelism(),
+            host_available_parallelism: available_parallelism(),
+            ready_batches: summary.ready_batches,
         }
     }
 
@@ -541,8 +580,14 @@ impl IssuanceBenchmarkRouteRecord {
         case: IssuanceBenchmarkCase,
         stage: IssuanceBenchmarkStage,
     ) -> String {
+        let ready_batches = self.ready_batches.as_ref().map(|batches| {
+            batches
+                .iter()
+                .map(ready_batch_machine_value)
+                .collect::<Vec<_>>()
+        });
         let record = json!({
-            "schema": "sd_jwt_issuance_route_v1",
+            "schema": "sd_jwt_issuance_route_v2",
             "benchmark_id": format!(
                 "{}/{}",
                 ISSUANCE_BENCHMARK_GROUP_ID,
@@ -558,10 +603,177 @@ impl IssuanceBenchmarkRouteRecord {
             "budget_fallback_batches": self.budget_fallback_batches,
             "max_native_worker_count": self.max_native_worker_count,
             "worker_cap": BENCHMARK_ISSUANCE_WORKER_CAP,
-            "available_parallelism": self.available_parallelism,
+            "host_available_parallelism": self.host_available_parallelism,
+            "work_estimator_version": BENCHMARK_WORK_ESTIMATOR_VERSION,
+            "static_partition_rule_version": BENCHMARK_STATIC_PARTITION_RULE_VERSION,
+            "ready_batches": ready_batches,
         });
         serde_json::to_string(&record).expect("benchmark route record must serialize")
     }
+}
+
+fn assert_ready_batch_trace(expected_ordinal: usize, batch: &BenchmarkReadyBatchTrace) {
+    assert_eq!(batch.ordinal, expected_ordinal);
+    assert_eq!(
+        batch.work_gate_evaluated,
+        batch.work_estimate_status != BenchmarkWorkEstimateStatus::NotEvaluated
+    );
+    match batch.work_estimate_status {
+        BenchmarkWorkEstimateStatus::NotEvaluated | BenchmarkWorkEstimateStatus::Overflow => {
+            assert!(batch.estimated_work_bytes.is_none())
+        }
+        BenchmarkWorkEstimateStatus::Available => assert!(batch.estimated_work_bytes.is_some()),
+    }
+    assert_eq!(
+        batch.parallelism_gate_evaluated,
+        batch.available_parallelism.is_some()
+    );
+    assert_eq!(
+        batch.selected_worker_count,
+        batch.available_parallelism.map(|available| {
+            available
+                .min(BENCHMARK_ISSUANCE_WORKER_CAP)
+                .min(batch.job_count)
+        })
+    );
+    assert_eq!(
+        batch.budget_gate_evaluated,
+        batch.budget_acquisition_result != BenchmarkBudgetAcquisitionResult::NotEvaluated
+    );
+
+    match batch.selection_reason {
+        BenchmarkSelectionReason::BelowMinJobs => {
+            assert_eq!(
+                batch.work_estimate_status,
+                BenchmarkWorkEstimateStatus::NotEvaluated
+            );
+            assert!(!batch.parallelism_gate_evaluated);
+            assert!(!batch.budget_gate_evaluated);
+        }
+        BenchmarkSelectionReason::WorkEstimateOverflow => {
+            assert_eq!(
+                batch.work_estimate_status,
+                BenchmarkWorkEstimateStatus::Overflow
+            );
+            assert!(!batch.parallelism_gate_evaluated);
+            assert!(!batch.budget_gate_evaluated);
+        }
+        BenchmarkSelectionReason::BelowMinEstimatedWorkBytes => {
+            assert_eq!(
+                batch.work_estimate_status,
+                BenchmarkWorkEstimateStatus::Available
+            );
+            assert!(!batch.parallelism_gate_evaluated);
+            assert!(!batch.budget_gate_evaluated);
+        }
+        BenchmarkSelectionReason::InsufficientAvailableParallelism => {
+            assert_eq!(
+                batch.work_estimate_status,
+                BenchmarkWorkEstimateStatus::Available
+            );
+            assert!(batch.parallelism_gate_evaluated);
+            assert!(!batch.budget_gate_evaluated);
+        }
+        BenchmarkSelectionReason::WorkerBudgetUnavailable => {
+            assert_eq!(
+                batch.budget_acquisition_result,
+                BenchmarkBudgetAcquisitionResult::Unavailable
+            );
+        }
+        BenchmarkSelectionReason::BoundedNative => {
+            assert_eq!(
+                batch.budget_acquisition_result,
+                BenchmarkBudgetAcquisitionResult::Acquired
+            );
+        }
+    }
+
+    match batch.selected_mode {
+        BenchmarkSelectedMode::Serial => {
+            assert_ne!(
+                batch.selection_reason,
+                BenchmarkSelectionReason::BoundedNative
+            );
+            assert!(batch.leased_worker_count.is_none());
+            assert!(batch.static_chunk_size.is_none());
+            assert!(batch.static_chunks.is_none());
+        }
+        BenchmarkSelectedMode::NativeParallel => {
+            assert_eq!(
+                batch.selection_reason,
+                BenchmarkSelectionReason::BoundedNative
+            );
+            assert_eq!(
+                batch.budget_acquisition_result,
+                BenchmarkBudgetAcquisitionResult::Acquired
+            );
+            assert_eq!(batch.leased_worker_count, batch.selected_worker_count);
+            let chunk_size = batch
+                .static_chunk_size
+                .expect("native trace must include its static chunk size");
+            let selected_worker_count = batch
+                .selected_worker_count
+                .expect("native trace must include selected workers");
+            assert_eq!(
+                chunk_size,
+                batch.job_count / selected_worker_count
+                    + usize::from(batch.job_count % selected_worker_count != 0)
+            );
+            let chunks = batch
+                .static_chunks
+                .as_ref()
+                .expect("native trace must include static chunks");
+            assert_eq!(
+                chunks.iter().map(|chunk| chunk.job_count).sum::<usize>(),
+                batch.job_count
+            );
+            assert_eq!(
+                chunks
+                    .iter()
+                    .map(|chunk| chunk.estimated_work_bytes)
+                    .sum::<usize>(),
+                batch
+                    .estimated_work_bytes
+                    .expect("native trace must include a successful work estimate")
+            );
+            for (ordinal, chunk) in chunks.iter().enumerate() {
+                assert_eq!(chunk.ordinal, ordinal);
+                assert!(chunk.job_count <= chunk_size);
+            }
+        }
+    }
+}
+
+fn ready_batch_machine_value(batch: &BenchmarkReadyBatchTrace) -> Value {
+    let static_chunks = batch.static_chunks.as_ref().map(|chunks| {
+        chunks
+            .iter()
+            .map(|chunk| {
+                json!({
+                    "ordinal": chunk.ordinal,
+                    "job_count": chunk.job_count,
+                    "estimated_work_bytes": chunk.estimated_work_bytes,
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+    json!({
+        "ordinal": batch.ordinal,
+        "job_count": batch.job_count,
+        "estimated_work_bytes": batch.estimated_work_bytes,
+        "work_estimate_status": batch.work_estimate_status.label(),
+        "work_gate_evaluated": batch.work_gate_evaluated,
+        "parallelism_gate_evaluated": batch.parallelism_gate_evaluated,
+        "budget_gate_evaluated": batch.budget_gate_evaluated,
+        "available_parallelism": batch.available_parallelism,
+        "selected_worker_count": batch.selected_worker_count,
+        "leased_worker_count": batch.leased_worker_count,
+        "budget_acquisition_result": batch.budget_acquisition_result.label(),
+        "selected_mode": batch.selected_mode.label(),
+        "selection_reason": batch.selection_reason.label(),
+        "static_chunk_size": batch.static_chunk_size,
+        "static_chunks": static_chunks,
+    })
 }
 
 #[derive(Clone)]
@@ -716,6 +928,7 @@ mod tests {
     use std::sync::{Mutex, MutexGuard};
 
     use super::*;
+    use crate::issuer::issuance_plan::BenchmarkStaticChunkTrace;
 
     static BENCHMARK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -774,12 +987,13 @@ mod tests {
         let record = IssuanceBenchmarkRouteRecord::serial_oracle()
             .machine_record(case, IssuanceBenchmarkStage::ExecutorAssembly);
         let record: Value = serde_json::from_str(&record).unwrap();
+        assert_eq!(record["schema"], "sd_jwt_issuance_route_v2");
         assert_eq!(
             record["benchmark_id"],
             "sd_jwt_issuance/v1__s_ea__r_so__p_s__d_0__n_0001"
         );
         assert_eq!(
-            record["available_parallelism"],
+            record["host_available_parallelism"],
             Value::from(
                 std::thread::available_parallelism()
                     .map(|parallelism| parallelism.get())
@@ -790,6 +1004,7 @@ mod tests {
         assert!(record["serial_batches"].is_null());
         assert!(record["native_batches"].is_null());
         assert!(record["budget_fallback_batches"].is_null());
+        assert!(record["ready_batches"].is_null());
 
         let target_fallback =
             IssuanceBenchmarkRouteRecord::candidate(BenchmarkExecutionTraceSummary {
@@ -802,6 +1017,223 @@ mod tests {
         assert!(target_fallback["serial_batches"].is_null());
         assert!(target_fallback["native_batches"].is_null());
         assert!(target_fallback["budget_fallback_batches"].is_null());
+        assert!(target_fallback["ready_batches"].is_null());
+
+        let observed_empty =
+            IssuanceBenchmarkRouteRecord::candidate(BenchmarkExecutionTraceSummary {
+                ready_batches: Some(Vec::new()),
+                ..BenchmarkExecutionTraceSummary::default()
+            })
+            .machine_record(case, IssuanceBenchmarkStage::ExecutorAssembly);
+        let observed_empty: Value = serde_json::from_str(&observed_empty).unwrap();
+        assert_eq!(observed_empty["ready_batches"], json!([]));
+    }
+
+    #[test]
+    fn route_v2_exact_schema_snapshot_is_stable() {
+        let case = issuance_benchmark_cases()[1];
+        let ready_batch = BenchmarkReadyBatchTrace {
+            ordinal: 0,
+            job_count: 5,
+            estimated_work_bytes: Some(59),
+            work_estimate_status: BenchmarkWorkEstimateStatus::Available,
+            work_gate_evaluated: true,
+            parallelism_gate_evaluated: true,
+            budget_gate_evaluated: true,
+            available_parallelism: Some(12),
+            selected_worker_count: Some(4),
+            leased_worker_count: Some(4),
+            budget_acquisition_result: BenchmarkBudgetAcquisitionResult::Acquired,
+            selected_mode: BenchmarkSelectedMode::NativeParallel,
+            selection_reason: BenchmarkSelectionReason::BoundedNative,
+            static_chunk_size: Some(2),
+            static_chunks: Some(vec![
+                BenchmarkStaticChunkTrace {
+                    ordinal: 0,
+                    job_count: 2,
+                    estimated_work_bytes: 28,
+                },
+                BenchmarkStaticChunkTrace {
+                    ordinal: 1,
+                    job_count: 2,
+                    estimated_work_bytes: 19,
+                },
+                BenchmarkStaticChunkTrace {
+                    ordinal: 2,
+                    job_count: 1,
+                    estimated_work_bytes: 12,
+                },
+            ]),
+        };
+        let mut route = IssuanceBenchmarkRouteRecord::candidate(BenchmarkExecutionTraceSummary {
+            executor_batches: 1,
+            native_batches: 1,
+            max_worker_count: 4,
+            ready_batches: Some(vec![ready_batch]),
+            ..BenchmarkExecutionTraceSummary::default()
+        });
+        route.host_available_parallelism = 12;
+
+        let actual: Value = serde_json::from_str(
+            &route.machine_record(case, IssuanceBenchmarkStage::ExecutorAssembly),
+        )
+        .unwrap();
+        assert_eq!(
+            actual,
+            json!({
+                "schema": "sd_jwt_issuance_route_v2",
+                "benchmark_id": "sd_jwt_issuance/v1__s_ea__r_ac__p_s__d_0__n_0008",
+                "fixture_id": "payload_small__decoys_off__n_0008",
+                "stage": "executor_assembly",
+                "requested": "adaptive_candidate",
+                "effective": "bounded_native",
+                "executor_batches": 1,
+                "serial_batches": 0,
+                "native_batches": 1,
+                "budget_fallback_batches": 0,
+                "max_native_worker_count": 4,
+                "worker_cap": BENCHMARK_ISSUANCE_WORKER_CAP,
+                "host_available_parallelism": 12,
+                "work_estimator_version": "issuance_work_bytes_v1",
+                "static_partition_rule_version": "contiguous_ceil_chunks_v1",
+                "ready_batches": [{
+                    "ordinal": 0,
+                    "job_count": 5,
+                    "estimated_work_bytes": 59,
+                    "work_estimate_status": "available",
+                    "work_gate_evaluated": true,
+                    "parallelism_gate_evaluated": true,
+                    "budget_gate_evaluated": true,
+                    "available_parallelism": 12,
+                    "selected_worker_count": 4,
+                    "leased_worker_count": 4,
+                    "budget_acquisition_result": "acquired",
+                    "selected_mode": "native_parallel",
+                    "selection_reason": "bounded_native",
+                    "static_chunk_size": 2,
+                    "static_chunks": [
+                        {"ordinal": 0, "job_count": 2, "estimated_work_bytes": 28},
+                        {"ordinal": 1, "job_count": 2, "estimated_work_bytes": 19},
+                        {"ordinal": 2, "job_count": 1, "estimated_work_bytes": 12},
+                    ],
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn route_v2_preserves_explicit_overflow_and_stable_reason_labels() {
+        assert_eq!(
+            [
+                BenchmarkSelectionReason::BelowMinJobs,
+                BenchmarkSelectionReason::WorkEstimateOverflow,
+                BenchmarkSelectionReason::BelowMinEstimatedWorkBytes,
+                BenchmarkSelectionReason::InsufficientAvailableParallelism,
+                BenchmarkSelectionReason::WorkerBudgetUnavailable,
+                BenchmarkSelectionReason::BoundedNative,
+            ]
+            .map(BenchmarkSelectionReason::label),
+            [
+                "below_min_jobs",
+                "work_estimate_overflow",
+                "below_min_estimated_work_bytes",
+                "insufficient_available_parallelism",
+                "worker_budget_unavailable",
+                "bounded_native",
+            ]
+        );
+
+        let case = issuance_benchmark_cases()[1];
+        let route = IssuanceBenchmarkRouteRecord::candidate(BenchmarkExecutionTraceSummary {
+            executor_batches: 1,
+            serial_batches: 1,
+            ready_batches: Some(vec![BenchmarkReadyBatchTrace {
+                ordinal: 0,
+                job_count: 8,
+                estimated_work_bytes: None,
+                work_estimate_status: BenchmarkWorkEstimateStatus::Overflow,
+                work_gate_evaluated: true,
+                parallelism_gate_evaluated: false,
+                budget_gate_evaluated: false,
+                available_parallelism: None,
+                selected_worker_count: None,
+                leased_worker_count: None,
+                budget_acquisition_result: BenchmarkBudgetAcquisitionResult::NotEvaluated,
+                selected_mode: BenchmarkSelectedMode::Serial,
+                selection_reason: BenchmarkSelectionReason::WorkEstimateOverflow,
+                static_chunk_size: None,
+                static_chunks: None,
+            }]),
+            ..BenchmarkExecutionTraceSummary::default()
+        });
+        let record: Value = serde_json::from_str(
+            &route.machine_record(case, IssuanceBenchmarkStage::ExecutorAssembly),
+        )
+        .unwrap();
+        assert!(record["ready_batches"][0]["estimated_work_bytes"].is_null());
+        assert_eq!(
+            record["ready_batches"][0]["work_estimate_status"],
+            "overflow"
+        );
+        assert_eq!(
+            record["ready_batches"][0]["selection_reason"],
+            "work_estimate_overflow"
+        );
+    }
+
+    #[test]
+    fn route_v2_records_only_aggregate_non_secret_work_metadata() {
+        fn collect_keys(value: &Value, keys: &mut BTreeSet<String>) {
+            match value {
+                Value::Object(values) => {
+                    for (key, value) in values {
+                        keys.insert(key.clone());
+                        collect_keys(value, keys);
+                    }
+                }
+                Value::Array(values) => {
+                    for value in values {
+                        collect_keys(value, keys);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let _guard = benchmark_test_guard();
+        let case = issuance_benchmark_cases()[1];
+        let route = fixture(case)
+            .prepare_executor()
+            .unwrap()
+            .execute_candidate_with_trace()
+            .unwrap()
+            .1;
+        let record = route.machine_record(case, IssuanceBenchmarkStage::ExecutorAssembly);
+        for forbidden in [
+            "claim_0000",
+            "value-0",
+            "issuance-benchmark-test-key",
+            &deterministic_salt(0x44, 0),
+        ] {
+            assert!(
+                !record.contains(forbidden),
+                "route evidence leaked {forbidden}"
+            );
+        }
+
+        let record: Value = serde_json::from_str(&record).unwrap();
+        let mut keys = BTreeSet::new();
+        collect_keys(&record, &mut keys);
+        for forbidden_key in [
+            "claim_name",
+            "claim_value",
+            "salt",
+            "job_id",
+            "location",
+            "location_id",
+        ] {
+            assert!(!keys.contains(forbidden_key));
+        }
     }
 
     #[test]
@@ -887,16 +1319,24 @@ mod tests {
             preflight.full_candidate_route(),
         ] {
             #[cfg(target_arch = "x86_64")]
-            if route.available_parallelism >= 2 {
-                assert_eq!(
-                    route.effective(),
-                    IssuanceBenchmarkEffectiveRoute::BoundedNative
-                );
-            } else {
-                assert_eq!(
-                    route.effective(),
-                    IssuanceBenchmarkEffectiveRoute::ReadyBatchSerialFallback
-                );
+            {
+                let selected_available_parallelism = route
+                    .ready_batches
+                    .as_ref()
+                    .and_then(|batches| batches.first())
+                    .and_then(|batch| batch.available_parallelism)
+                    .unwrap_or(1);
+                if selected_available_parallelism >= 2 {
+                    assert_eq!(
+                        route.effective(),
+                        IssuanceBenchmarkEffectiveRoute::BoundedNative
+                    );
+                } else {
+                    assert_eq!(
+                        route.effective(),
+                        IssuanceBenchmarkEffectiveRoute::ReadyBatchSerialFallback
+                    );
+                }
             }
 
             #[cfg(not(target_arch = "x86_64"))]

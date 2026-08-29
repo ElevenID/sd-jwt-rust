@@ -89,9 +89,21 @@ cargo bench --locked --no-default-features --features issuance_bench --bench sd_
 
 Keep this feature on the same exact revision for both requested routes; unlike
 the verification benchmark, it does not require two separately compiled
-feature modes. Preserve the emitted `sd_jwt_issuance_route_v1` records with the
+feature modes. Preserve the emitted `sd_jwt_issuance_route_v2` records with the
 Criterion estimates so a later runner can reject an expected-native case that
-actually fell back to serial execution.
+actually fell back to serial execution. Benchmark IDs remain `v1` because the
+matrix is unchanged; only the route-evidence schema is versioned here.
+
+Each adaptive `ready_batches` entry records the exact selector inputs and gate
+evaluation state, selected and leased workers, stable selection reason, and,
+for native execution, the contiguous static chunk counts and estimated loads.
+The estimator and partition rule have independent version labels. Aggregate
+batch counters are derived from these records. `ready_batches` is JSON `null`
+for the serial oracle and whole-target fallback; `[]` means the adaptive
+executor was genuinely observed and received no ready batches. This evidence
+is emitted only by the untimed preflight and contains aggregate sizes and
+counts, never claim names, claim values, salts, job identities, or structural
+locations.
 
 ## Reproducible comparison
 

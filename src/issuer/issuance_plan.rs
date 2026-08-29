@@ -19,7 +19,7 @@ use serde_json::{json, Map, Value};
     feature = "parallel",
     target_arch = "x86_64"
 ))]
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 #[cfg(any(test, all(feature = "parallel", target_arch = "x86_64")))]
 use std::collections::HashMap;
 #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
@@ -164,7 +164,7 @@ pub(super) struct IssuanceAssembly {
 }
 
 #[cfg(feature = "issuance_bench")]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct BenchmarkExecutionTraceSummary {
     pub(super) executor_batches: usize,
     pub(super) serial_batches: usize,
@@ -172,6 +172,127 @@ pub(super) struct BenchmarkExecutionTraceSummary {
     pub(super) budget_fallback_batches: usize,
     pub(super) max_worker_count: usize,
     pub(super) target_serial_fallback: bool,
+    pub(super) ready_batches: Option<Vec<BenchmarkReadyBatchTrace>>,
+}
+
+#[cfg(feature = "issuance_bench")]
+pub(super) const BENCHMARK_WORK_ESTIMATOR_VERSION: &str = "issuance_work_bytes_v1";
+
+#[cfg(feature = "issuance_bench")]
+pub(super) const BENCHMARK_STATIC_PARTITION_RULE_VERSION: &str = "contiguous_ceil_chunks_v1";
+
+#[cfg(feature = "issuance_bench")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BenchmarkWorkEstimateStatus {
+    NotEvaluated,
+    Available,
+    Overflow,
+}
+
+#[cfg(feature = "issuance_bench")]
+impl BenchmarkWorkEstimateStatus {
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::NotEvaluated => "not_evaluated",
+            Self::Available => "available",
+            Self::Overflow => "overflow",
+        }
+    }
+}
+
+#[cfg(feature = "issuance_bench")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BenchmarkBudgetAcquisitionResult {
+    NotEvaluated,
+    Acquired,
+    Unavailable,
+}
+
+#[cfg(feature = "issuance_bench")]
+impl BenchmarkBudgetAcquisitionResult {
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::NotEvaluated => "not_evaluated",
+            Self::Acquired => "acquired",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[cfg(feature = "issuance_bench")]
+// Unsupported targets emit only whole-target fallback records, so their
+// compiler cannot observe every native selector variant being constructed.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BenchmarkSelectedMode {
+    Serial,
+    NativeParallel,
+}
+
+#[cfg(feature = "issuance_bench")]
+impl BenchmarkSelectedMode {
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::Serial => "serial",
+            Self::NativeParallel => "native_parallel",
+        }
+    }
+}
+
+#[cfg(feature = "issuance_bench")]
+// Unsupported targets emit only whole-target fallback records, so their
+// compiler cannot observe the native selector constructing these reasons.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BenchmarkSelectionReason {
+    BelowMinJobs,
+    WorkEstimateOverflow,
+    BelowMinEstimatedWorkBytes,
+    InsufficientAvailableParallelism,
+    WorkerBudgetUnavailable,
+    BoundedNative,
+}
+
+#[cfg(feature = "issuance_bench")]
+impl BenchmarkSelectionReason {
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::BelowMinJobs => "below_min_jobs",
+            Self::WorkEstimateOverflow => "work_estimate_overflow",
+            Self::BelowMinEstimatedWorkBytes => "below_min_estimated_work_bytes",
+            Self::InsufficientAvailableParallelism => "insufficient_available_parallelism",
+            Self::WorkerBudgetUnavailable => "worker_budget_unavailable",
+            Self::BoundedNative => "bounded_native",
+        }
+    }
+}
+
+#[cfg(feature = "issuance_bench")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct BenchmarkStaticChunkTrace {
+    pub(super) ordinal: usize,
+    pub(super) job_count: usize,
+    pub(super) estimated_work_bytes: usize,
+}
+
+#[cfg(feature = "issuance_bench")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct BenchmarkReadyBatchTrace {
+    pub(super) ordinal: usize,
+    pub(super) job_count: usize,
+    pub(super) estimated_work_bytes: Option<usize>,
+    pub(super) work_estimate_status: BenchmarkWorkEstimateStatus,
+    pub(super) work_gate_evaluated: bool,
+    pub(super) parallelism_gate_evaluated: bool,
+    pub(super) budget_gate_evaluated: bool,
+    pub(super) available_parallelism: Option<usize>,
+    pub(super) selected_worker_count: Option<usize>,
+    pub(super) leased_worker_count: Option<usize>,
+    pub(super) budget_acquisition_result: BenchmarkBudgetAcquisitionResult,
+    pub(super) selected_mode: BenchmarkSelectedMode,
+    pub(super) selection_reason: BenchmarkSelectionReason,
+    pub(super) static_chunk_size: Option<usize>,
+    pub(super) static_chunks: Option<Vec<BenchmarkStaticChunkTrace>>,
 }
 
 #[cfg(all(
@@ -181,11 +302,7 @@ pub(super) struct BenchmarkExecutionTraceSummary {
 ))]
 #[derive(Default)]
 struct BenchmarkExecutionTrace {
-    executor_batches: Cell<usize>,
-    serial_batches: Cell<usize>,
-    native_batches: Cell<usize>,
-    budget_fallback_batches: Cell<usize>,
-    max_worker_count: Cell<usize>,
+    ready_batches: RefCell<Vec<BenchmarkReadyBatchTrace>>,
 }
 
 #[cfg(all(
@@ -194,39 +311,33 @@ struct BenchmarkExecutionTrace {
     target_arch = "x86_64"
 ))]
 impl BenchmarkExecutionTrace {
-    fn record_serial(&self) {
-        self.executor_batches
-            .set(self.executor_batches.get().saturating_add(1));
-        self.serial_batches
-            .set(self.serial_batches.get().saturating_add(1));
-    }
-
-    fn record_native(&self, worker_count: usize) {
-        self.executor_batches
-            .set(self.executor_batches.get().saturating_add(1));
-        self.native_batches
-            .set(self.native_batches.get().saturating_add(1));
-        self.max_worker_count
-            .set(self.max_worker_count.get().max(worker_count));
-    }
-
-    fn record_budget_fallback(&self) {
-        self.executor_batches
-            .set(self.executor_batches.get().saturating_add(1));
-        self.serial_batches
-            .set(self.serial_batches.get().saturating_add(1));
-        self.budget_fallback_batches
-            .set(self.budget_fallback_batches.get().saturating_add(1));
-    }
-
     fn summary(&self) -> BenchmarkExecutionTraceSummary {
+        let ready_batches = self.ready_batches.borrow().clone();
+        let native_batches = ready_batches
+            .iter()
+            .filter(|batch| batch.selected_mode == BenchmarkSelectedMode::NativeParallel)
+            .count();
+        let serial_batches = ready_batches.len().saturating_sub(native_batches);
+        let budget_fallback_batches = ready_batches
+            .iter()
+            .filter(|batch| {
+                batch.selection_reason == BenchmarkSelectionReason::WorkerBudgetUnavailable
+            })
+            .count();
+        let max_worker_count = ready_batches
+            .iter()
+            .filter_map(|batch| batch.leased_worker_count)
+            .max()
+            .unwrap_or(0);
+
         BenchmarkExecutionTraceSummary {
-            executor_batches: self.executor_batches.get(),
-            serial_batches: self.serial_batches.get(),
-            native_batches: self.native_batches.get(),
-            budget_fallback_batches: self.budget_fallback_batches.get(),
-            max_worker_count: self.max_worker_count.get(),
+            executor_batches: ready_batches.len(),
+            serial_batches,
+            native_batches,
+            budget_fallback_batches,
+            max_worker_count,
             target_serial_fallback: false,
+            ready_batches: Some(ready_batches),
         }
     }
 }
@@ -843,6 +954,26 @@ impl IssuanceExecutionDecision {
     }
 }
 
+#[cfg(all(
+    feature = "issuance_bench",
+    feature = "parallel",
+    target_arch = "x86_64"
+))]
+impl From<IssuanceExecutionReason> for BenchmarkSelectionReason {
+    fn from(reason: IssuanceExecutionReason) -> Self {
+        match reason {
+            IssuanceExecutionReason::BelowMinJobs => Self::BelowMinJobs,
+            IssuanceExecutionReason::WorkEstimateOverflow => Self::WorkEstimateOverflow,
+            IssuanceExecutionReason::BelowMinEstimatedWorkBytes => Self::BelowMinEstimatedWorkBytes,
+            IssuanceExecutionReason::InsufficientAvailableParallelism => {
+                Self::InsufficientAvailableParallelism
+            }
+            IssuanceExecutionReason::WorkerBudgetUnavailable => Self::WorkerBudgetUnavailable,
+            IssuanceExecutionReason::BoundedNative => Self::BoundedNative,
+        }
+    }
+}
+
 #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
 enum IssuanceExecutionSelection<'a> {
     Serial(IssuanceExecutionDecision),
@@ -854,7 +985,7 @@ enum IssuanceExecutionSelection<'a> {
 
 #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
 impl IssuanceExecutionSelection<'_> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "issuance_bench"))]
     fn decision(&self) -> IssuanceExecutionDecision {
         match self {
             Self::Serial(decision) | Self::Native { decision, .. } => *decision,
@@ -1032,6 +1163,129 @@ impl Drop for ParallelIssuanceWorkerLease<'_> {
 static PARALLEL_ISSUANCE_WORKER_BUDGET: ParallelIssuanceWorkerBudget =
     ParallelIssuanceWorkerBudget::new(MAX_PARALLEL_ISSUANCE_WORKERS);
 
+#[cfg(all(
+    feature = "issuance_bench",
+    feature = "parallel",
+    target_arch = "x86_64"
+))]
+fn record_benchmark_ready_batch(
+    trace: &BenchmarkExecutionTrace,
+    jobs: &[IssuanceJob],
+    decision: IssuanceExecutionDecision,
+    estimated_work_bytes: Option<Option<usize>>,
+    available_parallelism: Option<usize>,
+) {
+    let work_estimate_status = match estimated_work_bytes {
+        None => BenchmarkWorkEstimateStatus::NotEvaluated,
+        Some(Some(_)) => BenchmarkWorkEstimateStatus::Available,
+        Some(None) => BenchmarkWorkEstimateStatus::Overflow,
+    };
+    let work_gate_evaluated = estimated_work_bytes.is_some();
+    let parallelism_gate_evaluated = available_parallelism.is_some();
+    let budget_gate_evaluated = matches!(
+        decision.reason,
+        IssuanceExecutionReason::WorkerBudgetUnavailable | IssuanceExecutionReason::BoundedNative
+    );
+    let selected_worker_count = available_parallelism
+        .map(|available| available.min(MAX_PARALLEL_ISSUANCE_WORKERS).min(jobs.len()));
+    let (selected_mode, leased_worker_count, budget_acquisition_result) = match decision.mode {
+        IssuanceExecutionMode::Serial => (
+            BenchmarkSelectedMode::Serial,
+            None,
+            if decision.reason == IssuanceExecutionReason::WorkerBudgetUnavailable {
+                BenchmarkBudgetAcquisitionResult::Unavailable
+            } else {
+                BenchmarkBudgetAcquisitionResult::NotEvaluated
+            },
+        ),
+        IssuanceExecutionMode::NativeParallel { worker_count } => (
+            BenchmarkSelectedMode::NativeParallel,
+            Some(worker_count),
+            BenchmarkBudgetAcquisitionResult::Acquired,
+        ),
+    };
+    let (static_chunk_size, static_chunks) = match decision.mode {
+        IssuanceExecutionMode::Serial => (None, None),
+        IssuanceExecutionMode::NativeParallel { worker_count } => {
+            let chunk_size = static_chunk_size(jobs.len(), worker_count);
+            let chunks = jobs
+                .chunks(chunk_size)
+                .enumerate()
+                .map(|(ordinal, chunk)| BenchmarkStaticChunkTrace {
+                    ordinal,
+                    job_count: chunk.len(),
+                    estimated_work_bytes: estimate_ready_job_work_bytes(chunk).expect(
+                        "a native chunk estimate must fit when its ready-batch estimate fits",
+                    ),
+                })
+                .collect();
+            (Some(chunk_size), Some(chunks))
+        }
+    };
+
+    let mut ready_batches = trace.ready_batches.borrow_mut();
+    let ordinal = ready_batches.len();
+    ready_batches.push(BenchmarkReadyBatchTrace {
+        ordinal,
+        job_count: jobs.len(),
+        estimated_work_bytes: estimated_work_bytes.flatten(),
+        work_estimate_status,
+        work_gate_evaluated,
+        parallelism_gate_evaluated,
+        budget_gate_evaluated,
+        available_parallelism,
+        selected_worker_count,
+        leased_worker_count,
+        budget_acquisition_result,
+        selected_mode,
+        selection_reason: BenchmarkSelectionReason::from(decision.reason),
+        static_chunk_size,
+        static_chunks,
+    });
+}
+
+#[cfg(all(
+    feature = "issuance_bench",
+    feature = "parallel",
+    target_arch = "x86_64"
+))]
+fn select_execution_with_benchmark_trace<'a, F>(
+    jobs: &[IssuanceJob],
+    thresholds: IssuancePolicyThresholds,
+    budget: &'a ParallelIssuanceWorkerBudget,
+    available_threads: F,
+    trace: &BenchmarkExecutionTrace,
+) -> IssuanceExecutionSelection<'a>
+where
+    F: FnOnce() -> usize,
+{
+    let estimated_work_bytes = Cell::new(None);
+    let available_parallelism = Cell::new(None);
+    let selection = select_execution_with_estimate(
+        jobs.len(),
+        || {
+            let estimate = estimate_ready_job_work_bytes(jobs);
+            estimated_work_bytes.set(Some(estimate));
+            estimate
+        },
+        thresholds,
+        budget,
+        || {
+            let available = available_threads();
+            available_parallelism.set(Some(available));
+            available
+        },
+    );
+    record_benchmark_ready_batch(
+        trace,
+        jobs,
+        selection.decision(),
+        estimated_work_bytes.get(),
+        available_parallelism.get(),
+    );
+    selection
+}
+
 #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
 struct AdaptiveIssuanceExecutor<'a, F> {
     thresholds: IssuancePolicyThresholds,
@@ -1047,30 +1301,31 @@ where
     F: Fn() -> usize,
 {
     fn execute(&self, jobs: Vec<IssuanceJob>) -> Result<Vec<IssuanceOutcome>> {
-        match select_execution(&jobs, self.thresholds, self.budget, || {
+        #[cfg(feature = "issuance_bench")]
+        let selection = if let Some(trace) = self.trace {
+            select_execution_with_benchmark_trace(
+                &jobs,
+                self.thresholds,
+                self.budget,
+                || (self.available_threads)(),
+                trace,
+            )
+        } else {
+            select_execution(&jobs, self.thresholds, self.budget, || {
+                (self.available_threads)()
+            })
+        };
+
+        #[cfg(not(feature = "issuance_bench"))]
+        let selection = select_execution(&jobs, self.thresholds, self.budget, || {
             (self.available_threads)()
-        }) {
+        });
+
+        match selection {
             IssuanceExecutionSelection::Serial(decision) => {
                 debug_assert_eq!(decision.mode, IssuanceExecutionMode::Serial);
-                match decision.reason {
-                    IssuanceExecutionReason::BelowMinJobs
-                    | IssuanceExecutionReason::WorkEstimateOverflow
-                    | IssuanceExecutionReason::BelowMinEstimatedWorkBytes
-                    | IssuanceExecutionReason::InsufficientAvailableParallelism => {
-                        #[cfg(feature = "issuance_bench")]
-                        if let Some(trace) = self.trace {
-                            trace.record_serial();
-                        }
-                    }
-                    IssuanceExecutionReason::WorkerBudgetUnavailable => {
-                        #[cfg(feature = "issuance_bench")]
-                        if let Some(trace) = self.trace {
-                            trace.record_budget_fallback();
-                        }
-                    }
-                    IssuanceExecutionReason::BoundedNative => {
-                        unreachable!("bounded native issuance decision must own a worker lease")
-                    }
+                if decision.reason == IssuanceExecutionReason::BoundedNative {
+                    unreachable!("bounded native issuance decision must own a worker lease")
                 }
                 SerialIssuanceExecutor::default().execute(jobs)
             }
@@ -1080,11 +1335,6 @@ where
                 };
                 debug_assert_eq!(decision.reason, IssuanceExecutionReason::BoundedNative);
                 debug_assert_eq!(worker_count, lease.worker_count());
-
-                #[cfg(feature = "issuance_bench")]
-                if let Some(trace) = self.trace {
-                    trace.record_native(worker_count);
-                }
 
                 let outcomes = NativeParallelIssuanceExecutor::new(worker_count).execute(jobs);
                 // Every scoped worker has joined. Release permits before deterministic
