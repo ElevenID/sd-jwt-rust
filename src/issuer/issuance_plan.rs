@@ -799,39 +799,135 @@ struct IssuancePolicyThresholds {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IssuanceExecutionMode {
     Serial,
-    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
-    NativeParallel {
-        worker_count: usize,
+    NativeParallel { worker_count: usize },
+}
+
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
+enum IssuanceExecutionReason {
+    #[strum(serialize = "below_min_jobs")]
+    BelowMinJobs,
+    #[strum(serialize = "work_estimate_overflow")]
+    WorkEstimateOverflow,
+    #[strum(serialize = "below_min_estimated_work_bytes")]
+    BelowMinEstimatedWorkBytes,
+    #[strum(serialize = "insufficient_available_parallelism")]
+    InsufficientAvailableParallelism,
+    #[strum(serialize = "worker_budget_unavailable")]
+    WorkerBudgetUnavailable,
+    #[strum(serialize = "bounded_native")]
+    BoundedNative,
+}
+
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IssuanceExecutionDecision {
+    mode: IssuanceExecutionMode,
+    reason: IssuanceExecutionReason,
+}
+
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+impl IssuanceExecutionDecision {
+    const fn serial(reason: IssuanceExecutionReason) -> Self {
+        Self {
+            mode: IssuanceExecutionMode::Serial,
+            reason,
+        }
+    }
+
+    const fn bounded_native(worker_count: usize) -> Self {
+        Self {
+            mode: IssuanceExecutionMode::NativeParallel { worker_count },
+            reason: IssuanceExecutionReason::BoundedNative,
+        }
+    }
+}
+
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+enum IssuanceExecutionSelection<'a> {
+    Serial(IssuanceExecutionDecision),
+    Native {
+        decision: IssuanceExecutionDecision,
+        lease: ParallelIssuanceWorkerLease<'a>,
     },
 }
 
 #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
-fn select_execution_mode<F>(
+impl IssuanceExecutionSelection<'_> {
+    #[cfg(test)]
+    fn decision(&self) -> IssuanceExecutionDecision {
+        match self {
+            Self::Serial(decision) | Self::Native { decision, .. } => *decision,
+        }
+    }
+}
+
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+fn select_execution<'a, F>(
     jobs: &[IssuanceJob],
     thresholds: IssuancePolicyThresholds,
+    budget: &'a ParallelIssuanceWorkerBudget,
     available_threads: F,
-) -> IssuanceExecutionMode
+) -> IssuanceExecutionSelection<'a>
 where
     F: FnOnce() -> usize,
 {
-    if jobs.len() < thresholds.min_jobs {
-        return IssuanceExecutionMode::Serial;
+    select_execution_with_estimate(
+        jobs.len(),
+        || estimate_ready_job_work_bytes(jobs),
+        thresholds,
+        budget,
+        available_threads,
+    )
+}
+
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+fn select_execution_with_estimate<'a, E, F>(
+    job_count: usize,
+    estimate_work_bytes: E,
+    thresholds: IssuancePolicyThresholds,
+    budget: &'a ParallelIssuanceWorkerBudget,
+    available_threads: F,
+) -> IssuanceExecutionSelection<'a>
+where
+    E: FnOnce() -> Option<usize>,
+    F: FnOnce() -> usize,
+{
+    if job_count < thresholds.min_jobs {
+        return IssuanceExecutionSelection::Serial(IssuanceExecutionDecision::serial(
+            IssuanceExecutionReason::BelowMinJobs,
+        ));
     }
 
-    let Some(estimated_work_bytes) = estimate_ready_job_work_bytes(jobs) else {
-        return IssuanceExecutionMode::Serial;
+    let Some(estimated_work_bytes) = estimate_work_bytes() else {
+        return IssuanceExecutionSelection::Serial(IssuanceExecutionDecision::serial(
+            IssuanceExecutionReason::WorkEstimateOverflow,
+        ));
     };
     if estimated_work_bytes < thresholds.min_estimated_work_bytes {
-        return IssuanceExecutionMode::Serial;
+        return IssuanceExecutionSelection::Serial(IssuanceExecutionDecision::serial(
+            IssuanceExecutionReason::BelowMinEstimatedWorkBytes,
+        ));
     }
 
     let worker_count = available_threads()
         .min(MAX_PARALLEL_ISSUANCE_WORKERS)
-        .min(jobs.len());
+        .min(job_count);
     if worker_count < 2 {
-        IssuanceExecutionMode::Serial
-    } else {
-        IssuanceExecutionMode::NativeParallel { worker_count }
+        return IssuanceExecutionSelection::Serial(IssuanceExecutionDecision::serial(
+            IssuanceExecutionReason::InsufficientAvailableParallelism,
+        ));
+    }
+
+    let Some(lease) = budget.try_acquire(worker_count) else {
+        return IssuanceExecutionSelection::Serial(IssuanceExecutionDecision::serial(
+            IssuanceExecutionReason::WorkerBudgetUnavailable,
+        ));
+    };
+
+    IssuanceExecutionSelection::Native {
+        decision: IssuanceExecutionDecision::bounded_native(lease.worker_count()),
+        lease,
     }
 }
 
@@ -849,6 +945,8 @@ fn available_worker_threads() -> usize {
 struct ParallelIssuanceWorkerBudget {
     available: AtomicUsize,
     capacity: usize,
+    #[cfg(test)]
+    acquisition_attempts: AtomicUsize,
 }
 
 #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
@@ -857,10 +955,15 @@ impl ParallelIssuanceWorkerBudget {
         Self {
             available: AtomicUsize::new(capacity),
             capacity,
+            #[cfg(test)]
+            acquisition_attempts: AtomicUsize::new(0),
         }
     }
 
     fn try_acquire(&self, worker_count: usize) -> Option<ParallelIssuanceWorkerLease<'_>> {
+        #[cfg(test)]
+        self.acquisition_attempts.fetch_add(1, Ordering::Relaxed);
+
         if worker_count < 2 || worker_count > self.capacity {
             return None;
         }
@@ -890,6 +993,11 @@ impl ParallelIssuanceWorkerBudget {
     #[cfg(test)]
     fn available(&self) -> usize {
         self.available.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    fn acquisition_attempts(&self) -> usize {
+        self.acquisition_attempts.load(Ordering::Relaxed)
     }
 }
 
@@ -939,32 +1047,52 @@ where
     F: Fn() -> usize,
 {
     fn execute(&self, jobs: Vec<IssuanceJob>) -> Result<Vec<IssuanceOutcome>> {
-        let mode = select_execution_mode(&jobs, self.thresholds, || (self.available_threads)());
-        let IssuanceExecutionMode::NativeParallel { worker_count } = mode else {
-            #[cfg(feature = "issuance_bench")]
-            if let Some(trace) = self.trace {
-                trace.record_serial();
+        match select_execution(&jobs, self.thresholds, self.budget, || {
+            (self.available_threads)()
+        }) {
+            IssuanceExecutionSelection::Serial(decision) => {
+                debug_assert_eq!(decision.mode, IssuanceExecutionMode::Serial);
+                match decision.reason {
+                    IssuanceExecutionReason::BelowMinJobs
+                    | IssuanceExecutionReason::WorkEstimateOverflow
+                    | IssuanceExecutionReason::BelowMinEstimatedWorkBytes
+                    | IssuanceExecutionReason::InsufficientAvailableParallelism => {
+                        #[cfg(feature = "issuance_bench")]
+                        if let Some(trace) = self.trace {
+                            trace.record_serial();
+                        }
+                    }
+                    IssuanceExecutionReason::WorkerBudgetUnavailable => {
+                        #[cfg(feature = "issuance_bench")]
+                        if let Some(trace) = self.trace {
+                            trace.record_budget_fallback();
+                        }
+                    }
+                    IssuanceExecutionReason::BoundedNative => {
+                        unreachable!("bounded native issuance decision must own a worker lease")
+                    }
+                }
+                SerialIssuanceExecutor::default().execute(jobs)
             }
-            return SerialIssuanceExecutor::default().execute(jobs);
-        };
-        let Some(lease) = self.budget.try_acquire(worker_count) else {
-            #[cfg(feature = "issuance_bench")]
-            if let Some(trace) = self.trace {
-                trace.record_budget_fallback();
-            }
-            return SerialIssuanceExecutor::default().execute(jobs);
-        };
+            IssuanceExecutionSelection::Native { decision, lease } => {
+                let IssuanceExecutionMode::NativeParallel { worker_count } = decision.mode else {
+                    unreachable!("native issuance selection must contain a native decision")
+                };
+                debug_assert_eq!(decision.reason, IssuanceExecutionReason::BoundedNative);
+                debug_assert_eq!(worker_count, lease.worker_count());
 
-        #[cfg(feature = "issuance_bench")]
-        if let Some(trace) = self.trace {
-            trace.record_native(lease.worker_count());
+                #[cfg(feature = "issuance_bench")]
+                if let Some(trace) = self.trace {
+                    trace.record_native(worker_count);
+                }
+
+                let outcomes = NativeParallelIssuanceExecutor::new(worker_count).execute(jobs);
+                // Every scoped worker has joined. Release permits before deterministic
+                // restoration, parent assembly, signing, or another ready batch.
+                drop(lease);
+                outcomes
+            }
         }
-
-        let outcomes = NativeParallelIssuanceExecutor::new(lease.worker_count()).execute(jobs);
-        // Every scoped worker has joined. Release permits before deterministic
-        // restoration, parent assembly, signing, or another ready batch.
-        drop(lease);
-        outcomes
     }
 }
 
@@ -2387,10 +2515,13 @@ mod tests {
             min_jobs: 1,
             min_estimated_work_bytes: 1,
         };
-        let mode = select_execution_mode(&jobs, thresholds, || 4);
-        let IssuanceExecutionMode::NativeParallel { worker_count } = mode else {
+        let budget = ParallelIssuanceWorkerBudget::new(MAX_PARALLEL_ISSUANCE_WORKERS);
+        let selection = select_execution(&jobs, thresholds, &budget, || 4);
+        let decision = selection.decision();
+        let IssuanceExecutionMode::NativeParallel { worker_count } = decision.mode else {
             panic!("accounting fixture must select native execution");
         };
+        assert_eq!(decision.reason, IssuanceExecutionReason::BoundedNative);
 
         let chunk_size = static_chunk_size(jobs.len(), worker_count);
         let chunk_counts = jobs.chunks(chunk_size).map(<[_]>::len).collect::<Vec<_>>();
@@ -2417,45 +2548,211 @@ mod tests {
             available_parallelism_queries.set(available_parallelism_queries.get() + 1);
             4
         };
+        let budget = ParallelIssuanceWorkerBudget::new(MAX_PARALLEL_ISSUANCE_WORKERS);
 
         assert_eq!(
-            select_execution_mode(
+            select_execution(
                 &jobs[..2],
                 IssuancePolicyThresholds {
                     min_jobs: 3,
                     min_estimated_work_bytes: 1,
                 },
+                &budget,
                 query_available_parallelism,
-            ),
-            IssuanceExecutionMode::Serial
+            )
+            .decision(),
+            IssuanceExecutionDecision::serial(IssuanceExecutionReason::BelowMinJobs)
         );
         assert_eq!(available_parallelism_queries.get(), 0);
 
         assert_eq!(
-            select_execution_mode(
+            select_execution(
                 &jobs[..3],
                 IssuancePolicyThresholds {
                     min_jobs: 3,
                     min_estimated_work_bytes: 32,
                 },
+                &budget,
                 query_available_parallelism,
-            ),
-            IssuanceExecutionMode::Serial
+            )
+            .decision(),
+            IssuanceExecutionDecision::serial(IssuanceExecutionReason::BelowMinEstimatedWorkBytes)
         );
         assert_eq!(available_parallelism_queries.get(), 0);
 
         assert_eq!(
-            select_execution_mode(
+            select_execution(
                 &jobs,
                 IssuancePolicyThresholds {
                     min_jobs: 3,
                     min_estimated_work_bytes: 31,
                 },
+                &budget,
                 query_available_parallelism,
-            ),
-            IssuanceExecutionMode::NativeParallel { worker_count: 4 }
+            )
+            .decision(),
+            IssuanceExecutionDecision::bounded_native(4)
         );
         assert_eq!(available_parallelism_queries.get(), 1);
+    }
+
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+    #[test]
+    fn selector_reports_stable_reasons_without_eager_later_gates() {
+        use std::cell::Cell;
+
+        let stable_reason_names = [
+            IssuanceExecutionReason::BelowMinJobs,
+            IssuanceExecutionReason::WorkEstimateOverflow,
+            IssuanceExecutionReason::BelowMinEstimatedWorkBytes,
+            IssuanceExecutionReason::InsufficientAvailableParallelism,
+            IssuanceExecutionReason::WorkerBudgetUnavailable,
+            IssuanceExecutionReason::BoundedNative,
+        ]
+        .map(<&'static str>::from);
+        assert_eq!(
+            stable_reason_names,
+            [
+                "below_min_jobs",
+                "work_estimate_overflow",
+                "below_min_estimated_work_bytes",
+                "insufficient_available_parallelism",
+                "worker_budget_unavailable",
+                "bounded_native",
+            ]
+        );
+
+        let thresholds = IssuancePolicyThresholds {
+            min_jobs: 2,
+            min_estimated_work_bytes: 10,
+        };
+        let budget = ParallelIssuanceWorkerBudget::new(MAX_PARALLEL_ISSUANCE_WORKERS);
+        let estimate_queries = Cell::new(0usize);
+        let parallelism_queries = Cell::new(0usize);
+
+        let below_min_jobs = select_execution_with_estimate(
+            1,
+            || {
+                estimate_queries.set(estimate_queries.get() + 1);
+                None
+            },
+            thresholds,
+            &budget,
+            || {
+                parallelism_queries.set(parallelism_queries.get() + 1);
+                1
+            },
+        );
+        assert_eq!(
+            below_min_jobs.decision(),
+            IssuanceExecutionDecision::serial(IssuanceExecutionReason::BelowMinJobs)
+        );
+        assert_eq!(estimate_queries.get(), 0);
+        assert_eq!(parallelism_queries.get(), 0);
+
+        let overflow = select_execution_with_estimate(
+            2,
+            || {
+                estimate_queries.set(estimate_queries.get() + 1);
+                None
+            },
+            thresholds,
+            &budget,
+            || {
+                parallelism_queries.set(parallelism_queries.get() + 1);
+                1
+            },
+        );
+        assert_eq!(
+            overflow.decision(),
+            IssuanceExecutionDecision::serial(IssuanceExecutionReason::WorkEstimateOverflow)
+        );
+        assert_eq!(estimate_queries.get(), 1);
+        assert_eq!(parallelism_queries.get(), 0);
+
+        let below_min_work = select_execution_with_estimate(
+            2,
+            || {
+                estimate_queries.set(estimate_queries.get() + 1);
+                Some(9)
+            },
+            thresholds,
+            &budget,
+            || {
+                parallelism_queries.set(parallelism_queries.get() + 1);
+                1
+            },
+        );
+        assert_eq!(
+            below_min_work.decision(),
+            IssuanceExecutionDecision::serial(IssuanceExecutionReason::BelowMinEstimatedWorkBytes)
+        );
+        assert_eq!(estimate_queries.get(), 2);
+        assert_eq!(parallelism_queries.get(), 0);
+
+        let insufficient_parallelism = select_execution_with_estimate(
+            2,
+            || {
+                estimate_queries.set(estimate_queries.get() + 1);
+                Some(10)
+            },
+            thresholds,
+            &budget,
+            || {
+                parallelism_queries.set(parallelism_queries.get() + 1);
+                1
+            },
+        );
+        assert_eq!(
+            insufficient_parallelism.decision(),
+            IssuanceExecutionDecision::serial(
+                IssuanceExecutionReason::InsufficientAvailableParallelism
+            )
+        );
+        assert_eq!(estimate_queries.get(), 3);
+        assert_eq!(parallelism_queries.get(), 1);
+        assert_eq!(budget.available(), MAX_PARALLEL_ISSUANCE_WORKERS);
+        assert_eq!(budget.acquisition_attempts(), 0);
+
+        let held = budget.try_acquire(MAX_PARALLEL_ISSUANCE_WORKERS).unwrap();
+        let unavailable_budget = select_execution_with_estimate(
+            2,
+            || Some(10),
+            thresholds,
+            &budget,
+            || {
+                parallelism_queries.set(parallelism_queries.get() + 1);
+                MAX_PARALLEL_ISSUANCE_WORKERS
+            },
+        );
+        assert_eq!(
+            unavailable_budget.decision(),
+            IssuanceExecutionDecision::serial(IssuanceExecutionReason::WorkerBudgetUnavailable)
+        );
+        assert_eq!(parallelism_queries.get(), 2);
+        assert_eq!(budget.available(), 0);
+        assert_eq!(budget.acquisition_attempts(), 2);
+        drop(held);
+
+        let bounded_native = select_execution_with_estimate(
+            2,
+            || Some(10),
+            thresholds,
+            &budget,
+            || {
+                parallelism_queries.set(parallelism_queries.get() + 1);
+                MAX_PARALLEL_ISSUANCE_WORKERS
+            },
+        );
+        assert_eq!(
+            bounded_native.decision(),
+            IssuanceExecutionDecision::bounded_native(2)
+        );
+        assert_eq!(parallelism_queries.get(), 3);
+        assert_eq!(budget.available(), MAX_PARALLEL_ISSUANCE_WORKERS - 2);
+        assert_eq!(budget.acquisition_attempts(), 3);
+        drop(bounded_native);
+        assert_eq!(budget.available(), MAX_PARALLEL_ISSUANCE_WORKERS);
     }
 
     #[cfg(all(
@@ -2504,34 +2801,40 @@ mod tests {
             min_estimated_work_bytes: 1,
         };
         assert_eq!(
-            select_execution_mode(&jobs, thresholds, || 8),
-            IssuanceExecutionMode::NativeParallel { worker_count: 2 }
+            select_execution(&jobs, thresholds, &budget, || 8).decision(),
+            IssuanceExecutionDecision::bounded_native(2)
         );
         assert_eq!(
-            select_execution_mode(
+            select_execution(
                 &jobs,
                 IssuancePolicyThresholds {
                     min_jobs: 3,
                     min_estimated_work_bytes: 1,
                 },
+                &budget,
                 || 8,
-            ),
-            IssuanceExecutionMode::Serial
+            )
+            .decision(),
+            IssuanceExecutionDecision::serial(IssuanceExecutionReason::BelowMinJobs)
         );
         assert_eq!(
-            select_execution_mode(
+            select_execution(
                 &jobs,
                 IssuancePolicyThresholds {
                     min_jobs: 2,
                     min_estimated_work_bytes: usize::MAX,
                 },
+                &budget,
                 || 8,
-            ),
-            IssuanceExecutionMode::Serial
+            )
+            .decision(),
+            IssuanceExecutionDecision::serial(IssuanceExecutionReason::BelowMinEstimatedWorkBytes)
         );
         assert_eq!(
-            select_execution_mode(&jobs, thresholds, || 1),
-            IssuanceExecutionMode::Serial
+            select_execution(&jobs, thresholds, &budget, || 1).decision(),
+            IssuanceExecutionDecision::serial(
+                IssuanceExecutionReason::InsufficientAvailableParallelism
+            )
         );
     }
 
