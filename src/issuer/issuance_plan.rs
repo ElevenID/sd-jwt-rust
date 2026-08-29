@@ -50,21 +50,51 @@ const PARALLEL_ISSUANCE_SPAWN_FAILURE: &str =
 /// benchmarked independently from verification before native execution can be
 /// selected. Keeping the policy as data makes that later, evidence-backed
 /// enablement an isolated change.
-#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+#[cfg(any(
+    feature = "issuance_bench",
+    all(feature = "parallel", target_arch = "x86_64")
+))]
 const QUALIFIED_ISSUANCE_THRESHOLDS: Option<IssuancePolicyThresholds> = None;
 
 /// Mechanical eligibility only: this is not a qualified production policy.
 /// It exists solely so the opt-in benchmark exercises the complete adaptive
 /// selector, process-wide worker lease, and bounded native executor.
-#[cfg(all(
-    feature = "issuance_bench",
-    feature = "parallel",
-    target_arch = "x86_64"
-))]
+#[cfg(feature = "issuance_bench")]
 const BENCHMARK_ISSUANCE_THRESHOLDS: IssuancePolicyThresholds = IssuancePolicyThresholds {
     min_jobs: 2,
     min_estimated_work_bytes: 1,
 };
+
+/// Policy values copied from the exact constants used by production and the
+/// benchmark selector. The benchmark facade consumes this accessor instead of
+/// restating policy facts in a second module.
+#[cfg(feature = "issuance_bench")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct BenchmarkIssuancePolicyFacts {
+    pub(super) mechanical_min_jobs: usize,
+    pub(super) mechanical_min_estimated_work_bytes: usize,
+    pub(super) qualified_min_jobs: Option<usize>,
+    pub(super) qualified_min_estimated_work_bytes: Option<usize>,
+}
+
+#[cfg(feature = "issuance_bench")]
+pub(super) const fn benchmark_issuance_policy_facts() -> BenchmarkIssuancePolicyFacts {
+    let (qualified_min_jobs, qualified_min_estimated_work_bytes) =
+        match QUALIFIED_ISSUANCE_THRESHOLDS {
+            Some(thresholds) => (
+                Some(thresholds.min_jobs),
+                Some(thresholds.min_estimated_work_bytes),
+            ),
+            None => (None, None),
+        };
+
+    BenchmarkIssuancePolicyFacts {
+        mechanical_min_jobs: BENCHMARK_ISSUANCE_THRESHOLDS.min_jobs,
+        mechanical_min_estimated_work_bytes: BENCHMARK_ISSUANCE_THRESHOLDS.min_estimated_work_bytes,
+        qualified_min_jobs,
+        qualified_min_estimated_work_bytes,
+    }
+}
 
 #[cfg(all(
     feature = "issuance_bench",
@@ -923,7 +953,10 @@ impl IssuanceExecutor for NativeParallelIssuanceExecutor {
     }
 }
 
-#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+#[cfg(any(
+    feature = "issuance_bench",
+    all(feature = "parallel", target_arch = "x86_64")
+))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct IssuancePolicyThresholds {
     min_jobs: usize,
