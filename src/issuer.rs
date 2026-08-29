@@ -19,11 +19,10 @@ use serde_json::{json, Map as SJMap, Map};
 
 use crate::disclosure::SDJWTDisclosure;
 use crate::error::Error;
-use crate::utils::{base64_hash, generate_salt};
+use crate::utils::generate_salt;
 use crate::{
     SDJWTCommon, SDJWTSerializationFormat, CNF_KEY, COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
-    DEFAULT_DIGEST_ALG, DEFAULT_SIGNING_ALG, DIGEST_ALG_KEY, JWK_KEY, SD_DIGESTS_KEY,
-    SD_LIST_PREFIX,
+    DEFAULT_DIGEST_ALG, DEFAULT_SIGNING_ALG, DIGEST_ALG_KEY, JWK_KEY,
 };
 
 pub struct SDJWTIssuer {
@@ -43,6 +42,10 @@ pub struct SDJWTIssuer {
     signed_sd_jwt: String,
     serialized_sd_jwt: String,
 }
+
+mod issuance_plan;
+
+use issuance_plan::IssuancePlan;
 
 /// ClaimsForSelectiveDisclosureStrategy is used to determine which claims can be selectively disclosed later by the holder.
 #[derive(PartialEq, Debug)]
@@ -258,8 +261,16 @@ impl SDJWTIssuer {
             .filter_map(|key| claims_obj_ref.shift_remove_entry(key))
             .collect();
 
-        self.sd_jwt_payload = self
-            .create_sd_claims(&user_claims, sd_strategy, random_source)
+        let assembly = IssuancePlan::create(
+            user_claims,
+            sd_strategy,
+            self.add_decoy_claims,
+            random_source,
+        )?
+        .execute_serial()?;
+        self.all_disclosures = assembly.disclosures;
+        self.sd_jwt_payload = assembly
+            .claims
             .as_object()
             .ok_or(Error::ConversionError("json object".to_string()))?
             .clone();
@@ -277,96 +288,6 @@ impl SDJWTIssuer {
         }
 
         Ok(())
-    }
-
-    fn create_sd_claims<R: IssuanceRandomSource>(
-        &mut self,
-        user_claims: &Value,
-        sd_strategy: ClaimsForSelectiveDisclosureStrategy,
-        random_source: &mut R,
-    ) -> Value {
-        match user_claims {
-            Value::Array(list) => self.create_sd_claims_list(list, sd_strategy, random_source),
-            Value::Object(object) => {
-                self.create_sd_claims_object(object, sd_strategy, random_source)
-            }
-            _ => user_claims.to_owned(),
-        }
-    }
-
-    fn create_sd_claims_list<R: IssuanceRandomSource>(
-        &mut self,
-        list: &[Value],
-        sd_strategy: ClaimsForSelectiveDisclosureStrategy,
-        random_source: &mut R,
-    ) -> Value {
-        let mut claims = Vec::new();
-        for (idx, object) in list.iter().enumerate() {
-            let key = format!("[{idx}]");
-            let strategy_for_child = sd_strategy.next_level(&key);
-            let subtree = self.create_sd_claims(object, strategy_for_child, random_source);
-
-            if sd_strategy.sd_for_key(&key) {
-                let disclosure =
-                    SDJWTDisclosure::new_with_salt(None, subtree, random_source.disclosure_salt());
-                claims.push(json!({ SD_LIST_PREFIX: disclosure.hash}));
-                self.all_disclosures.push(disclosure);
-            } else {
-                claims.push(subtree);
-            }
-        }
-        Value::Array(claims)
-    }
-
-    fn create_sd_claims_object<R: IssuanceRandomSource>(
-        &mut self,
-        user_claims: &SJMap<String, Value>,
-        sd_strategy: ClaimsForSelectiveDisclosureStrategy,
-        random_source: &mut R,
-    ) -> Value {
-        let mut claims = SJMap::new();
-
-        // to have the first key "_sd" in the ordered map
-        claims.insert(SD_DIGESTS_KEY.to_owned(), Value::Null);
-
-        let mut sd_claims = Vec::new();
-
-        for (key, value) in user_claims.iter() {
-            let strategy_for_child = sd_strategy.next_level(key);
-            let subtree_from_here = self.create_sd_claims(value, strategy_for_child, random_source);
-
-            if sd_strategy.sd_for_key(key) {
-                let disclosure = SDJWTDisclosure::new_with_salt(
-                    Some(key.to_owned()),
-                    subtree_from_here,
-                    random_source.disclosure_salt(),
-                );
-                sd_claims.push(disclosure.hash.clone());
-                self.all_disclosures.push(disclosure);
-            } else {
-                claims.insert(key.to_owned(), subtree_from_here);
-            }
-        }
-
-        if self.add_decoy_claims {
-            let num_decoy_elements =
-                random_source.decoy_count(Self::DECOY_MIN_ELEMENTS..Self::DECOY_MAX_ELEMENTS);
-            for _ in 0..num_decoy_elements {
-                sd_claims.push(self.create_decoy_claim_entry(random_source));
-            }
-        }
-
-        if !sd_claims.is_empty() {
-            sd_claims.sort();
-            claims.insert(
-                SD_DIGESTS_KEY.to_owned(),
-                Value::Array(sd_claims.into_iter().map(Value::String).collect()),
-            );
-        } else {
-            claims.shift_remove(SD_DIGESTS_KEY);
-        }
-
-        Value::Object(claims)
     }
 
     fn create_signed_jws(&mut self) -> Result<()> {
@@ -450,14 +371,6 @@ impl SDJWTIssuer {
         }
 
         Ok(())
-    }
-
-    fn create_decoy_claim_entry<R: IssuanceRandomSource>(
-        &mut self,
-        random_source: &mut R,
-    ) -> String {
-        let digest = base64_hash(random_source.decoy_salt().as_bytes()).to_string();
-        digest
     }
 }
 
