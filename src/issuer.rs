@@ -45,6 +45,15 @@ pub struct SDJWTIssuer {
 
 mod issuance_plan;
 
+/// Deterministic fixtures for the opt-in Criterion issuance benchmark.
+///
+/// This module is unavailable unless the `issuance_bench` Cargo feature is
+/// explicitly enabled. It is not part of the ordinary issuer API and cannot
+/// change production executor selection.
+#[cfg(feature = "issuance_bench")]
+#[doc(hidden)]
+pub mod issuance_benchmark;
+
 use issuance_plan::IssuancePlan;
 
 /// ClaimsForSelectiveDisclosureStrategy is used to determine which claims can be selectively disclosed later by the holder.

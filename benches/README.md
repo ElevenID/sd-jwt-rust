@@ -1,4 +1,4 @@
-# SD-JWT verification benchmark
+# SD-JWT benchmarks
 
 `sd_jwt_verification` measures the existing public `SDJWTVerifier::new` boundary.
 Each measured invocation parses compact serialization, decodes and parses every
@@ -19,6 +19,79 @@ that can run both revisions without paging.
 
 Hosted CI runs `cargo test --benches` as a compile and one-iteration smoke gate.
 Do not apply wall-clock performance thresholds to shared CI runners.
+
+## Issuance executor qualification fixture
+
+`sd_jwt_issuance` is an opt-in harness for comparing the immutable serial
+issuance oracle with the bounded adaptive candidate on one exact source tree.
+It requires `--features issuance_bench`; that feature implies `parallel`, but
+`parallel` does not imply `issuance_bench`. Ordinary builds therefore neither
+compile the fixture surface nor change issuer routing. In particular,
+`QUALIFIED_ISSUANCE_THRESHOLDS` remains `None` until separate benchmark evidence
+supports a production policy.
+
+The 30 fixture cases contain the required 1, 8, 32, 128, and 512 top-level
+disclosures for each of small, medium nested, 64 KiB large, and mixed nested
+values. Ten additional cases enable decoys for small values (root decoys) and
+mixed values (root and nested-object decoys). Decoy counts deterministically
+cycle through 2, 3, and 4 per object. Every disclosure and decoy salt starts as
+an independently domain-separated deterministic 16-byte input and is encoded
+to exactly 22 Base64url characters, matching the production salt length without
+using the process-global `mock_salts` queue.
+
+Each fixture registers four IDs:
+
+- `executor_assembly` constructs the complete immutable `IssuancePlan` in
+  Criterion's untimed `iter_batched` setup and times only execution,
+  deterministic restoration, and assembly.
+- `full_issuance` clones claims and the random tape, then constructs issuer
+  state around a pre-parsed signing key in untimed setup. It times planning,
+  assembly, ES256 signing, and compact serialization.
+- `serial_oracle` calls the exact serial implementation.
+- `adaptive_candidate` uses the real per-ready-batch adaptive selector, shared
+  non-blocking worker-budget lease, four-worker cap, bounded native executor,
+  and serial fallbacks. Its benchmark-only eligibility floors are two ready
+  jobs and one estimated byte; these are mechanical exercise controls, not a
+  proposed production threshold.
+
+Before timing, both stages require exact serial/candidate output equality.
+The harness emits one compact JSON route record for each of the 120 exact
+Criterion IDs, including requested and effective routes, ready-batch counts,
+budget fallbacks, maximum native workers, host parallelism, and the worker cap.
+A one-job ready batch, a single-thread host, worker-budget contention, ARM64,
+and WASM can therefore be recorded as serial fallback rather than mislabeled
+as native work. Ready-batch count fields are JSON `null` for the serial oracle
+and for whole-plan target fallback because neither path invokes the adaptive
+batch executor; numeric zero is reserved for an observed adaptive execution
+with no batches of that kind. IDs use compact, stable codes so Criterion 0.5
+neither truncates directory names nor creates order-dependent collision
+suffixes. The JSON record carries the expanded labels. The ID schema is:
+
+```text
+sd_jwt_issuance/v1__s_<ea|fi>__r_<so|ac>__p_<s|mn|l64|mx>__d_<0|1>__n_<zero-padded-count>
+```
+
+Here `ea`/`fi` select executor assembly/full issuance, `so`/`ac` select the
+serial oracle/adaptive candidate, and `s`/`mn`/`l64`/`mx` select the four
+payload classes.
+
+Compile and one-iteration smoke gate:
+
+```sh
+cargo test --locked --no-default-features --features issuance_bench --bench sd_jwt_issuance --verbose
+```
+
+Criterion run:
+
+```sh
+cargo bench --locked --no-default-features --features issuance_bench --bench sd_jwt_issuance -- --verbose
+```
+
+Keep this feature on the same exact revision for both requested routes; unlike
+the verification benchmark, it does not require two separately compiled
+feature modes. Preserve the emitted `sd_jwt_issuance_route_v1` records with the
+Criterion estimates so a later runner can reject an expected-native case that
+actually fell back to serial execution.
 
 ## Reproducible comparison
 
