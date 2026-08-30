@@ -30,7 +30,7 @@ fn benchmark_issuance(c: &mut Criterion) {
         // One untimed compact JSON record binds each exact Criterion ID to the
         // route observed at that same stage's preflight boundary. Records stay
         // out of Criterion's stdout and all timed closures.
-        for (stage, candidate_route) in [
+        let stage_routes = [
             (
                 IssuanceBenchmarkStage::ExecutorAssembly,
                 preflight.executor_candidate_route(),
@@ -39,10 +39,21 @@ fn benchmark_issuance(c: &mut Criterion) {
                 IssuanceBenchmarkStage::FullIssuance,
                 preflight.full_candidate_route(),
             ),
+        ];
+        for route in [
+            IssuanceBenchmarkRoute::SerialOracle,
+            IssuanceBenchmarkRoute::AdaptiveCandidate,
         ] {
-            route_records
-                .push(IssuanceBenchmarkRouteRecord::serial_oracle().machine_record(case, stage));
-            route_records.push(candidate_route.machine_record(case, stage));
+            for (stage, candidate_route) in &stage_routes {
+                route_records.push(match route {
+                    IssuanceBenchmarkRoute::SerialOracle => {
+                        IssuanceBenchmarkRouteRecord::serial_oracle().machine_record(case, *stage)
+                    }
+                    IssuanceBenchmarkRoute::AdaptiveCandidate => {
+                        candidate_route.clone().machine_record(case, *stage)
+                    }
+                });
+            }
         }
 
         for route in [
