@@ -31,24 +31,24 @@ const PARALLEL_SPAWN_FAILURE: &str =
 /// encoded disclosure is also carried as identity so assembly can reject a
 /// result that was associated with the wrong input.
 #[derive(Debug)]
-struct DisclosureJob<'a> {
-    ordinal: usize,
-    encoded_disclosure: &'a str,
+pub(crate) struct DisclosureJob<'a> {
+    pub(crate) ordinal: usize,
+    pub(crate) encoded_disclosure: &'a str,
 }
 
 #[derive(Debug)]
-struct ProcessedDisclosure {
-    digest: String,
-    decoded_disclosure: Value,
+pub(crate) struct ProcessedDisclosure {
+    pub(crate) digest: String,
+    pub(crate) decoded_disclosure: Value,
 }
 
 /// A worker outcome retains identity even when decoding or parsing fails.
 /// A missing result is reserved for executor-contract validation.
 #[derive(Debug)]
-struct DisclosureOutcome<'a> {
-    ordinal: usize,
-    encoded_disclosure: &'a str,
-    result: Option<Result<ProcessedDisclosure>>,
+pub(crate) struct DisclosureOutcome<'a> {
+    pub(crate) ordinal: usize,
+    pub(crate) encoded_disclosure: &'a str,
+    pub(crate) result: Option<Result<ProcessedDisclosure>>,
 }
 
 type DisclosureWorker = for<'a> fn(&DisclosureJob<'a>) -> DisclosureOutcome<'a>;
@@ -625,7 +625,7 @@ fn plan_disclosures(encoded_disclosures: &[String]) -> Vec<DisclosureJob<'_>> {
 
 /// Decode, parse, and hash one disclosure without reading or mutating shared
 /// state. Hashing deliberately uses the original encoded bytes.
-fn process_disclosure<'a>(job: &DisclosureJob<'a>) -> DisclosureOutcome<'a> {
+pub(crate) fn process_disclosure<'a>(job: &DisclosureJob<'a>) -> DisclosureOutcome<'a> {
     let result = (|| {
         let decoded_disclosure = base64url_decode(job.encoded_disclosure).map_err(|err| {
             Error::InvalidDisclosure(format!(
@@ -655,8 +655,7 @@ fn process_disclosure<'a>(job: &DisclosureJob<'a>) -> DisclosureOutcome<'a> {
 
 /// Restore worker outcomes to input order, validate the executor contract, and
 /// only then publish complete mappings. Any failure discards all partial state.
-#[cfg(any(test, all(feature = "parallel", target_arch = "x86_64")))]
-fn assemble_disclosures<'a>(
+pub(crate) fn assemble_disclosures<'a>(
     jobs: &[DisclosureJob<'a>],
     mut outcomes: Vec<DisclosureOutcome<'a>>,
 ) -> Result<DisclosureMappings> {
@@ -696,7 +695,6 @@ fn assemble_disclosures<'a>(
     })
 }
 
-#[cfg(any(test, all(feature = "parallel", target_arch = "x86_64")))]
 fn validate_outcome_contract(
     jobs: &[DisclosureJob<'_>],
     outcomes: &[DisclosureOutcome<'_>],

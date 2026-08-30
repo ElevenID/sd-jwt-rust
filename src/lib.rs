@@ -19,6 +19,7 @@ pub use {
 
 pub type KeyResolver = dyn Fn(&str, &Header) -> DecodingKey;
 
+pub mod batch;
 mod disclosure;
 mod disclosure_preprocessing;
 pub mod error;
