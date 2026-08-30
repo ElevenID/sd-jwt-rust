@@ -24,6 +24,9 @@ use crate::{
 
 const DISCLOSURE_PREPROCESSING_STATE_FAILURE: &str =
     "Disclosure preprocessing state is inconsistent";
+const MAX_PROCESSED_SD_JWT_DEPTH: usize = 128;
+const PROCESSED_SD_JWT_DEPTH_FAILURE: &str =
+    "Processed SD-JWT exceeds maximum supported nesting depth";
 
 pub struct SDJWTVerifier {
     sd_jwt_engine: SDJWTCommon,
@@ -257,7 +260,7 @@ impl SDJWTVerifier {
         self.duplicate_hash_check =
             HashSet::with_capacity(self.sd_jwt_engine.input_disclosures.len());
         let claims: Value = self.sd_jwt_payload.clone().into_iter().collect();
-        let unpacked = self.unpack_disclosed_claims(&claims)?;
+        let unpacked = self.unpack_disclosed_claims(&claims, 0)?;
 
         if self.sd_jwt_engine.ordered_disclosure_digests.len()
             != self.sd_jwt_engine.input_disclosures.len()
@@ -307,17 +310,43 @@ impl SDJWTVerifier {
         Ok(())
     }
 
-    fn unpack_disclosed_claims(&mut self, sd_jwt_claims: &Value) -> Result<Value> {
+    fn unpack_disclosed_claims(
+        &mut self,
+        sd_jwt_claims: &Value,
+        processed_depth: usize,
+    ) -> Result<Value> {
         match sd_jwt_claims {
             Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
                 Ok(sd_jwt_claims.to_owned())
             }
-            Value::Array(arr) => self.unpack_disclosed_claims_in_array(arr),
-            Value::Object(obj) => self.unpack_disclosed_claims_in_object(obj),
+            Value::Array(arr) => {
+                let processed_depth = Self::enter_processed_container(processed_depth)?;
+                self.unpack_disclosed_claims_in_array(arr, processed_depth)
+            }
+            Value::Object(obj) => {
+                let processed_depth = Self::enter_processed_container(processed_depth)?;
+                self.unpack_disclosed_claims_in_object(obj, processed_depth)
+            }
         }
     }
 
-    fn unpack_disclosed_claims_in_array(&mut self, arr: &Vec<Value>) -> Result<Value> {
+    fn enter_processed_container(processed_depth: usize) -> Result<usize> {
+        let next_depth = processed_depth
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidDisclosure(PROCESSED_SD_JWT_DEPTH_FAILURE.to_owned()))?;
+        if next_depth > MAX_PROCESSED_SD_JWT_DEPTH {
+            return Err(Error::InvalidDisclosure(
+                PROCESSED_SD_JWT_DEPTH_FAILURE.to_owned(),
+            ));
+        }
+        Ok(next_depth)
+    }
+
+    fn unpack_disclosed_claims_in_array(
+        &mut self,
+        arr: &Vec<Value>,
+        processed_depth: usize,
+    ) -> Result<Value> {
         if arr.is_empty() {
             return Err(Error::InvalidArrayDisclosureObject(
                 "Array of disclosed claims cannot be empty".to_string(),
@@ -337,13 +366,13 @@ impl SDJWTVerifier {
                     }
 
                     let digest = obj.get(SD_LIST_PREFIX).unwrap();
-                    let disclosed_claim = self.unpack_from_digest(digest)?;
+                    let disclosed_claim = self.unpack_from_digest(digest, processed_depth)?;
                     if let Some(disclosed_claim) = disclosed_claim {
                         claims.push(disclosed_claim);
                     }
                 }
                 _ => {
-                    let claim = self.unpack_disclosed_claims(value)?;
+                    let claim = self.unpack_disclosed_claims(value, processed_depth)?;
                     claims.push(claim);
                 }
             }
@@ -354,18 +383,26 @@ impl SDJWTVerifier {
     fn unpack_disclosed_claims_in_object(
         &mut self,
         nested_sd_jwt_claims: &Map<String, Value>,
+        processed_depth: usize,
     ) -> Result<Value> {
         let mut disclosed_claims: Map<String, Value> = serde_json::Map::new();
 
         for (key, value) in nested_sd_jwt_claims {
             if key != SD_DIGESTS_KEY && key != DIGEST_ALG_KEY {
-                disclosed_claims.insert(key.to_owned(), self.unpack_disclosed_claims(value)?);
+                disclosed_claims.insert(
+                    key.to_owned(),
+                    self.unpack_disclosed_claims(value, processed_depth)?,
+                );
             }
         }
 
         if let Some(Value::Array(digest_of_disclosures)) = nested_sd_jwt_claims.get(SD_DIGESTS_KEY)
         {
-            self.unpack_from_digests(&mut disclosed_claims, digest_of_disclosures)?;
+            self.unpack_from_digests(
+                &mut disclosed_claims,
+                digest_of_disclosures,
+                processed_depth,
+            )?;
         }
 
         Ok(Value::Object(disclosed_claims))
@@ -375,6 +412,7 @@ impl SDJWTVerifier {
         &mut self,
         pre_output: &mut Map<String, Value>,
         digests_of_disclosures: &Vec<Value>,
+        processed_depth: usize,
     ) -> Result<()> {
         for digest in digests_of_disclosures {
             let digest = digest
@@ -409,7 +447,7 @@ impl SDJWTVerifier {
                 if pre_output.contains_key(&key) {
                     return Err(Error::DuplicateKeyError(key.to_string()));
                 }
-                let unpacked_value = self.unpack_disclosed_claims(&value)?;
+                let unpacked_value = self.unpack_disclosed_claims(&value, processed_depth)?;
                 pre_output.insert(key, unpacked_value);
             }
         }
@@ -417,7 +455,11 @@ impl SDJWTVerifier {
         Ok(())
     }
 
-    fn unpack_from_digest(&mut self, digest: &Value) -> Result<Option<Value>> {
+    fn unpack_from_digest(
+        &mut self,
+        digest: &Value,
+        processed_depth: usize,
+    ) -> Result<Option<Value>> {
         let digest = digest
             .as_str()
             .ok_or(Error::ConversionError("str".to_string()))?;
@@ -437,7 +479,7 @@ impl SDJWTVerifier {
             }
 
             let value = disclosure[1].clone();
-            let unpacked_value = self.unpack_disclosed_claims(&value)?;
+            let unpacked_value = self.unpack_disclosed_claims(&value, processed_depth)?;
             return Ok(Some(unpacked_value));
         }
 
@@ -505,6 +547,131 @@ mod tests {
         let encoded = base64url_encode(&serde_json::to_vec(value).unwrap());
         let digest = base64_hash(encoded.as_bytes());
         (encoded, digest)
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RecursiveFixtureKind {
+        Object,
+        Array,
+        Alternating,
+    }
+
+    #[derive(Clone, Copy)]
+    enum RecursiveContainerKind {
+        Object,
+        Array,
+    }
+
+    impl RecursiveFixtureKind {
+        fn container_at(self, processed_depth: usize) -> RecursiveContainerKind {
+            match self {
+                Self::Object => RecursiveContainerKind::Object,
+                Self::Array => RecursiveContainerKind::Array,
+                Self::Alternating if processed_depth.is_multiple_of(2) => {
+                    RecursiveContainerKind::Object
+                }
+                Self::Alternating => RecursiveContainerKind::Array,
+            }
+        }
+    }
+
+    struct RecursiveDisclosureFixture {
+        payload: Value,
+        disclosures: Vec<String>,
+    }
+
+    impl RecursiveDisclosureFixture {
+        fn presentation(&self) -> String {
+            compact_presentation(&self.payload, &self.disclosures)
+        }
+    }
+
+    fn recursive_disclosure_fixture(
+        processed_depth: usize,
+        fixture_kind: RecursiveFixtureKind,
+    ) -> RecursiveDisclosureFixture {
+        assert!(processed_depth >= 2);
+        let container_kinds = (2..=processed_depth)
+            .map(|depth| fixture_kind.container_at(depth))
+            .collect::<Vec<_>>();
+        let mut disclosures = Vec::with_capacity(container_kinds.len());
+        let mut current_value = match container_kinds.last().unwrap() {
+            RecursiveContainerKind::Object => json!({"leaf": true}),
+            RecursiveContainerKind::Array => json!(["leaf"]),
+        };
+
+        for (parent_index, parent_kind) in container_kinds
+            .iter()
+            .take(container_kinds.len() - 1)
+            .enumerate()
+            .rev()
+        {
+            let disclosure = match parent_kind {
+                RecursiveContainerKind::Object => json!([
+                    format!("recursive-salt-{parent_index}"),
+                    format!("recursive-claim-{parent_index}"),
+                    current_value,
+                ]),
+                RecursiveContainerKind::Array => {
+                    json!([format!("recursive-salt-{parent_index}"), current_value,])
+                }
+            };
+            let (encoded, digest) = encoded_disclosure(&disclosure);
+            disclosures.push(encoded);
+            current_value = match parent_kind {
+                RecursiveContainerKind::Object => json!({"_sd": [digest]}),
+                RecursiveContainerKind::Array => json!([{"...": digest}]),
+            };
+        }
+
+        let (root_disclosure, root_digest) = encoded_disclosure(&json!([
+            "recursive-root-salt",
+            "recursive-root",
+            current_value,
+        ]));
+        disclosures.push(root_disclosure);
+
+        RecursiveDisclosureFixture {
+            payload: json!({
+                "iss": "https://example.com/issuer",
+                "iat": 1683000000,
+                "_sd_alg": "sha-256",
+                "_sd": [root_digest],
+            }),
+            disclosures,
+        }
+    }
+
+    fn composite_depth(value: &Value) -> usize {
+        match value {
+            Value::Array(values) => {
+                1 + values.iter().map(composite_depth).max().unwrap_or_default()
+            }
+            Value::Object(values) => {
+                1 + values
+                    .values()
+                    .map(composite_depth)
+                    .max()
+                    .unwrap_or_default()
+            }
+            _ => 0,
+        }
+    }
+
+    fn assert_processed_depth_limit(error: Error) {
+        match &error {
+            Error::InvalidDisclosure(message) => {
+                assert_eq!(message, super::PROCESSED_SD_JWT_DEPTH_FAILURE)
+            }
+            other => panic!("expected InvalidDisclosure depth limit, got {other:?}"),
+        }
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "invalid disclosure: {}",
+                super::PROCESSED_SD_JWT_DEPTH_FAILURE
+            )
+        );
     }
 
     fn verify_compact(presentation: String) -> crate::error::Result<SDJWTVerifier> {
@@ -856,6 +1023,211 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "invalid array disclosure: \"not-an-array\""
+        );
+    }
+
+    #[rstest]
+    #[case::object_chain(RecursiveFixtureKind::Object)]
+    #[case::array_chain(RecursiveFixtureKind::Array)]
+    #[case::alternating_chain(RecursiveFixtureKind::Alternating)]
+    fn cumulative_processed_depth_accepts_127_and_128_but_rejects_129(
+        #[case] fixture_kind: RecursiveFixtureKind,
+    ) {
+        let limit = super::MAX_PROCESSED_SD_JWT_DEPTH;
+
+        for accepted_depth in [limit - 1, limit] {
+            let fixture = recursive_disclosure_fixture(accepted_depth, fixture_kind);
+            verify_compact(fixture.presentation()).unwrap_or_else(|error| {
+                panic!("{fixture_kind:?} fixture at depth {accepted_depth} was rejected: {error}")
+            });
+        }
+
+        let fixture = recursive_disclosure_fixture(limit + 1, fixture_kind);
+        assert_processed_depth_limit(compact_verification_error(fixture.presentation()));
+    }
+
+    #[test]
+    fn cumulative_processed_depth_does_not_reject_wide_fan_out() {
+        const DISCLOSURE_COUNT: usize = 512;
+        let mut disclosures = Vec::with_capacity(DISCLOSURE_COUNT);
+        let mut digests = Vec::with_capacity(DISCLOSURE_COUNT);
+        for ordinal in 0..DISCLOSURE_COUNT {
+            let (disclosure, digest) = encoded_disclosure(&json!([
+                format!("wide-salt-{ordinal}"),
+                format!("wide-claim-{ordinal}"),
+                ordinal,
+            ]));
+            disclosures.push(disclosure);
+            digests.push(digest);
+        }
+        let payload = json!({
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "_sd_alg": "sha-256",
+            "_sd": digests,
+        });
+
+        let verifier = verify_compact(compact_presentation(&payload, &disclosures)).unwrap();
+        let claims = verifier.verified_claims.as_object().unwrap();
+        assert_eq!(claims.len(), DISCLOSURE_COUNT + 2);
+        assert_eq!(claims["wide-claim-0"], 0);
+        assert_eq!(
+            claims[&format!("wide-claim-{}", DISCLOSURE_COUNT - 1)],
+            DISCLOSURE_COUNT - 1
+        );
+    }
+
+    #[test]
+    fn individually_shallow_disclosures_cannot_compose_an_over_limit_value() {
+        let fixture = recursive_disclosure_fixture(
+            super::MAX_PROCESSED_SD_JWT_DEPTH + 1,
+            RecursiveFixtureKind::Alternating,
+        );
+
+        for disclosure in &fixture.disclosures {
+            let decoded = base64url_decode(disclosure).unwrap();
+            let value: Value = serde_json::from_slice(&decoded).unwrap();
+            assert!(
+                composite_depth(&value) <= 3,
+                "fixture Disclosure was not independently shallow: {value}"
+            );
+        }
+
+        assert_processed_depth_limit(compact_verification_error(fixture.presentation()));
+    }
+
+    #[test]
+    fn preprocessing_and_signature_errors_precede_processed_depth_limit() {
+        let fixture = recursive_disclosure_fixture(
+            super::MAX_PROCESSED_SD_JWT_DEPTH + 1,
+            RecursiveFixtureKind::Object,
+        );
+        let invalid_signature = corrupt_compact_signature(&fixture.presentation());
+        let signature_error = compact_verification_error(invalid_signature.clone());
+        assert!(
+            matches!(&signature_error, Error::DeserializationError(message) if message.starts_with("Cannot decode jwt:")),
+            "expected signature error, got {signature_error:?}"
+        );
+
+        let (signed, disclosures) = invalid_signature
+            .split_once(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
+            .unwrap();
+        let separator = COMBINED_SERIALIZATION_FORMAT_SEPARATOR;
+        let malformed_and_invalid_signature =
+            format!("{signed}{separator}%{separator}{disclosures}");
+        let preprocessing_error = compact_verification_error(malformed_and_invalid_signature);
+        assert!(
+            matches!(&preprocessing_error, Error::InvalidDisclosure(message) if message.starts_with("Error decoding disclosure %:")),
+            "expected preprocessing error, got {preprocessing_error:?}"
+        );
+    }
+
+    #[test]
+    fn current_reconstruction_errors_precede_processed_depth_limit() {
+        let over_limit = super::MAX_PROCESSED_SD_JWT_DEPTH + 1;
+
+        let mut duplicate_fixture =
+            recursive_disclosure_fixture(over_limit, RecursiveFixtureKind::Object);
+        let root_digest = duplicate_fixture.payload["_sd"][0].clone();
+        duplicate_fixture.payload["_sd"] = json!([
+            "repeated-decoy-before-recursion",
+            "repeated-decoy-before-recursion",
+            root_digest,
+        ]);
+        let duplicate_error = compact_verification_error(duplicate_fixture.presentation());
+        assert!(
+            matches!(&duplicate_error, Error::DuplicateDigestError(digest) if digest == "repeated-decoy-before-recursion"),
+            "expected duplicate digest error, got {duplicate_error:?}"
+        );
+
+        let mut collision_fixture =
+            recursive_disclosure_fixture(over_limit, RecursiveFixtureKind::Object);
+        collision_fixture.payload["recursive-root"] = json!("visible");
+        let collision_error = compact_verification_error(collision_fixture.presentation());
+        assert!(
+            matches!(&collision_error, Error::DuplicateKeyError(key) if key == "recursive-root"),
+            "expected duplicate key error, got {collision_error:?}"
+        );
+
+        let mut malformed_fixture =
+            recursive_disclosure_fixture(over_limit, RecursiveFixtureKind::Object);
+        let encoded_root = malformed_fixture.disclosures.pop().unwrap();
+        let decoded_root = base64url_decode(&encoded_root).unwrap();
+        let mut malformed_root: Value = serde_json::from_slice(&decoded_root).unwrap();
+        malformed_root.as_array_mut().unwrap().push(json!("extra"));
+        let (malformed_root, malformed_root_digest) = encoded_disclosure(&malformed_root);
+        malformed_fixture.payload["_sd"] = json!([malformed_root_digest]);
+        malformed_fixture.disclosures.push(malformed_root);
+        let malformed_error = compact_verification_error(malformed_fixture.presentation());
+        assert!(
+            matches!(&malformed_error, Error::InvalidDisclosure(message) if message.starts_with("Object-property Disclosure must be a 3-element array")),
+            "expected malformed Disclosure error, got {malformed_error:?}"
+        );
+    }
+
+    #[test]
+    fn processed_depth_limit_precedes_later_duplicate_and_unreferenced_errors() {
+        let mut fixture = recursive_disclosure_fixture(
+            super::MAX_PROCESSED_SD_JWT_DEPTH + 1,
+            RecursiveFixtureKind::Alternating,
+        );
+        let root_digest = fixture.payload["_sd"][0].clone();
+        fixture.payload["_sd"] = json!([
+            root_digest,
+            "repeated-decoy-after-recursion",
+            "repeated-decoy-after-recursion",
+        ]);
+        let (unreferenced, _) =
+            encoded_disclosure(&json!(["unreferenced-salt", "unreferenced", true]));
+        fixture.disclosures.push(unreferenced);
+
+        assert_processed_depth_limit(compact_verification_error(fixture.presentation()));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn processed_depth_limit_prevents_stack_abort_in_isolated_child() {
+        const CHILD_ENV: &str = "SD_JWT_RS_DEPTH_LIMIT_CHILD";
+        const CHILD_SENTINEL: &str = "SD_JWT_RS_DEPTH_LIMIT_CHILD_OK";
+        const TEST_NAME: &str =
+            "verifier::tests::processed_depth_limit_prevents_stack_abort_in_isolated_child";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let child = std::thread::Builder::new()
+                .name("sd-jwt-depth-limit-child".to_owned())
+                .stack_size(1024 * 1024)
+                .spawn(|| {
+                    let fixture = recursive_disclosure_fixture(
+                        super::MAX_PROCESSED_SD_JWT_DEPTH + 4096,
+                        RecursiveFixtureKind::Alternating,
+                    );
+                    assert_processed_depth_limit(compact_verification_error(
+                        fixture.presentation(),
+                    ));
+                })
+                .unwrap();
+            assert!(child.join().is_ok(), "depth-limit child thread panicked");
+            println!("{CHILD_SENTINEL}");
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "isolated depth-limit child failed with {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            stdout,
+            stderr
+        );
+        assert!(
+            stdout.contains(CHILD_SENTINEL),
+            "isolated child did not execute the intended test\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
     }
 
