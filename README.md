@@ -58,6 +58,29 @@ and durably synced. Supplying only one variable, using a noncanonical selector,
 or changing the frozen Criterion arguments fails closed. When both variables
 are absent, no route-evidence file is created.
 
+The fixed qualification binary also supports the optional v3 cooperative
+launch barrier. With `MARTY_PERF_START_BARRIER` absent, benchmark startup is
+unchanged. With it present, the custom binary entrypoint validates the exact
+cleared child environment, coordinate-derived campaign paths, selected ID,
+Criterion arguments, canonical token, and installed executable before it
+constructs Criterion. The selected ID must also equal the route scheduled for
+the token coordinate by the frozen 20-round ABBA/BAAB expansion. It emits the
+token-bound canonical ready frame as the first stdout frame, flushes, and blocks
+for exactly one canonical release frame terminated by stdin EOF. A matching
+release is bound into a create-new,
+flushed, durably synced receipt before Criterion construction. Early EOF,
+partial, extra, second, noncanonical, oversized, non-UTF-8, or mismatched input
+fails closed with a sanitized diagnostic and no Criterion or route activity.
+The qualification controller is the trusted exclusive owner of the campaign
+root and keeps its directory ancestry unchanged for the child lifetime; the
+child's no-follow and handle-identity checks are not a sandbox against a local
+actor concurrently replacing an otherwise ordinary parent directory. Such a
+mutation violates the quiescent-ancestry assumption and invalidates the
+campaign operationally; detecting it is outside the child-side guarantee.
+On Unix, receipt durability includes a no-follow parent-directory sync. On
+Windows, the child uses `File::sync_all` for file contents and metadata and
+does not claim a separate Unix-style parent-directory-entry flush.
+
 ### Interoperability testing tool
 See [Generate tool README](./generate/README.md) document.
 
