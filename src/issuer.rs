@@ -13,13 +13,13 @@ use std::vec::Vec;
 
 use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
-use rand::Rng;
+use rand::{rngs::ThreadRng, Rng, RngCore};
 use serde_json::Value;
 use serde_json::{json, Map as SJMap, Map};
 
 use crate::disclosure::SDJWTDisclosure;
 use crate::error::Error;
-use crate::utils::generate_salt;
+use crate::utils::generate_salt_with_rng;
 use crate::{
     SDJWTCommon, SDJWTSerializationFormat, CNF_KEY, COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
     DEFAULT_DIGEST_ALG, DEFAULT_SIGNING_ALG, DIGEST_ALG_KEY, JWK_KEY,
@@ -131,7 +131,10 @@ trait IssuanceRandomSource {
     fn decoy_salt(&mut self) -> String;
 }
 
-struct LegacyIssuanceRandomSource;
+struct LegacyIssuanceRandomSource<R> {
+    rng: Option<R>,
+    initialize: fn() -> R,
+}
 
 struct IssuanceOptions {
     holder_key: Option<Jwk>,
@@ -139,11 +142,29 @@ struct IssuanceOptions {
     serialization_format: SDJWTSerializationFormat,
 }
 
-impl IssuanceRandomSource for LegacyIssuanceRandomSource {
+impl Default for LegacyIssuanceRandomSource<ThreadRng> {
+    fn default() -> Self {
+        Self {
+            rng: None,
+            initialize: rand::thread_rng,
+        }
+    }
+}
+
+impl<R> LegacyIssuanceRandomSource<R> {
+    fn rng(&mut self) -> &mut R {
+        self.rng.get_or_insert_with(self.initialize)
+    }
+}
+
+impl<R> IssuanceRandomSource for LegacyIssuanceRandomSource<R>
+where
+    R: RngCore,
+{
     fn disclosure_salt(&mut self) -> String {
         #[cfg(not(feature = "mock_salts"))]
         {
-            generate_salt()
+            generate_salt_with_rng(self.rng())
         }
         #[cfg(feature = "mock_salts")]
         {
@@ -152,11 +173,11 @@ impl IssuanceRandomSource for LegacyIssuanceRandomSource {
     }
 
     fn decoy_count(&mut self, range: Range<u32>) -> u32 {
-        rand::thread_rng().gen_range(range)
+        self.rng().gen_range(range)
     }
 
     fn decoy_salt(&mut self) -> String {
-        generate_salt()
+        generate_salt_with_rng(self.rng())
     }
 }
 
@@ -220,7 +241,7 @@ impl SDJWTIssuer {
         #[cfg(all(feature = "mock_salts", test))]
         let _mock_salt_guard = crate::utils::seed_mock_salts_for_test();
 
-        let mut random_source = LegacyIssuanceRandomSource;
+        let mut random_source = LegacyIssuanceRandomSource::default();
         self.issue_sd_jwt_with_random_source(
             user_claims,
             sd_strategy,
