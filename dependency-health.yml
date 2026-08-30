@@ -11,4 +11,4 @@ dependencies:
     advisories: []
     tracking-issue: https://github.com/ElevenID/sd-jwt-rust/issues/4
     review-after: 2026-10-18
-    rationale: The fork retains upstream behavior while adding ElevenID security and quality policy.
+    rationale: The fork retains upstream behavior while adding ElevenID security and quality policy. Browser entropy remains supplied by getrandom's JS backend, whose transitive wasm-bindgen family is intentionally allowed to unify with maintained consumers and is compile-checked against the supported consumer family.

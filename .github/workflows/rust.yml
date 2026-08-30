@@ -47,5 +47,7 @@ jobs:
       run: cargo check --locked --target aarch64-unknown-linux-gnu --no-default-features --features issuance_bench --lib --tests --verbose
     - name: Check parallel feature uses WASM serial fallback
       run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features parallel --verbose
+    - name: Check maintained WASM consumer binding family
+      run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features parallel --tests --verbose
     - name: Check issuance benchmark uses WASM serial fallback
       run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features issuance_bench --lib --tests --verbose
