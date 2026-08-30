@@ -56,6 +56,7 @@ where
     base64url_encode(&buf)
 }
 
+#[cfg(all(test, not(feature = "mock_salts")))]
 pub(crate) fn generate_salt() -> String {
     generate_salt_with_rng(&mut rand::thread_rng())
 }

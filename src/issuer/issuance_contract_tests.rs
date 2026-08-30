@@ -4,7 +4,7 @@
 
 #[cfg(not(feature = "mock_salts"))]
 use super::IssuanceRandomSource;
-use super::{ClaimsForSelectiveDisclosureStrategy, SDJWTIssuer};
+use super::{ClaimsForSelectiveDisclosureStrategy, LegacyIssuanceRandomSource, SDJWTIssuer};
 use crate::utils::{base64_hash, base64url_decode, base64url_encode};
 #[cfg(feature = "mock_salts")]
 use crate::SD_LIST_PREFIX;
@@ -12,7 +12,9 @@ use crate::{SDJWTSerializationFormat, DEFAULT_DIGEST_ALG, SD_DIGESTS_KEY};
 #[cfg(feature = "mock_salts")]
 use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::EncodingKey;
+use rand::{Error as RandError, RngCore};
 use serde_json::{json, Value};
+use std::cell::Cell;
 #[cfg(not(feature = "mock_salts"))]
 use std::{collections::VecDeque, ops::Range};
 
@@ -113,6 +115,61 @@ enum RandomCall {
     DisclosureSalt,
     DecoyCount(Range<u32>),
     DecoySalt,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum RawRandomCall {
+    FillBytes(usize),
+    NextU32,
+}
+
+#[derive(Default)]
+struct InstrumentedIssuanceRng {
+    calls: Vec<RawRandomCall>,
+    salt_ordinal: u8,
+}
+
+impl RngCore for InstrumentedIssuanceRng {
+    fn next_u32(&mut self) -> u32 {
+        self.calls.push(RawRandomCall::NextU32);
+        0x8000_0000
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        panic!("u32 decoy-count sampling must not request a u64")
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        self.calls.push(RawRandomCall::FillBytes(dest.len()));
+        dest.fill(self.salt_ordinal);
+        self.salt_ordinal = self.salt_ordinal.wrapping_add(1);
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), RandError> {
+        self.fill_bytes(dest);
+        Ok(())
+    }
+}
+
+thread_local! {
+    static RNG_INITIALIZATION_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+fn initialize_instrumented_rng() -> InstrumentedIssuanceRng {
+    RNG_INITIALIZATION_COUNT.with(|count| count.set(count.get() + 1));
+    InstrumentedIssuanceRng::default()
+}
+
+fn counted_random_source() -> LegacyIssuanceRandomSource<InstrumentedIssuanceRng> {
+    RNG_INITIALIZATION_COUNT.with(|count| count.set(0));
+    LegacyIssuanceRandomSource {
+        rng: None,
+        initialize: initialize_instrumented_rng,
+    }
+}
+
+fn rng_initialization_count() -> usize {
+    RNG_INITIALIZATION_COUNT.with(Cell::get)
 }
 
 #[cfg(not(feature = "mock_salts"))]
@@ -506,6 +563,124 @@ fn fixed_random_tape_replays_decoys_and_their_allocation_order() {
         );
     }
     assert_eq!(serialized, GOLDEN_COMPACT_WITH_DECOYS);
+}
+
+#[test]
+#[cfg(not(feature = "mock_salts"))]
+fn production_source_acquires_one_rng_and_preserves_scalar_draw_order() {
+    let mut random_source = counted_random_source();
+    let mut issuer = new_issuer();
+    issuer
+        .issue_sd_jwt_with_random_source(
+            json!({ "name": "Alice" }),
+            ClaimsForSelectiveDisclosureStrategy::TopLevel,
+            None,
+            true,
+            SDJWTSerializationFormat::Compact,
+            &mut random_source,
+        )
+        .expect("instrumented scalar issuance must succeed");
+
+    assert_eq!(rng_initialization_count(), 1);
+    let instrumented_rng = random_source
+        .rng
+        .as_ref()
+        .expect("issuance must retain its initialized RNG");
+    assert_eq!(
+        instrumented_rng.calls,
+        [
+            RawRandomCall::FillBytes(16),
+            RawRandomCall::NextU32,
+            RawRandomCall::FillBytes(16),
+            RawRandomCall::FillBytes(16),
+            RawRandomCall::FillBytes(16),
+        ]
+    );
+    assert_eq!(instrumented_rng.salt_ordinal, 4);
+
+    let disclosure = String::from_utf8(
+        base64url_decode(&issuer.all_disclosures[0].raw_b64)
+            .expect("disclosure must be valid Base64url"),
+    )
+    .expect("disclosure must be UTF-8 JSON");
+    let disclosure: Value =
+        serde_json::from_str(&disclosure).expect("disclosure must be valid JSON");
+    let disclosure_salt = disclosure[0]
+        .as_str()
+        .expect("disclosure salt must be a string");
+    assert_eq!(
+        base64url_decode(disclosure_salt).expect("disclosure salt must be Base64url"),
+        [0; 16]
+    );
+
+    let digests = issuer.sd_jwt_payload[SD_DIGESTS_KEY]
+        .as_array()
+        .expect("root _sd must be an array");
+    assert_eq!(digests.len(), 4);
+    for salt_ordinal in 1..=3 {
+        let salt = base64url_encode(&[salt_ordinal; 16]);
+        let digest = base64_hash(salt.as_bytes());
+        assert!(digests.iter().any(|candidate| candidate == &digest));
+    }
+}
+
+#[test]
+#[cfg(not(feature = "mock_salts"))]
+fn randomness_free_issuance_does_not_acquire_production_rng() {
+    let mut random_source = counted_random_source();
+    new_issuer()
+        .issue_sd_jwt_with_random_source(
+            json!({ "iss": "https://issuer.example", "visible": true }),
+            ClaimsForSelectiveDisclosureStrategy::NoSDClaims,
+            None,
+            false,
+            SDJWTSerializationFormat::Compact,
+            &mut random_source,
+        )
+        .expect("randomness-free issuance must succeed");
+
+    assert_eq!(rng_initialization_count(), 0);
+    assert!(random_source.rng.is_none());
+}
+
+#[test]
+#[cfg(not(feature = "mock_salts"))]
+fn invalid_issuance_does_not_acquire_production_rng() {
+    let mut random_source = counted_random_source();
+    let result = new_issuer().issue_sd_jwt_with_random_source(
+        json!({ "_sd": [] }),
+        ClaimsForSelectiveDisclosureStrategy::TopLevel,
+        None,
+        true,
+        SDJWTSerializationFormat::Compact,
+        &mut random_source,
+    );
+
+    assert!(result.is_err());
+    assert_eq!(rng_initialization_count(), 0);
+    assert!(random_source.rng.is_none());
+}
+
+#[test]
+#[cfg(feature = "mock_salts")]
+fn mock_salts_without_decoys_does_not_acquire_production_rng() {
+    let _mock_salt_guard = crate::utils::seed_mock_salts_for_test();
+    let mut random_source = counted_random_source();
+    let mut issuer = new_issuer();
+    issuer
+        .issue_sd_jwt_with_random_source(
+            json!({ "name": "Alice" }),
+            ClaimsForSelectiveDisclosureStrategy::TopLevel,
+            None,
+            false,
+            SDJWTSerializationFormat::Compact,
+            &mut random_source,
+        )
+        .expect("mock-salt issuance without decoys must succeed");
+
+    assert_eq!(issuer.all_disclosures.len(), 1);
+    assert_eq!(rng_initialization_count(), 0);
+    assert!(random_source.rng.is_none());
 }
 
 #[test]
