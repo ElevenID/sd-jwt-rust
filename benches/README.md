@@ -124,6 +124,59 @@ route-swapped evidence is rejected. Diagnostics do not reproduce the selected
 ID. With both variables absent, the ordinary benchmark creates no evidence
 file.
 
+### Frozen launch barrier
+
+The qualification controller additionally sets `MARTY_PERF_START_BARRIER` to
+the absolute coordinate token path and invokes the installed binary from the
+campaign root with only the frozen environment allowlist. The custom binary
+entrypoint runs before `criterion_group!` constructs Criterion. It validates
+the canonical pretty token (under the v3 16 MiB auxiliary-artifact cap), UUID
+v4 campaign identity, coordinate and process pseudonym, the fixed executable
+at `bin/fixed-benchmark[.exe]`, the empty unique Criterion home, route and temp
+paths, the exact argument vector, and the selected full ID against the route
+scheduled for that coordinate by the frozen 20-round ABBA/BAAB expansion.
+
+The child then writes and flushes one canonical compact ready frame plus LF as
+the first stdout bytes. Its next protocol operation is a blocking stdin read
+through EOF under the 64 KiB frame cap. It rejects early EOF, partial, extra,
+second, noncanonical, oversized, non-UTF-8, or identity/fingerprint-mismatched
+release bytes. A valid release produces the exact canonical pretty receipt at
+`barrier-receipts/rNN_cNN_eN.json` using create-new, flush, and durable sync
+before Criterion construction. Diagnostics never reproduce the campaign ID,
+process pseudonym, selected benchmark ID, or host path. When the barrier
+variable is absent, the ordinary benchmark path remains unchanged.
+
+The trusted controller has exclusive ownership of the campaign root and must
+keep every parent directory unchanged from spawn through child exit. The child
+uses no-follow opens and handle identity/link/size checks for the token and
+fixed binary, rejects static symlink/reparse/hard-link inputs, and revalidates
+mutable paths after release. It does not claim race-resistant sandboxing
+against another local actor swapping an ordinary parent between path
+operations. Such a mutation violates the trusted-controller,
+quiescent-ancestry assumption and invalidates the campaign operationally;
+detecting it is outside the child-side guarantee. On Unix the receipt file and
+its no-follow parent directory are both synced. On Windows `File::sync_all`
+attempts to flush the receipt contents and metadata; there is no separate
+Unix-style parent-directory-entry flush claim.
+Fixed-binary hashing is streamed and fails closed above the frozen
+2,147,483,648-byte build-input cap.
+
+The real-child smoke is deliberately ignored unless a separately built custom
+benchmark binary is supplied. For example on PowerShell, after resolving the
+compiler-artifact executable from the JSON build output:
+
+```powershell
+cargo build --locked --profile bench --no-default-features --features issuance_bench --bench sd_jwt_issuance --message-format=json
+$env:SD_JWT_LAUNCH_BARRIER_FIXED_BINARY_UNDER_TEST = "C:\absolute\target\release\deps\sd_jwt_issuance-<hash>.exe"
+cargo test --locked --no-default-features --features issuance_bench --test issuance_launch_barrier_fixed_binary -- --ignored
+Remove-Item Env:\SD_JWT_LAUNCH_BARRIER_FIXED_BINARY_UNDER_TEST
+```
+
+The smoke proves the installed binary blocks before release, emits no bytes
+before the ready frame or after it while blocked, syncs the exact receipt after
+release, and rejects both the pre-ready and release-frame negative corpora
+without constructing Criterion or mutating route/receipt/home/temp evidence.
+
 Keep this feature on the same exact revision for both requested routes; unlike
 the verification benchmark, it does not require two separately compiled
 feature modes. Preserve each selected `sd_jwt_issuance_route_v2` record with
