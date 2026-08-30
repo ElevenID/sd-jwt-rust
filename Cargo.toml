@@ -58,6 +58,10 @@ name = "sd_jwt_issuance"
 harness = false
 required-features = ["issuance_bench"]
 
+[[bench]]
+name = "sd_jwt_production_rng"
+harness = false
+
 [[test]]
 name = "issuance_launch_barrier_fixed_binary"
 required-features = ["issuance_bench"]

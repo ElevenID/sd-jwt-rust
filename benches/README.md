@@ -20,6 +20,22 @@ that can run both revisions without paging.
 Hosted CI runs `cargo test --benches` as a compile and one-iteration smoke gate.
 Do not apply wall-clock performance thresholds to shared CI runners.
 
+## Production RNG acquisition microcase
+
+`sd_jwt_production_rng` exercises the public production issuance path with 512
+top-level disclosures and root decoys. Claim cloning and issuer-key parsing are
+outside the timed closure; salt generation, decoy-count sampling, planning,
+signing, and serialization are timed. This keeps production `ThreadRng` handle
+acquisition in the measured path, unlike the deterministic qualification tape
+below. Run it without `mock_salts`:
+
+```sh
+cargo bench --locked --no-default-features --bench sd_jwt_production_rng
+```
+
+This scalar case is directional local evidence, not a release threshold. The
+frozen qualification matrix and its launch protocol remain unchanged.
+
 ## Issuance executor qualification fixture
 
 `sd_jwt_issuance` is an opt-in harness for comparing the immutable serial
