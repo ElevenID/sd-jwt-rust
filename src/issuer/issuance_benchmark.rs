@@ -509,6 +509,36 @@ fn prepare_issuance_route_sink(
     selected_benchmark_id: Option<OsString>,
     criterion_arguments: &[OsString],
 ) -> io::Result<Option<IssuanceBenchmarkRouteSink>> {
+    let Some(validated) = validate_issuance_route_invocation(
+        destination,
+        selected_benchmark_id,
+        criterion_arguments,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(validated.destination)?;
+    Ok(Some(IssuanceBenchmarkRouteSink {
+        file,
+        selected_route_index: validated.selected_route_index,
+    }))
+}
+
+#[derive(Debug)]
+struct ValidatedIssuanceRouteInvocation {
+    destination: PathBuf,
+    selected_route_index: usize,
+}
+
+fn validate_issuance_route_invocation(
+    destination: Option<OsString>,
+    selected_benchmark_id: Option<OsString>,
+    criterion_arguments: &[OsString],
+) -> io::Result<Option<ValidatedIssuanceRouteInvocation>> {
     let (destination, selected_benchmark_id) = match (destination, selected_benchmark_id) {
         (None, None) => return Ok(None),
         (Some(destination), Some(selected_benchmark_id)) => (destination, selected_benchmark_id),
@@ -546,12 +576,8 @@ fn prepare_issuance_route_sink(
         ));
     }
 
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)?;
-    Ok(Some(IssuanceBenchmarkRouteSink {
-        file,
+    Ok(Some(ValidatedIssuanceRouteInvocation {
+        destination,
         selected_route_index,
     }))
 }
