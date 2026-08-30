@@ -70,7 +70,7 @@ Each fixture registers four IDs:
   proposed production threshold.
 
 Before timing, both stages require exact serial/candidate output equality.
-The harness emits one compact JSON route record for each of the 132 exact
+The harness constructs one compact JSON route record for each of the 132 exact
 Criterion IDs, including requested and effective routes, ready-batch counts,
 budget fallbacks, maximum native workers, host parallelism, and the worker cap.
 A one-job ready batch, a single-thread host, worker-budget contention, ARM64,
@@ -103,14 +103,36 @@ Criterion run:
 cargo bench --locked --no-default-features --features issuance_bench --bench sd_jwt_issuance -- --verbose
 ```
 
+Frozen selected-ID qualification uses the exact logical Criterion 0.5.1
+arguments below. The qualification controller invokes the already-built fixed
+benchmark binary directly and supplies the complete vector as shown. A Cargo
+wrapper is not the frozen path because its custom-harness arguments can differ.
+
+```text
+--bench --exact {full_benchmark_id} --sample-size 50 --nresamples 100000 --warm-up-time 15 --measurement-time 10 --confidence-level 0.95 --save-baseline base --noplot
+```
+
+Set `SD_JWT_ISSUANCE_ROUTE_BENCHMARK_ID` to exactly the substituted full ID and
+`SD_JWT_ISSUANCE_ROUTE_NDJSON` to an absolute create-new destination. Both must
+be present or both absent. In selected mode the harness still constructs and
+validates the complete ordered 132-record preflight matrix, including each
+ID/requested-route pairing, before it projects the matching record. The output
+is exactly one canonical compact UTF-8 record plus one LF, with no BOM, CR, or
+extra bytes; it is capped at 1 MiB, flushed, and durably synced. Unknown,
+partial, case-drifted, mismatched, duplicate, missing, extra, reordered, or
+route-swapped evidence is rejected. Diagnostics do not reproduce the selected
+ID. With both variables absent, the ordinary benchmark creates no evidence
+file.
+
 Keep this feature on the same exact revision for both requested routes; unlike
 the verification benchmark, it does not require two separately compiled
-feature modes. Preserve the emitted `sd_jwt_issuance_route_v2` records with the
-Criterion estimates so a later runner can reject an expected-native case that
-actually fell back to serial execution. A qualification artifact is complete
-only when it contains exactly 132 route records with 132 unique expected IDs;
-missing, duplicate, or extra records invalidate the artifact. Benchmark IDs are
-`v2` because the fixture matrix changed. The route-evidence schema remains
+feature modes. Preserve each selected `sd_jwt_issuance_route_v2` record with
+its matching Criterion estimates so a later runner can reject an
+expected-native case that actually fell back to serial execution. The complete
+preflight matrix is valid only with all 132 unique expected IDs in exact
+registration order; missing, duplicate, extra, reordered, or route-swapped
+records prevent projection. Benchmark IDs are `v2` because the fixture matrix
+changed. The route-evidence schema remains
 `sd_jwt_issuance_route_v2`, while the work estimator and contiguous static
 partition labels intentionally remain their independently versioned `v1`
 contracts.

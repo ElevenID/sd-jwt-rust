@@ -41,8 +41,14 @@ pub const ISSUANCE_LARGE_PAYLOAD_BYTES: usize = 64 * 1024;
 /// Stable Criterion group prefix used in route evidence.
 pub const ISSUANCE_BENCHMARK_GROUP_ID: &str = "sd_jwt_issuance";
 
-/// Optional absolute create-new destination for aggregate route evidence.
+/// Optional absolute create-new destination for selected route evidence.
 pub const ISSUANCE_ROUTE_NDJSON_ENV: &str = "SD_JWT_ISSUANCE_ROUTE_NDJSON";
+
+/// Exact full Criterion ID projected into the selected route artifact.
+pub const ISSUANCE_ROUTE_BENCHMARK_ID_ENV: &str = "SD_JWT_ISSUANCE_ROUTE_BENCHMARK_ID";
+
+/// Maximum size of the selected compact route record including its final LF.
+pub const MAX_ISSUANCE_ROUTE_ARTIFACT_BYTES: usize = 1024 * 1024;
 
 const ISSUANCE_ROUTE_SCHEMA: &str = "sd_jwt_issuance_route_v2";
 const ISSUANCE_QUALIFICATION_MANIFEST_SCHEMA: &str = "sd_jwt_issuance_qualification_manifest_v1";
@@ -332,12 +338,20 @@ fn full_criterion_id(
     )
 }
 
-fn qualification_criterion_ids(cases: &[IssuanceBenchmarkCase]) -> Vec<String> {
-    let mut ids = Vec::with_capacity(ISSUANCE_BENCHMARK_ID_COUNT);
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct IssuanceQualificationRoute {
+    benchmark_id: String,
+    fixture_id: String,
+    stage: IssuanceBenchmarkStage,
+    requested: IssuanceBenchmarkRoute,
+}
+
+fn qualification_routes(cases: &[IssuanceBenchmarkCase]) -> Vec<IssuanceQualificationRoute> {
+    let mut routes = Vec::with_capacity(ISSUANCE_BENCHMARK_ID_COUNT);
     for case in cases {
         // This is the exact route-then-stage registration order in the
         // Criterion target.
-        for route in [
+        for requested in [
             IssuanceBenchmarkRoute::SerialOracle,
             IssuanceBenchmarkRoute::AdaptiveCandidate,
         ] {
@@ -345,12 +359,24 @@ fn qualification_criterion_ids(cases: &[IssuanceBenchmarkCase]) -> Vec<String> {
                 IssuanceBenchmarkStage::ExecutorAssembly,
                 IssuanceBenchmarkStage::FullIssuance,
             ] {
-                ids.push(full_criterion_id(*case, stage, route));
+                routes.push(IssuanceQualificationRoute {
+                    benchmark_id: full_criterion_id(*case, stage, requested),
+                    fixture_id: case.fixture_id(),
+                    stage,
+                    requested,
+                });
             }
         }
     }
-    debug_assert_eq!(ids.len(), ISSUANCE_BENCHMARK_ID_COUNT);
-    ids
+    debug_assert_eq!(routes.len(), ISSUANCE_BENCHMARK_ID_COUNT);
+    routes
+}
+
+fn qualification_criterion_ids(cases: &[IssuanceBenchmarkCase]) -> Vec<String> {
+    qualification_routes(cases)
+        .into_iter()
+        .map(|route| route.benchmark_id)
+        .collect()
 }
 
 fn qualification_paired_cells(cases: &[IssuanceBenchmarkCase]) -> Vec<Value> {
@@ -437,7 +463,8 @@ pub fn issuance_qualification_manifest_json() -> String {
     manifest
 }
 
-/// A create-new destination reserved before Criterion starts measuring.
+/// A create-new selected-route destination reserved before Criterion starts
+/// measuring.
 ///
 /// Holding the reserved write-only file handle does not add work to any timed
 /// closure. A process that exits before [`Self::finish`] leaves an empty file,
@@ -446,13 +473,14 @@ pub fn issuance_qualification_manifest_json() -> String {
 #[derive(Debug)]
 pub struct IssuanceBenchmarkRouteSink {
     file: File,
+    selected_route_index: usize,
 }
 
 impl IssuanceBenchmarkRouteSink {
-    /// Validate all route records and durably write one LF-terminated JSON
-    /// object per line.
+    /// Validate the complete canonical matrix, then durably project the one
+    /// selected compact JSON record followed by one LF.
     pub fn finish(mut self, records: &[String]) -> io::Result<()> {
-        let payload = validated_route_payload(records)?;
+        let payload = validated_selected_route_payload(records, self.selected_route_index)?;
         self.file.write_all(&payload)?;
         self.file.flush()?;
         self.file.sync_all()
@@ -462,19 +490,54 @@ impl IssuanceBenchmarkRouteSink {
 /// Reserve the optional route-evidence file named by
 /// [`ISSUANCE_ROUTE_NDJSON_ENV`].
 ///
-/// The environment variable may be absent. When present, it must contain an
-/// absolute path that does not already exist; existing evidence is never
-/// replaced.
+/// The destination and [`ISSUANCE_ROUTE_BENCHMARK_ID_ENV`] must either both be
+/// absent or both be present. When present, the selector must be one exact
+/// canonical full ID, the process arguments must be the frozen Criterion
+/// qualification invocation, and the destination must be an absolute path
+/// that does not already exist. Existing evidence is never replaced.
 pub fn prepare_issuance_route_sink_from_env() -> io::Result<Option<IssuanceBenchmarkRouteSink>> {
-    prepare_issuance_route_sink(env::var_os(ISSUANCE_ROUTE_NDJSON_ENV))
+    let criterion_arguments = env::args_os().skip(1).collect::<Vec<_>>();
+    prepare_issuance_route_sink(
+        env::var_os(ISSUANCE_ROUTE_NDJSON_ENV),
+        env::var_os(ISSUANCE_ROUTE_BENCHMARK_ID_ENV),
+        &criterion_arguments,
+    )
 }
 
 fn prepare_issuance_route_sink(
     destination: Option<OsString>,
+    selected_benchmark_id: Option<OsString>,
+    criterion_arguments: &[OsString],
 ) -> io::Result<Option<IssuanceBenchmarkRouteSink>> {
-    let Some(destination) = destination else {
-        return Ok(None);
+    let (destination, selected_benchmark_id) = match (destination, selected_benchmark_id) {
+        (None, None) => return Ok(None),
+        (Some(destination), Some(selected_benchmark_id)) => (destination, selected_benchmark_id),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "issuance route selector and destination must be supplied together",
+            ))
+        }
     };
+
+    let selected_benchmark_id = selected_benchmark_id.into_string().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "issuance route selector must be UTF-8",
+        )
+    })?;
+    let qualification_routes = qualification_routes(&issuance_benchmark_cases());
+    let selected_route_index = qualification_routes
+        .iter()
+        .position(|route| route.benchmark_id == selected_benchmark_id)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "issuance route selector must be one exact canonical full benchmark ID",
+            )
+        })?;
+    validate_qualification_criterion_arguments(criterion_arguments, &selected_benchmark_id)?;
+
     let destination = PathBuf::from(destination);
     if !destination.is_absolute() {
         return Err(io::Error::new(
@@ -487,10 +550,613 @@ fn prepare_issuance_route_sink(
         .write(true)
         .create_new(true)
         .open(destination)?;
-    Ok(Some(IssuanceBenchmarkRouteSink { file }))
+    Ok(Some(IssuanceBenchmarkRouteSink {
+        file,
+        selected_route_index,
+    }))
 }
 
-fn validated_route_payload(records: &[String]) -> io::Result<Vec<u8>> {
+fn validate_qualification_criterion_arguments(
+    criterion_arguments: &[OsString],
+    selected_benchmark_id: &str,
+) -> io::Result<()> {
+    let criterion_arguments = criterion_arguments
+        .iter()
+        .cloned()
+        .map(|argument| {
+            argument.into_string().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Criterion qualification arguments must be UTF-8",
+                )
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let expected_arguments = [
+        "--bench",
+        "--exact",
+        selected_benchmark_id,
+        "--sample-size",
+        "50",
+        "--nresamples",
+        "100000",
+        "--warm-up-time",
+        "15",
+        "--measurement-time",
+        "10",
+        "--confidence-level",
+        "0.95",
+        "--save-baseline",
+        "base",
+        "--noplot",
+    ];
+    if criterion_arguments
+        .iter()
+        .map(String::as_str)
+        .ne(expected_arguments)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Criterion arguments do not match the frozen qualification invocation",
+        ));
+    }
+    Ok(())
+}
+
+const ISSUANCE_ROUTE_RECORD_FIELDS: [&str; 16] = [
+    "schema",
+    "benchmark_id",
+    "fixture_id",
+    "stage",
+    "requested",
+    "effective",
+    "executor_batches",
+    "serial_batches",
+    "native_batches",
+    "budget_fallback_batches",
+    "max_native_worker_count",
+    "worker_cap",
+    "host_available_parallelism",
+    "work_estimator_version",
+    "static_partition_rule_version",
+    "ready_batches",
+];
+
+const ISSUANCE_READY_BATCH_FIELDS: [&str; 15] = [
+    "ordinal",
+    "job_count",
+    "estimated_work_bytes",
+    "work_estimate_status",
+    "work_gate_evaluated",
+    "parallelism_gate_evaluated",
+    "budget_gate_evaluated",
+    "available_parallelism",
+    "selected_worker_count",
+    "leased_worker_count",
+    "budget_acquisition_result",
+    "selected_mode",
+    "selection_reason",
+    "static_chunk_size",
+    "static_chunks",
+];
+
+const ISSUANCE_STATIC_CHUNK_FIELDS: [&str; 3] = ["ordinal", "job_count", "estimated_work_bytes"];
+
+fn has_exact_keys(value: &Value, expected: &[&str]) -> bool {
+    value
+        .as_object()
+        .map(|object| {
+            object
+                .keys()
+                .map(String::as_str)
+                .eq(expected.iter().copied())
+        })
+        .unwrap_or(false)
+}
+
+fn is_null_or_unsigned(value: Option<&Value>) -> bool {
+    value.map(|value| value.is_null() || value.as_u64().is_some()) == Some(true)
+}
+
+fn route_record_has_canonical_shape(value: &Value) -> bool {
+    if !has_exact_keys(value, &ISSUANCE_ROUTE_RECORD_FIELDS) {
+        return false;
+    }
+    let object = value
+        .as_object()
+        .expect("exact route record keys require an object");
+    if [
+        "schema",
+        "benchmark_id",
+        "fixture_id",
+        "stage",
+        "requested",
+        "effective",
+        "work_estimator_version",
+        "static_partition_rule_version",
+    ]
+    .iter()
+    .any(|field| object.get(*field).and_then(Value::as_str).is_none())
+        || [
+            "executor_batches",
+            "serial_batches",
+            "native_batches",
+            "budget_fallback_batches",
+        ]
+        .iter()
+        .any(|field| !is_null_or_unsigned(object.get(*field)))
+        || [
+            "max_native_worker_count",
+            "worker_cap",
+            "host_available_parallelism",
+        ]
+        .iter()
+        .any(|field| object.get(*field).and_then(Value::as_u64).is_none())
+    {
+        return false;
+    }
+
+    let Some(ready_batches) = object.get("ready_batches") else {
+        return false;
+    };
+    if ready_batches.is_null() {
+        return true;
+    }
+    let Some(ready_batches) = ready_batches.as_array() else {
+        return false;
+    };
+    ready_batches.iter().all(|batch| {
+        if !has_exact_keys(batch, &ISSUANCE_READY_BATCH_FIELDS) {
+            return false;
+        }
+        let batch = batch
+            .as_object()
+            .expect("exact ready-batch keys require an object");
+        if ["ordinal", "job_count"]
+            .iter()
+            .any(|field| batch.get(*field).and_then(Value::as_u64).is_none())
+            || [
+                "estimated_work_bytes",
+                "available_parallelism",
+                "selected_worker_count",
+                "leased_worker_count",
+                "static_chunk_size",
+            ]
+            .iter()
+            .any(|field| !is_null_or_unsigned(batch.get(*field)))
+            || [
+                "work_estimate_status",
+                "budget_acquisition_result",
+                "selected_mode",
+                "selection_reason",
+            ]
+            .iter()
+            .any(|field| batch.get(*field).and_then(Value::as_str).is_none())
+            || [
+                "work_gate_evaluated",
+                "parallelism_gate_evaluated",
+                "budget_gate_evaluated",
+            ]
+            .iter()
+            .any(|field| batch.get(*field).and_then(Value::as_bool).is_none())
+        {
+            return false;
+        }
+        let Some(static_chunks) = batch.get("static_chunks") else {
+            return false;
+        };
+        static_chunks.is_null()
+            || static_chunks.as_array().map_or(false, |chunks| {
+                chunks.iter().all(|chunk| {
+                    has_exact_keys(chunk, &ISSUANCE_STATIC_CHUNK_FIELDS)
+                        && chunk.as_object().map_or(false, |chunk| {
+                            ISSUANCE_STATIC_CHUNK_FIELDS
+                                .iter()
+                                .all(|field| chunk.get(*field).and_then(Value::as_u64).is_some())
+                        })
+                })
+            })
+    })
+}
+
+fn nullable_unsigned_field(object: &Map<String, Value>, field: &str) -> Option<Option<u64>> {
+    let value = object.get(field)?;
+    if value.is_null() {
+        Some(None)
+    } else {
+        value.as_u64().map(Some)
+    }
+}
+
+fn checked_ceil_div(value: u64, divisor: u64) -> Option<u64> {
+    if divisor == 0 {
+        return None;
+    }
+    (value / divisor).checked_add(u64::from(value % divisor != 0))
+}
+
+fn ready_batch_serial_tail_is_unevaluated(batch: &Map<String, Value>) -> bool {
+    batch
+        .get("parallelism_gate_evaluated")
+        .and_then(Value::as_bool)
+        == Some(false)
+        && nullable_unsigned_field(batch, "available_parallelism") == Some(None)
+        && nullable_unsigned_field(batch, "selected_worker_count") == Some(None)
+        && batch.get("budget_gate_evaluated").and_then(Value::as_bool) == Some(false)
+        && batch
+            .get("budget_acquisition_result")
+            .and_then(Value::as_str)
+            == Some("not_evaluated")
+        && batch.get("selected_mode").and_then(Value::as_str) == Some("serial")
+        && nullable_unsigned_field(batch, "leased_worker_count") == Some(None)
+        && nullable_unsigned_field(batch, "static_chunk_size") == Some(None)
+        && batch.get("static_chunks").map(Value::is_null) == Some(true)
+}
+
+fn native_static_chunks_are_valid(
+    batch: &Map<String, Value>,
+    job_count: u64,
+    estimated_work_bytes: u64,
+    selected_worker_count: u64,
+) -> bool {
+    let Some(chunk_size) = nullable_unsigned_field(batch, "static_chunk_size").flatten() else {
+        return false;
+    };
+    let Some(expected_chunk_size) = checked_ceil_div(job_count, selected_worker_count) else {
+        return false;
+    };
+    if chunk_size != expected_chunk_size {
+        return false;
+    }
+    let Some(expected_chunk_count) = checked_ceil_div(job_count, chunk_size) else {
+        return false;
+    };
+    let Some(chunks) = batch.get("static_chunks").and_then(Value::as_array) else {
+        return false;
+    };
+    if u64::try_from(chunks.len()).ok() != Some(expected_chunk_count)
+        || expected_chunk_count == 0
+        || expected_chunk_count > selected_worker_count
+    {
+        return false;
+    }
+
+    let mut observed_jobs = 0u64;
+    let mut observed_work = 0u64;
+    for (ordinal, chunk) in chunks.iter().enumerate() {
+        let Some(chunk) = chunk.as_object() else {
+            return false;
+        };
+        let Some(chunk_ordinal) = chunk.get("ordinal").and_then(Value::as_u64) else {
+            return false;
+        };
+        let Some(chunk_jobs) = chunk.get("job_count").and_then(Value::as_u64) else {
+            return false;
+        };
+        let Some(chunk_work) = chunk.get("estimated_work_bytes").and_then(Value::as_u64) else {
+            return false;
+        };
+        let Some(expected_ordinal) = u64::try_from(ordinal).ok() else {
+            return false;
+        };
+        let expected_jobs = if expected_ordinal + 1 == expected_chunk_count {
+            let Some(prior_jobs) = chunk_size.checked_mul(expected_chunk_count - 1) else {
+                return false;
+            };
+            let Some(final_jobs) = job_count.checked_sub(prior_jobs) else {
+                return false;
+            };
+            final_jobs
+        } else {
+            chunk_size
+        };
+        if chunk_ordinal != expected_ordinal
+            || chunk_jobs != expected_jobs
+            || chunk_jobs == 0
+            || chunk_jobs > chunk_size
+        {
+            return false;
+        }
+        let Some(next_jobs) = observed_jobs.checked_add(chunk_jobs) else {
+            return false;
+        };
+        let Some(next_work) = observed_work.checked_add(chunk_work) else {
+            return false;
+        };
+        observed_jobs = next_jobs;
+        observed_work = next_work;
+    }
+    observed_jobs == job_count && observed_work == estimated_work_bytes
+}
+
+fn ready_batch_semantics_are_valid(
+    batch: &Value,
+    expected_ordinal: usize,
+    host_available_parallelism: u64,
+    worker_cap: u64,
+) -> bool {
+    let Some(batch) = batch.as_object() else {
+        return false;
+    };
+    let Some(ordinal) = batch.get("ordinal").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Some(job_count) = batch.get("job_count").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Some(expected_ordinal) = u64::try_from(expected_ordinal).ok() else {
+        return false;
+    };
+    let estimated_work_bytes = nullable_unsigned_field(batch, "estimated_work_bytes");
+    let available_parallelism = nullable_unsigned_field(batch, "available_parallelism");
+    let selected_worker_count = nullable_unsigned_field(batch, "selected_worker_count");
+    let leased_worker_count = nullable_unsigned_field(batch, "leased_worker_count");
+    let static_chunk_size = nullable_unsigned_field(batch, "static_chunk_size");
+    let work_estimate_status = batch.get("work_estimate_status").and_then(Value::as_str);
+    let work_gate_evaluated = batch.get("work_gate_evaluated").and_then(Value::as_bool);
+    let parallelism_gate_evaluated = batch
+        .get("parallelism_gate_evaluated")
+        .and_then(Value::as_bool);
+    let budget_gate_evaluated = batch.get("budget_gate_evaluated").and_then(Value::as_bool);
+    let budget_acquisition_result = batch
+        .get("budget_acquisition_result")
+        .and_then(Value::as_str);
+    let selected_mode = batch.get("selected_mode").and_then(Value::as_str);
+    let selection_reason = batch.get("selection_reason").and_then(Value::as_str);
+    let static_chunks = batch.get("static_chunks");
+
+    if ordinal != expected_ordinal
+        || job_count == 0
+        || estimated_work_bytes.is_none()
+        || available_parallelism.is_none()
+        || selected_worker_count.is_none()
+        || leased_worker_count.is_none()
+        || static_chunk_size.is_none()
+        || work_estimate_status.is_none()
+        || work_gate_evaluated.is_none()
+        || parallelism_gate_evaluated.is_none()
+        || budget_gate_evaluated.is_none()
+        || budget_acquisition_result.is_none()
+        || selected_mode.is_none()
+        || selection_reason.is_none()
+        || static_chunks.is_none()
+    {
+        return false;
+    }
+
+    let estimated_work_bytes = estimated_work_bytes.expect("shape checked");
+    let available_parallelism = available_parallelism.expect("shape checked");
+    let selected_worker_count = selected_worker_count.expect("shape checked");
+    let leased_worker_count = leased_worker_count.expect("shape checked");
+    let static_chunk_size = static_chunk_size.expect("shape checked");
+    let work_estimate_status = work_estimate_status.expect("shape checked");
+    let work_gate_evaluated = work_gate_evaluated.expect("shape checked");
+    let parallelism_gate_evaluated = parallelism_gate_evaluated.expect("shape checked");
+    let budget_gate_evaluated = budget_gate_evaluated.expect("shape checked");
+    let budget_acquisition_result = budget_acquisition_result.expect("shape checked");
+    let selected_mode = selected_mode.expect("shape checked");
+    let selection_reason = selection_reason.expect("shape checked");
+    let static_chunks = static_chunks.expect("shape checked");
+
+    if work_gate_evaluated != (work_estimate_status != "not_evaluated")
+        || estimated_work_bytes.is_some() != (work_estimate_status == "available")
+        || parallelism_gate_evaluated
+            != (available_parallelism.is_some() && selected_worker_count.is_some())
+        || budget_gate_evaluated != (budget_acquisition_result != "not_evaluated")
+    {
+        return false;
+    }
+
+    if job_count < 2 {
+        return selection_reason == "below_min_jobs"
+            && work_estimate_status == "not_evaluated"
+            && !work_gate_evaluated
+            && estimated_work_bytes.is_none()
+            && ready_batch_serial_tail_is_unevaluated(batch);
+    }
+    if work_estimate_status == "overflow" {
+        return selection_reason == "work_estimate_overflow"
+            && work_gate_evaluated
+            && estimated_work_bytes.is_none()
+            && ready_batch_serial_tail_is_unevaluated(batch);
+    }
+    let Some(estimated_work_bytes) = estimated_work_bytes else {
+        return false;
+    };
+    if estimated_work_bytes < 1 {
+        return selection_reason == "below_min_estimated_work_bytes"
+            && work_estimate_status == "available"
+            && work_gate_evaluated
+            && ready_batch_serial_tail_is_unevaluated(batch);
+    }
+    if work_estimate_status != "available" || !work_gate_evaluated {
+        return false;
+    }
+
+    let Some(available_parallelism) = available_parallelism else {
+        return false;
+    };
+    let Some(selected_worker_count) = selected_worker_count else {
+        return false;
+    };
+    if available_parallelism != host_available_parallelism
+        || available_parallelism == 0
+        || !parallelism_gate_evaluated
+        || selected_worker_count != available_parallelism.min(worker_cap).min(job_count)
+    {
+        return false;
+    }
+    if selected_worker_count < 2 {
+        return selection_reason == "insufficient_available_parallelism"
+            && !budget_gate_evaluated
+            && budget_acquisition_result == "not_evaluated"
+            && selected_mode == "serial"
+            && leased_worker_count.is_none()
+            && static_chunk_size.is_none()
+            && static_chunks.is_null();
+    }
+    if budget_acquisition_result == "unavailable" {
+        return selection_reason == "worker_budget_unavailable"
+            && budget_gate_evaluated
+            && selected_mode == "serial"
+            && leased_worker_count.is_none()
+            && static_chunk_size.is_none()
+            && static_chunks.is_null();
+    }
+    if budget_acquisition_result != "acquired"
+        || selection_reason != "bounded_native"
+        || !budget_gate_evaluated
+        || selected_mode != "native_parallel"
+        || leased_worker_count != Some(selected_worker_count)
+    {
+        return false;
+    }
+    native_static_chunks_are_valid(
+        batch,
+        job_count,
+        estimated_work_bytes,
+        selected_worker_count,
+    )
+}
+
+fn route_record_semantics_are_valid(
+    value: &Value,
+    expected_route: &IssuanceQualificationRoute,
+) -> bool {
+    let Some(record) = value.as_object() else {
+        return false;
+    };
+    let Some(worker_cap) = record.get("worker_cap").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Some(host_available_parallelism) = record
+        .get("host_available_parallelism")
+        .and_then(Value::as_u64)
+    else {
+        return false;
+    };
+    let expected_worker_cap = u64::try_from(BENCHMARK_ISSUANCE_WORKER_CAP).ok();
+    if expected_worker_cap != Some(worker_cap)
+        || host_available_parallelism == 0
+        || record.get("work_estimator_version").and_then(Value::as_str)
+            != Some(BENCHMARK_WORK_ESTIMATOR_VERSION)
+        || record
+            .get("static_partition_rule_version")
+            .and_then(Value::as_str)
+            != Some(BENCHMARK_STATIC_PARTITION_RULE_VERSION)
+    {
+        return false;
+    }
+
+    let count_fields = [
+        "executor_batches",
+        "serial_batches",
+        "native_batches",
+        "budget_fallback_batches",
+    ];
+    let counts = count_fields
+        .map(|field| nullable_unsigned_field(record, field))
+        .into_iter()
+        .collect::<Option<Vec<_>>>();
+    let Some(counts) = counts else {
+        return false;
+    };
+    let Some(max_native_worker_count) = record
+        .get("max_native_worker_count")
+        .and_then(Value::as_u64)
+    else {
+        return false;
+    };
+    let effective = record.get("effective").and_then(Value::as_str);
+    let Some(ready_batches) = record.get("ready_batches") else {
+        return false;
+    };
+
+    if expected_route.requested == IssuanceBenchmarkRoute::SerialOracle {
+        return effective == Some("serial_oracle")
+            && counts.iter().all(Option::is_none)
+            && max_native_worker_count == 0
+            && ready_batches.is_null();
+    }
+    if worker_cap == 1 {
+        return effective == Some("target_serial_fallback")
+            && counts.iter().all(Option::is_none)
+            && max_native_worker_count == 0
+            && ready_batches.is_null();
+    }
+
+    let Some(ready_batches) = ready_batches.as_array() else {
+        return false;
+    };
+    if !ready_batches.iter().enumerate().all(|(ordinal, batch)| {
+        ready_batch_semantics_are_valid(batch, ordinal, host_available_parallelism, worker_cap)
+    }) {
+        return false;
+    }
+    let Some(executor_batches) = u64::try_from(ready_batches.len()).ok() else {
+        return false;
+    };
+    let native_batches = ready_batches
+        .iter()
+        .filter(|batch| {
+            batch.get("selected_mode").and_then(Value::as_str) == Some("native_parallel")
+        })
+        .count();
+    let budget_fallback_batches = ready_batches
+        .iter()
+        .filter(|batch| {
+            batch.get("selection_reason").and_then(Value::as_str)
+                == Some("worker_budget_unavailable")
+        })
+        .count();
+    let Some(native_batches) = u64::try_from(native_batches).ok() else {
+        return false;
+    };
+    let Some(serial_batches) = executor_batches.checked_sub(native_batches) else {
+        return false;
+    };
+    let Some(budget_fallback_batches) = u64::try_from(budget_fallback_batches).ok() else {
+        return false;
+    };
+    let observed_max_workers = ready_batches
+        .iter()
+        .filter_map(|batch| {
+            batch
+                .as_object()
+                .and_then(|batch| nullable_unsigned_field(batch, "leased_worker_count"))
+                .flatten()
+        })
+        .max()
+        .unwrap_or(0);
+    if counts
+        != [
+            Some(executor_batches),
+            Some(serial_batches),
+            Some(native_batches),
+            Some(budget_fallback_batches),
+        ]
+        || budget_fallback_batches > serial_batches
+        || max_native_worker_count != observed_max_workers
+        || max_native_worker_count > worker_cap
+    {
+        return false;
+    }
+    let expected_effective = if native_batches > 0 && serial_batches > 0 {
+        "mixed_native_and_serial"
+    } else if native_batches > 0 {
+        "bounded_native"
+    } else if budget_fallback_batches > 0 {
+        "budget_serial_fallback"
+    } else {
+        "ready_batch_serial_fallback"
+    };
+    effective == Some(expected_effective)
+}
+
+fn validated_selected_route_payload(
+    records: &[String],
+    selected_route_index: usize,
+) -> io::Result<Vec<u8>> {
     if records.len() != ISSUANCE_BENCHMARK_ID_COUNT {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -500,13 +1166,21 @@ fn validated_route_payload(records: &[String]) -> io::Result<Vec<u8>> {
         ));
     }
 
-    let expected_ids = qualification_criterion_ids(&issuance_benchmark_cases())
-        .into_iter()
-        .collect::<BTreeSet<_>>();
+    let expected_routes = qualification_routes(&issuance_benchmark_cases());
     let mut observed_ids = BTreeSet::new();
-    let mut payload = Vec::with_capacity(records.iter().map(|record| record.len() + 1).sum());
+    let mut observed_host_available_parallelism = None;
 
-    for record in records {
+    for (record, expected_route) in records.iter().zip(&expected_routes) {
+        if record
+            .len()
+            .checked_add(1)
+            .map_or(true, |size| size > MAX_ISSUANCE_ROUTE_ARTIFACT_BYTES)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "issuance route record exceeds the artifact size limit",
+            ));
+        }
         if record.contains('\r') || record.contains('\n') {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -519,6 +1193,18 @@ fn validated_route_payload(records: &[String]) -> io::Result<Vec<u8>> {
                 "issuance route record must be valid JSON",
             )
         })?;
+        let compact_value = serde_json::to_string(&value).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "issuance route record cannot be encoded as compact JSON",
+            )
+        })?;
+        if !route_record_has_canonical_shape(&value) || compact_value != *record {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "issuance route record must have the canonical compact shape",
+            ));
+        }
         if value.get("schema").and_then(Value::as_str) != Some(ISSUANCE_ROUTE_SCHEMA) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -540,17 +1226,61 @@ fn validated_route_payload(records: &[String]) -> io::Result<Vec<u8>> {
                 "issuance route evidence contains a duplicate benchmark ID",
             ));
         }
-
-        payload.extend_from_slice(record.as_bytes());
-        payload.push(b'\n');
+        if benchmark_id != expected_route.benchmark_id.as_str()
+            || value.get("fixture_id").and_then(Value::as_str)
+                != Some(expected_route.fixture_id.as_str())
+            || value.get("stage").and_then(Value::as_str) != Some(expected_route.stage.label())
+            || value.get("requested").and_then(Value::as_str)
+                != Some(expected_route.requested.label())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "issuance route evidence does not match the canonical ordered matrix",
+            ));
+        }
+        if !route_record_semantics_are_valid(&value, expected_route) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "issuance route record violates the frozen route semantics",
+            ));
+        }
+        let Some(host_available_parallelism) = value
+            .get("host_available_parallelism")
+            .and_then(Value::as_u64)
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "issuance route record is missing host parallelism",
+            ));
+        };
+        match observed_host_available_parallelism {
+            Some(observed) if observed != host_available_parallelism => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "issuance route records disagree on host parallelism",
+                ))
+            }
+            Some(_) => {}
+            None => observed_host_available_parallelism = Some(host_available_parallelism),
+        }
     }
 
-    if observed_ids != expected_ids {
+    if observed_ids.len() != ISSUANCE_BENCHMARK_ID_COUNT {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "issuance route evidence does not cover the canonical benchmark IDs",
         ));
     }
+
+    let selected_record = records.get(selected_route_index).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "issuance route selector does not resolve after matrix validation",
+        )
+    })?;
+    let mut payload = Vec::with_capacity(selected_record.len() + 1);
+    payload.extend_from_slice(selected_record.as_bytes());
+    payload.push(b'\n');
     Ok(payload)
 }
 
@@ -1343,11 +2073,15 @@ mod tests {
     use std::sync::{Mutex, MutexGuard};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use sha2::{Digest, Sha256};
+
     use super::*;
     use crate::issuer::issuance_plan::BenchmarkStaticChunkTrace;
 
     static BENCHMARK_TEST_LOCK: Mutex<()> = Mutex::new(());
     static NEXT_ROUTE_PATH: AtomicUsize = AtomicUsize::new(0);
+    #[cfg(target_arch = "x86_64")]
+    type RouteMutation = (&'static str, fn(&mut Value));
 
     fn benchmark_test_guard() -> MutexGuard<'static, ()> {
         BENCHMARK_TEST_LOCK
@@ -1409,88 +2143,724 @@ mod tests {
         ))
     }
 
+    fn qualification_arguments(selected_benchmark_id: &str) -> Vec<OsString> {
+        [
+            "--bench",
+            "--exact",
+            selected_benchmark_id,
+            "--sample-size",
+            "50",
+            "--nresamples",
+            "100000",
+            "--warm-up-time",
+            "15",
+            "--measurement-time",
+            "10",
+            "--confidence-level",
+            "0.95",
+            "--save-baseline",
+            "base",
+            "--noplot",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect()
+    }
+
     fn minimal_route_records() -> Vec<String> {
-        qualification_criterion_ids(&issuance_benchmark_cases())
+        qualification_routes(&issuance_benchmark_cases())
             .into_iter()
-            .map(|benchmark_id| {
+            .map(|route| {
+                let adaptive = route.requested == IssuanceBenchmarkRoute::AdaptiveCandidate;
+                let target_fallback = adaptive && BENCHMARK_ISSUANCE_WORKER_CAP == 1;
+                let observed_count = (adaptive && !target_fallback).then_some(0usize);
+                let ready_batches = (adaptive && !target_fallback).then(Vec::<Value>::new);
                 serde_json::to_string(&json!({
                     "schema": ISSUANCE_ROUTE_SCHEMA,
-                    "benchmark_id": benchmark_id,
+                    "benchmark_id": route.benchmark_id,
+                    "fixture_id": route.fixture_id,
+                    "stage": route.stage.label(),
+                    "requested": route.requested.label(),
+                    "effective": if target_fallback {
+                        "target_serial_fallback"
+                    } else if adaptive {
+                        "ready_batch_serial_fallback"
+                    } else {
+                        "serial_oracle"
+                    },
+                    "executor_batches": observed_count,
+                    "serial_batches": observed_count,
+                    "native_batches": observed_count,
+                    "budget_fallback_batches": observed_count,
+                    "max_native_worker_count": 0,
+                    "worker_cap": BENCHMARK_ISSUANCE_WORKER_CAP,
+                    "host_available_parallelism": 1,
+                    "work_estimator_version": BENCHMARK_WORK_ESTIMATOR_VERSION,
+                    "static_partition_rule_version": BENCHMARK_STATIC_PARTITION_RULE_VERSION,
+                    "ready_batches": ready_batches,
                 }))
                 .unwrap()
             })
             .collect()
     }
 
-    #[test]
-    fn route_sink_is_optional_and_rejects_relative_destinations() {
-        assert!(prepare_issuance_route_sink(None).unwrap().is_none());
-
-        let error =
-            prepare_issuance_route_sink(Some(OsString::from("relative.ndjson"))).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    #[cfg(target_arch = "x86_64")]
+    fn pre_parallel_ready_batch(
+        ordinal: usize,
+        job_count: usize,
+        estimated_work_bytes: Value,
+        work_estimate_status: &str,
+        work_gate_evaluated: bool,
+        selection_reason: &str,
+    ) -> Value {
+        json!({
+            "ordinal": ordinal,
+            "job_count": job_count,
+            "estimated_work_bytes": estimated_work_bytes,
+            "work_estimate_status": work_estimate_status,
+            "work_gate_evaluated": work_gate_evaluated,
+            "parallelism_gate_evaluated": false,
+            "budget_gate_evaluated": false,
+            "available_parallelism": null,
+            "selected_worker_count": null,
+            "leased_worker_count": null,
+            "budget_acquisition_result": "not_evaluated",
+            "selected_mode": "serial",
+            "selection_reason": selection_reason,
+            "static_chunk_size": null,
+            "static_chunks": null,
+        })
     }
 
-    #[test]
-    fn route_sink_creates_once_and_writes_the_exact_canonical_id_set() {
-        let destination = unique_route_path("valid");
-        let records = minimal_route_records();
-        let sink = prepare_issuance_route_sink(Some(destination.clone().into_os_string()))
+    #[cfg(target_arch = "x86_64")]
+    fn detailed_adaptive_route_records() -> Vec<String> {
+        let mut records = minimal_route_records();
+        for record in &mut records {
+            *record = replace_route_field(record, "host_available_parallelism", json!(4));
+        }
+        let ready_batches = vec![
+            pre_parallel_ready_batch(0, 1, Value::Null, "not_evaluated", false, "below_min_jobs"),
+            pre_parallel_ready_batch(
+                1,
+                2,
+                Value::Null,
+                "overflow",
+                true,
+                "work_estimate_overflow",
+            ),
+            pre_parallel_ready_batch(
+                2,
+                2,
+                json!(0),
+                "available",
+                true,
+                "below_min_estimated_work_bytes",
+            ),
+            json!({
+                "ordinal": 3,
+                "job_count": 2,
+                "estimated_work_bytes": 3,
+                "work_estimate_status": "available",
+                "work_gate_evaluated": true,
+                "parallelism_gate_evaluated": true,
+                "budget_gate_evaluated": true,
+                "available_parallelism": 4,
+                "selected_worker_count": 2,
+                "leased_worker_count": null,
+                "budget_acquisition_result": "unavailable",
+                "selected_mode": "serial",
+                "selection_reason": "worker_budget_unavailable",
+                "static_chunk_size": null,
+                "static_chunks": null,
+            }),
+            json!({
+                "ordinal": 4,
+                "job_count": 3,
+                "estimated_work_bytes": 9,
+                "work_estimate_status": "available",
+                "work_gate_evaluated": true,
+                "parallelism_gate_evaluated": true,
+                "budget_gate_evaluated": true,
+                "available_parallelism": 4,
+                "selected_worker_count": 3,
+                "leased_worker_count": 3,
+                "budget_acquisition_result": "acquired",
+                "selected_mode": "native_parallel",
+                "selection_reason": "bounded_native",
+                "static_chunk_size": 1,
+                "static_chunks": [
+                    {"ordinal": 0, "job_count": 1, "estimated_work_bytes": 2},
+                    {"ordinal": 1, "job_count": 1, "estimated_work_bytes": 3},
+                    {"ordinal": 2, "job_count": 1, "estimated_work_bytes": 4},
+                ],
+            }),
+        ];
+        let mut record: Value = serde_json::from_str(&records[2]).unwrap();
+        record["effective"] = json!("mixed_native_and_serial");
+        record["executor_batches"] = json!(5);
+        record["serial_batches"] = json!(4);
+        record["native_batches"] = json!(1);
+        record["budget_fallback_batches"] = json!(1);
+        record["max_native_worker_count"] = json!(3);
+        record["host_available_parallelism"] = json!(4);
+        record["ready_batches"] = Value::Array(ready_batches);
+        records[2] = serde_json::to_string(&record).unwrap();
+        records
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn insufficient_parallelism_route_records() -> Vec<String> {
+        let mut records = minimal_route_records();
+        let mut record: Value = serde_json::from_str(&records[2]).unwrap();
+        record["effective"] = json!("ready_batch_serial_fallback");
+        record["executor_batches"] = json!(1);
+        record["serial_batches"] = json!(1);
+        record["native_batches"] = json!(0);
+        record["budget_fallback_batches"] = json!(0);
+        record["max_native_worker_count"] = json!(0);
+        record["host_available_parallelism"] = json!(1);
+        record["ready_batches"] = json!([{
+            "ordinal": 0,
+            "job_count": 2,
+            "estimated_work_bytes": 1,
+            "work_estimate_status": "available",
+            "work_gate_evaluated": true,
+            "parallelism_gate_evaluated": true,
+            "budget_gate_evaluated": false,
+            "available_parallelism": 1,
+            "selected_worker_count": 1,
+            "leased_worker_count": null,
+            "budget_acquisition_result": "not_evaluated",
+            "selected_mode": "serial",
+            "selection_reason": "insufficient_available_parallelism",
+            "static_chunk_size": null,
+            "static_chunks": null,
+        }]);
+        records[2] = serde_json::to_string(&record).unwrap();
+        records
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn mutate_detailed_route_record(records: &[String], mutation: fn(&mut Value)) -> Vec<String> {
+        let mut records = records.to_vec();
+        let mut record: Value = serde_json::from_str(&records[2]).unwrap();
+        mutation(&mut record);
+        records[2] = serde_json::to_string(&record).unwrap();
+        records
+    }
+
+    fn prepare_test_route_sink(
+        destination: &std::path::Path,
+        selected_route_index: usize,
+    ) -> IssuanceBenchmarkRouteSink {
+        let routes = qualification_routes(&issuance_benchmark_cases());
+        let selector = routes[selected_route_index].benchmark_id.clone();
+        let arguments = qualification_arguments(&selector);
+        prepare_issuance_route_sink(
+            Some(destination.as_os_str().to_owned()),
+            Some(OsString::from(selector)),
+            &arguments,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn replace_route_field(record: &str, field: &str, value: Value) -> String {
+        let mut record: Value = serde_json::from_str(record).unwrap();
+        record
+            .as_object_mut()
             .unwrap()
-            .unwrap();
-        sink.finish(&records).unwrap();
+            .insert(field.to_owned(), value);
+        serde_json::to_string(&record).unwrap()
+    }
 
-        let bytes = std::fs::read(&destination).unwrap();
-        assert!(!bytes.starts_with(&[0xef, 0xbb, 0xbf]));
-        assert_eq!(bytes.last(), Some(&b'\n'));
-        assert!(!bytes.contains(&b'\r'));
-        assert_eq!(
-            String::from_utf8(bytes).unwrap(),
-            format!("{}\n", records.join("\n"))
+    fn assert_invalid_route_matrix(records: &[String], label: &str) {
+        let destination = unique_route_path(label);
+        let selected_id = qualification_routes(&issuance_benchmark_cases())[0]
+            .benchmark_id
+            .clone();
+        let sink = prepare_test_route_sink(&destination, 0);
+        let result = sink.finish(records);
+        assert!(
+            result.is_err(),
+            "invalid route matrix {label} must be rejected"
         );
-
-        let error =
-            prepare_issuance_route_sink(Some(destination.clone().into_os_string())).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!error.to_string().contains(&selected_id));
+        assert!(std::fs::read(&destination).unwrap().is_empty());
         std::fs::remove_file(destination).unwrap();
     }
 
     #[test]
-    fn route_sink_rejects_incomplete_ambiguous_or_wrong_id_evidence_before_writing() {
-        let records = minimal_route_records();
-        let invalid_sets = [
-            records[..records.len() - 1].to_vec(),
+    fn route_sink_is_optional_and_requires_selector_destination_coupling() {
+        assert!(prepare_issuance_route_sink(None, None, &[])
+            .unwrap()
+            .is_none());
+
+        let destination = unique_route_path("coupling");
+        let selector = qualification_routes(&issuance_benchmark_cases())[0]
+            .benchmark_id
+            .clone();
+        let arguments = qualification_arguments(&selector);
+        for result in [
+            prepare_issuance_route_sink(
+                Some(destination.clone().into_os_string()),
+                None,
+                &arguments,
+            ),
+            prepare_issuance_route_sink(None, Some(OsString::from(selector.clone())), &arguments),
+        ] {
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(!error.to_string().contains(&selector));
+        }
+        assert!(!destination.exists());
+
+        let error = prepare_issuance_route_sink(
+            Some(OsString::from("relative.ndjson")),
+            Some(OsString::from(selector.clone())),
+            &arguments,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!error.to_string().contains(&selector));
+    }
+
+    #[test]
+    fn route_sink_rejects_unknown_partial_and_case_drift_selectors_without_disclosure() {
+        let routes = qualification_routes(&issuance_benchmark_cases());
+        let canonical = routes[0].benchmark_id.clone();
+        let selectors = [
+            "sd_jwt_issuance/v2__s_ea__r_so__p_s__d_0__n_9999".to_owned(),
+            canonical[..canonical.len() - 1].to_owned(),
+            canonical.to_uppercase(),
+        ];
+        for (ordinal, selector) in selectors.into_iter().enumerate() {
+            let destination = unique_route_path(&format!("selector-{ordinal}"));
+            let arguments = qualification_arguments(&selector);
+            let error = prepare_issuance_route_sink(
+                Some(destination.clone().into_os_string()),
+                Some(OsString::from(selector.clone())),
+                &arguments,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(!error.to_string().contains(&selector));
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn route_sink_requires_the_complete_literal_criterion_invocation() {
+        let selector = qualification_routes(&issuance_benchmark_cases())[0]
+            .benchmark_id
+            .clone();
+        let canonical = qualification_arguments(&selector);
+        let invalid_arguments = [
             {
-                let mut multiline = records.clone();
-                multiline[0].push('\n');
-                multiline
+                let mut arguments = canonical.clone();
+                arguments.remove(3);
+                arguments
             },
             {
-                let mut duplicate = records.clone();
-                duplicate[0] = duplicate[1].clone();
-                duplicate
+                let mut arguments = canonical.clone();
+                arguments.insert(1, OsString::from("--exact"));
+                arguments
             },
             {
-                let mut wrong_schema = records.clone();
-                wrong_schema[0] = serde_json::to_string(&json!({
-                    "schema": "sd_jwt_issuance_route_unknown",
-                    "benchmark_id": qualification_criterion_ids(&issuance_benchmark_cases())[0],
-                }))
-                .unwrap();
-                wrong_schema
+                let mut arguments = canonical.clone();
+                arguments.push(OsString::from("--verbose"));
+                arguments
+            },
+            {
+                let mut arguments = canonical.clone();
+                arguments[1] = OsString::from("--Exact");
+                arguments
+            },
+            {
+                let mut arguments = canonical.clone();
+                arguments[2] = OsString::from(
+                    qualification_routes(&issuance_benchmark_cases())[1]
+                        .benchmark_id
+                        .clone(),
+                );
+                arguments
+            },
+            {
+                let mut arguments = canonical.clone();
+                arguments.swap(3, 5);
+                arguments
             },
         ];
 
-        for (ordinal, invalid) in invalid_sets.into_iter().enumerate() {
-            let destination = unique_route_path(&format!("invalid-{ordinal}"));
-            let sink = prepare_issuance_route_sink(Some(destination.clone().into_os_string()))
-                .unwrap()
-                .unwrap();
-            let error = sink.finish(&invalid).unwrap_err();
-            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-            assert!(std::fs::read(&destination).unwrap().is_empty());
+        for (ordinal, arguments) in invalid_arguments.into_iter().enumerate() {
+            let destination = unique_route_path(&format!("arguments-{ordinal}"));
+            let error = prepare_issuance_route_sink(
+                Some(destination.clone().into_os_string()),
+                Some(OsString::from(selector.clone())),
+                &arguments,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(!error.to_string().contains(&selector));
+            assert!(!destination.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    fn non_utf8_os_string() -> OsString {
+        use std::os::unix::ffi::OsStringExt;
+
+        OsString::from_vec(vec![0xff])
+    }
+
+    #[cfg(windows)]
+    fn non_utf8_os_string() -> OsString {
+        use std::os::windows::ffi::OsStringExt;
+
+        OsString::from_wide(&[0xd800])
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn route_sink_rejects_non_utf8_selector_and_arguments() {
+        let destination = unique_route_path("non-utf8");
+        let selector = qualification_routes(&issuance_benchmark_cases())[0]
+            .benchmark_id
+            .clone();
+        let arguments = qualification_arguments(&selector);
+        let selector_error = prepare_issuance_route_sink(
+            Some(destination.clone().into_os_string()),
+            Some(non_utf8_os_string()),
+            &arguments,
+        )
+        .unwrap_err();
+        assert_eq!(selector_error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!destination.exists());
+
+        let mut invalid_arguments = arguments;
+        invalid_arguments[0] = non_utf8_os_string();
+        let argument_error = prepare_issuance_route_sink(
+            Some(destination.clone().into_os_string()),
+            Some(OsString::from(selector.clone())),
+            &invalid_arguments,
+        )
+        .unwrap_err();
+        assert_eq!(argument_error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!argument_error.to_string().contains(&selector));
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn route_sink_projects_exact_first_middle_and_last_records_once() {
+        assert_eq!(MAX_ISSUANCE_ROUTE_ARTIFACT_BYTES, 1_048_576);
+        let records = minimal_route_records();
+        for selected_route_index in [0, records.len() / 2, records.len() - 1] {
+            let destination = unique_route_path(&format!("selected-{selected_route_index}"));
+            let sink = prepare_test_route_sink(&destination, selected_route_index);
+            sink.finish(&records).unwrap();
+
+            let bytes = std::fs::read(&destination).unwrap();
+            assert!(!bytes.starts_with(&[0xef, 0xbb, 0xbf]));
+            assert_eq!(bytes.last(), Some(&b'\n'));
+            assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
+            assert!(!bytes.contains(&b'\r'));
+            assert!(bytes.len() <= MAX_ISSUANCE_ROUTE_ARTIFACT_BYTES);
+            assert_eq!(
+                String::from_utf8(bytes.clone()).unwrap(),
+                format!("{}\n", records[selected_route_index])
+            );
+
+            let routes = qualification_routes(&issuance_benchmark_cases());
+            let selector = routes[selected_route_index].benchmark_id.clone();
+            let arguments = qualification_arguments(&selector);
+            let error = prepare_issuance_route_sink(
+                Some(destination.clone().into_os_string()),
+                Some(OsString::from(selector)),
+                &arguments,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(std::fs::read(&destination).unwrap(), bytes);
             std::fs::remove_file(destination).unwrap();
         }
+    }
+
+    #[test]
+    fn route_sink_rejects_malformed_incomplete_duplicate_extra_and_drifted_matrices() {
+        let records = minimal_route_records();
+        let mut invalid_sets = Vec::new();
+
+        invalid_sets.push(records[..records.len() - 1].to_vec());
+        invalid_sets.push({
+            let mut extra = records.clone();
+            extra.push(records[0].clone());
+            extra
+        });
+        invalid_sets.push({
+            let mut malformed = records.clone();
+            malformed[records.len() - 1] = "{".to_owned();
+            malformed
+        });
+        invalid_sets.push({
+            let mut multiline = records.clone();
+            multiline[1].push('\n');
+            multiline
+        });
+        invalid_sets.push({
+            let mut duplicate = records.clone();
+            duplicate[3] = duplicate[2].clone();
+            duplicate
+        });
+        invalid_sets.push({
+            let mut reordered = records.clone();
+            reordered.swap(4, 5);
+            reordered
+        });
+        invalid_sets.push({
+            let mut wrong_schema = records.clone();
+            wrong_schema[6] = replace_route_field(
+                &wrong_schema[6],
+                "schema",
+                json!("sd_jwt_issuance_route_unknown"),
+            );
+            wrong_schema
+        });
+        invalid_sets.push({
+            let mut wrong_id = records.clone();
+            wrong_id[7] = replace_route_field(
+                &wrong_id[7],
+                "benchmark_id",
+                json!("sd_jwt_issuance/v2__unknown"),
+            );
+            wrong_id
+        });
+        invalid_sets.push({
+            let mut partial_id = records.clone();
+            let id = qualification_routes(&issuance_benchmark_cases())[8]
+                .benchmark_id
+                .clone();
+            partial_id[8] =
+                replace_route_field(&partial_id[8], "benchmark_id", json!(&id[..id.len() - 1]));
+            partial_id
+        });
+        invalid_sets.push({
+            let mut case_drift = records.clone();
+            let id = qualification_routes(&issuance_benchmark_cases())[9]
+                .benchmark_id
+                .to_uppercase();
+            case_drift[9] = replace_route_field(&case_drift[9], "benchmark_id", json!(id));
+            case_drift
+        });
+        invalid_sets.push({
+            let mut missing = records.clone();
+            let mut value: Value = serde_json::from_str(&missing[10]).unwrap();
+            value.as_object_mut().unwrap().remove("requested");
+            missing[10] = serde_json::to_string(&value).unwrap();
+            missing
+        });
+        invalid_sets.push({
+            let mut unknown = records.clone();
+            let mut value: Value = serde_json::from_str(&unknown[11]).unwrap();
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert("unexpected".to_owned(), json!(true));
+            unknown[11] = serde_json::to_string(&value).unwrap();
+            unknown
+        });
+        invalid_sets.push({
+            let mut route_swapped = records.clone();
+            route_swapped[2] =
+                replace_route_field(&route_swapped[2], "requested", json!("serial_oracle"));
+            route_swapped
+        });
+        invalid_sets.push({
+            let mut fixture_mismatch = records.clone();
+            fixture_mismatch[12] =
+                replace_route_field(&fixture_mismatch[12], "fixture_id", json!("payload_wrong"));
+            fixture_mismatch
+        });
+        invalid_sets.push({
+            let mut stage_mismatch = records.clone();
+            stage_mismatch[13] =
+                replace_route_field(&stage_mismatch[13], "stage", json!("executor_assembly"));
+            stage_mismatch
+        });
+        invalid_sets.push({
+            let mut non_compact = records.clone();
+            non_compact[14].insert(0, ' ');
+            non_compact
+        });
+        invalid_sets.push({
+            let mut wrong_effective = records.clone();
+            wrong_effective[0] =
+                replace_route_field(&wrong_effective[0], "effective", json!("bounded_native"));
+            wrong_effective
+        });
+        invalid_sets.push({
+            let mut wrong_nullability = records.clone();
+            wrong_nullability[1] =
+                replace_route_field(&wrong_nullability[1], "executor_batches", json!(0));
+            wrong_nullability
+        });
+        invalid_sets.push({
+            let mut wrong_count = records.clone();
+            wrong_count[2] = replace_route_field(&wrong_count[2], "executor_batches", json!(1));
+            wrong_count
+        });
+        invalid_sets.push({
+            let mut wrong_version = records.clone();
+            wrong_version[3] = replace_route_field(
+                &wrong_version[3],
+                "work_estimator_version",
+                json!("issuance_work_bytes_unknown"),
+            );
+            wrong_version
+        });
+        invalid_sets.push({
+            let mut wrong_worker_cap = records.clone();
+            wrong_worker_cap[4] =
+                replace_route_field(&wrong_worker_cap[4], "worker_cap", json!(999));
+            wrong_worker_cap
+        });
+
+        for (ordinal, invalid) in invalid_sets.into_iter().enumerate() {
+            assert_invalid_route_matrix(&invalid, &format!("invalid-matrix-{ordinal}"));
+        }
+    }
+
+    #[test]
+    fn route_sink_validates_records_after_the_selected_record_before_projection() {
+        let mut records = minimal_route_records();
+        let last = records.len() - 1;
+        records[last] = replace_route_field(&records[last], "requested", json!("serial_oracle"));
+        assert_invalid_route_matrix(&records, "invalid-after-selected");
+    }
+
+    #[test]
+    fn route_sink_rejects_oversize_artifacts_before_writing() {
+        let mut records = minimal_route_records();
+        records[0].push_str(&" ".repeat(MAX_ISSUANCE_ROUTE_ARTIFACT_BYTES));
+        assert!(records[0].len() + 1 > MAX_ISSUANCE_ROUTE_ARTIFACT_BYTES);
+        assert_invalid_route_matrix(&records, "oversize");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn route_sink_accepts_every_selector_reason_and_native_chunk_branch() {
+        let records = detailed_adaptive_route_records();
+        let record: Value = serde_json::from_str(&records[2]).unwrap();
+        for (ordinal, batch) in record["ready_batches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                ready_batch_semantics_are_valid(batch, ordinal, 4, 4),
+                "ready-batch branch {ordinal} must be valid"
+            );
+        }
+        assert!(route_record_semantics_are_valid(
+            &record,
+            &qualification_routes(&issuance_benchmark_cases())[2]
+        ));
+        let destination = unique_route_path("all-dynamic-branches");
+        let sink = prepare_test_route_sink(&destination, 2);
+        sink.finish(&records).unwrap();
+        assert_eq!(
+            String::from_utf8(std::fs::read(&destination).unwrap()).unwrap(),
+            format!("{}\n", records[2])
+        );
+        std::fs::remove_file(destination).unwrap();
+
+        let insufficient_records = insufficient_parallelism_route_records();
+        let insufficient_record: Value = serde_json::from_str(&insufficient_records[2]).unwrap();
+        assert!(ready_batch_semantics_are_valid(
+            &insufficient_record["ready_batches"][0],
+            0,
+            1,
+            4
+        ));
+        let destination = unique_route_path("insufficient-parallelism-branch");
+        let sink = prepare_test_route_sink(&destination, 2);
+        sink.finish(&insufficient_records).unwrap();
+        std::fs::remove_file(destination).unwrap();
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn route_sink_rejects_dynamic_selector_chunk_and_aggregate_drift() {
+        let records = detailed_adaptive_route_records();
+        let mutations: [RouteMutation; 17] = [
+            ("below-jobs", |record| {
+                record["ready_batches"][0]["job_count"] = json!(2);
+            }),
+            ("overflow", |record| {
+                record["ready_batches"][1]["work_estimate_status"] = json!("available");
+            }),
+            ("zero-work", |record| {
+                record["ready_batches"][2]["estimated_work_bytes"] = json!(1);
+            }),
+            ("budget-unavailable", |record| {
+                record["ready_batches"][3]["budget_acquisition_result"] = json!("acquired");
+            }),
+            ("native-ready-ordinal", |record| {
+                record["ready_batches"][4]["ordinal"] = json!(5);
+            }),
+            ("native-static-count", |record| {
+                record["ready_batches"][4]["static_chunks"]
+                    .as_array_mut()
+                    .unwrap()
+                    .pop();
+            }),
+            ("native-static-ordinal", |record| {
+                record["ready_batches"][4]["static_chunks"][1]["ordinal"] = json!(2);
+            }),
+            ("native-static-jobs", |record| {
+                record["ready_batches"][4]["static_chunks"][1]["job_count"] = json!(2);
+            }),
+            ("native-static-work-sum", |record| {
+                record["ready_batches"][4]["static_chunks"][1]["estimated_work_bytes"] = json!(4);
+            }),
+            ("native-lease", |record| {
+                record["ready_batches"][4]["leased_worker_count"] = json!(2);
+            }),
+            ("executor-count", |record| {
+                record["executor_batches"] = json!(6);
+            }),
+            ("serial-count", |record| {
+                record["serial_batches"] = json!(5);
+            }),
+            ("native-count", |record| {
+                record["native_batches"] = json!(2);
+            }),
+            ("budget-count", |record| {
+                record["budget_fallback_batches"] = json!(2);
+            }),
+            ("max-worker", |record| {
+                record["max_native_worker_count"] = json!(2);
+            }),
+            ("effective-route", |record| {
+                record["effective"] = json!("bounded_native");
+            }),
+            ("host-parallelism", |record| {
+                record["host_available_parallelism"] = json!(3);
+            }),
+        ];
+
+        for (label, mutation) in mutations {
+            let invalid = mutate_detailed_route_record(&records, mutation);
+            assert_invalid_route_matrix(&invalid, &format!("dynamic-{label}"));
+        }
+
+        let insufficient_records = insufficient_parallelism_route_records();
+        let invalid = mutate_detailed_route_record(&insufficient_records, |record| {
+            record["ready_batches"][0]["available_parallelism"] = json!(2);
+        });
+        assert_invalid_route_matrix(&invalid, "dynamic-insufficient-parallelism");
     }
 
     #[test]
@@ -1502,6 +2872,13 @@ mod tests {
         assert!(!encoded.ends_with("\n\n"));
         assert!(!encoded.contains('\r'));
         assert_eq!(encoded, issuance_qualification_manifest_json());
+        assert_eq!(
+            Sha256::digest(encoded.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            "04efeb5e52ef19a0278383f9fd8c574f0b0f24941cd5fcd764696a6e496edc1f"
+        );
 
         let manifest: Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(

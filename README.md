@@ -48,13 +48,15 @@ manifest without enabling the production adaptive route:
 cargo run --features issuance_bench --example issuance_qualification_manifest -- --output /absolute/new/manifest.json
 ```
 
-The output path must be absolute and must not already exist. To retain the
-aggregate preflight route records produced by the issuance Criterion target,
-set `SD_JWT_ISSUANCE_ROUTE_NDJSON` to a different absolute, nonexistent file
-before starting the benchmark. A successful benchmark process writes exactly
-132 LF-terminated JSON records and durably syncs the file. Route records are
-never mixed into Criterion's standard output; when the variable is absent no
-route-evidence file is created.
+The output path must be absolute and must not already exist. A frozen
+qualification invocation sets both `SD_JWT_ISSUANCE_ROUTE_BENCHMARK_ID` to one
+exact full Criterion ID and `SD_JWT_ISSUANCE_ROUTE_NDJSON` to a different
+absolute, nonexistent file. The harness constructs and validates all 132
+preflight records in canonical registration order, then writes only the
+selected compact record plus one LF. The artifact is capped at 1 MiB, flushed,
+and durably synced. Supplying only one variable, using a noncanonical selector,
+or changing the frozen Criterion arguments fails closed. When both variables
+are absent, no route-evidence file is created.
 
 ### Interoperability testing tool
 See [Generate tool README](./generate/README.md) document.
