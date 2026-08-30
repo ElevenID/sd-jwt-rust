@@ -11,7 +11,6 @@ use base64::Engine;
 use error::Result;
 #[cfg(feature = "mock_salts")]
 use lazy_static::lazy_static;
-use rand::prelude::ThreadRng;
 use rand::RngCore;
 use serde_json::Value;
 use sha2::Digest;
@@ -48,10 +47,17 @@ pub fn base64url_decode(b64data: &str) -> Result<Vec<u8>> {
         .map_err(|e| Error::DeserializationError(e.to_string()))
 }
 
-pub(crate) fn generate_salt() -> String {
+pub(crate) fn generate_salt_with_rng<R>(rng: &mut R) -> String
+where
+    R: RngCore + ?Sized,
+{
     let mut buf = [0u8; 16];
-    ThreadRng::default().fill_bytes(&mut buf);
+    rng.fill_bytes(&mut buf);
     base64url_encode(&buf)
+}
+
+pub(crate) fn generate_salt() -> String {
+    generate_salt_with_rng(&mut rand::thread_rng())
 }
 
 #[cfg(feature = "mock_salts")]
@@ -83,6 +89,61 @@ pub(crate) fn jwt_payload_decode(b64data: &str) -> Result<serde_json::Map<String
         .map_err(|e| DeserializationError(e.to_string()))?,
     )
     .map_err(|e| DeserializationError(e.to_string()))
+}
+
+#[cfg(test)]
+mod salt_tests {
+    use super::{base64url_decode, generate_salt_with_rng};
+    use rand::{Error as RandError, RngCore};
+
+    #[derive(Default)]
+    struct InstrumentedRng {
+        fill_lengths: Vec<usize>,
+        next_byte: u8,
+    }
+
+    impl RngCore for InstrumentedRng {
+        fn next_u32(&mut self) -> u32 {
+            panic!("salt generation must request bytes directly")
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            panic!("salt generation must request bytes directly")
+        }
+
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            self.fill_lengths.push(dest.len());
+            for byte in dest {
+                *byte = self.next_byte;
+                self.next_byte = self.next_byte.wrapping_add(1);
+            }
+        }
+
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), RandError> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn caller_owned_rng_supplies_one_ordered_16_byte_draw_per_salt() {
+        let mut rng = InstrumentedRng::default();
+
+        let first = generate_salt_with_rng(&mut rng);
+        let second = generate_salt_with_rng(&mut rng);
+
+        assert_eq!(rng.fill_lengths, [16, 16]);
+        assert_eq!(
+            base64url_decode(&first).expect("first salt must be Base64url"),
+            (0..16).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            base64url_decode(&second).expect("second salt must be Base64url"),
+            (16..32).collect::<Vec<_>>()
+        );
+        assert_eq!(first.len(), 22);
+        assert_eq!(second.len(), 22);
+    }
 }
 
 #[cfg(all(test, feature = "mock_salts"))]
