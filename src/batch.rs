@@ -18,7 +18,7 @@ use crate::disclosure_preprocessing::{
 };
 use crate::error::{Error, Result};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -167,10 +167,22 @@ impl DisclosureVerificationExecutor for SerialDisclosureVerificationExecutor {
         jobs: &[DisclosureVerificationJob<'a>],
     ) -> Result<Vec<DisclosureVerificationOutcome<'a>>> {
         let mut outcomes = Vec::with_capacity(jobs.len());
+        let mut credential = None;
+        let mut observed_digests = HashSet::new();
         for job in jobs {
-            let outcome = job.process();
-            match outcome.result {
-                Some(Ok(_)) => outcomes.push(outcome),
+            if credential != Some(job.id.credential) {
+                credential = Some(job.id.credential);
+                observed_digests.clear();
+            }
+            let mut outcome = job.process();
+            match outcome.result.take() {
+                Some(Ok(processed)) => {
+                    if !observed_digests.insert(processed.digest.clone()) {
+                        return Err(Error::DuplicateDigestError(processed.digest));
+                    }
+                    outcome.result = Some(Ok(processed));
+                    outcomes.push(outcome);
+                }
                 Some(Err(error)) => return Err(error),
                 None => return Err(batch_contract_error("job returned no result")),
             }
@@ -491,6 +503,49 @@ mod tests {
                 actual.ordered_disclosure_digests,
                 expected.ordered_disclosure_digests
             );
+        }
+    }
+
+    #[test]
+    fn serial_batch_error_precedence_exactly_matches_single_credential_oracle() {
+        const INVALID_BASE64_DISCLOSURE: &str = "%";
+        const INVALID_JSON_DISCLOSURE: &str = "ew";
+
+        for disclosures in [
+            owned(&[
+                OBJECT_DISCLOSURE,
+                OBJECT_DISCLOSURE,
+                INVALID_JSON_DISCLOSURE,
+            ]),
+            owned(&[
+                OBJECT_DISCLOSURE,
+                OBJECT_DISCLOSURE,
+                INVALID_BASE64_DISCLOSURE,
+            ]),
+            owned(&[
+                INVALID_JSON_DISCLOSURE,
+                OBJECT_DISCLOSURE,
+                OBJECT_DISCLOSURE,
+            ]),
+            owned(&[
+                INVALID_BASE64_DISCLOSURE,
+                OBJECT_DISCLOSURE,
+                OBJECT_DISCLOSURE,
+            ]),
+            owned(&[INVALID_JSON_DISCLOSURE, INVALID_BASE64_DISCLOSURE]),
+            owned(&[INVALID_BASE64_DISCLOSURE, INVALID_JSON_DISCLOSURE]),
+        ] {
+            let expected = preprocess_disclosures_serial(&disclosures).unwrap_err();
+            let actual = preprocess_disclosure_verification_batch(&[CredentialDisclosures::new(
+                &disclosures,
+            )])
+            .unwrap_err();
+
+            assert_eq!(
+                std::mem::discriminant(&actual),
+                std::mem::discriminant(&expected)
+            );
+            assert_eq!(actual.to_string(), expected.to_string());
         }
     }
 
