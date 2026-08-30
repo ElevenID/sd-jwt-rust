@@ -15,6 +15,7 @@ use jsonwebtoken::EncodingKey;
 use rand::{Error as RandError, RngCore};
 use serde_json::{json, Value};
 use std::cell::Cell;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 #[cfg(not(feature = "mock_salts"))]
 use std::{collections::VecDeque, ops::Range};
 
@@ -107,6 +108,65 @@ fn nested_claims() -> Value {
         "address": { "city": "Denver" },
         "roles": ["admin"]
     })
+}
+
+fn assert_public_unicode_issuance(
+    claims: Value,
+    strategy: ClaimsForSelectiveDisclosureStrategy<'_>,
+    expected_disclosed_value: Value,
+) {
+    let mut issuer = new_issuer();
+    let issuance = catch_unwind(AssertUnwindSafe(|| {
+        issuer.issue_sd_jwt(
+            claims,
+            strategy,
+            None,
+            false,
+            SDJWTSerializationFormat::Compact,
+        )
+    }));
+    issuance
+        .expect("supplementary Unicode must not panic")
+        .expect("supplementary Unicode issuance must succeed");
+
+    assert_eq!(issuer.all_disclosures.len(), 1);
+    let decoded = String::from_utf8(
+        base64url_decode(&issuer.all_disclosures[0].raw_b64)
+            .expect("disclosure must be valid Base64url"),
+    )
+    .expect("disclosure must be UTF-8 JSON");
+    assert!(decoded.contains(r"\ud83d\ude00"));
+    let disclosure: Value = serde_json::from_str(&decoded).expect("disclosure must be valid JSON");
+    assert_eq!(disclosure[2], expected_disclosed_value);
+}
+
+#[test]
+fn public_issuance_accepts_direct_supplementary_unicode() {
+    assert_public_unicode_issuance(
+        json!({ "claim": "\u{1f600}" }),
+        ClaimsForSelectiveDisclosureStrategy::AllLevels,
+        json!("\u{1f600}"),
+    );
+}
+
+#[test]
+fn public_issuance_accepts_parsed_json_surrogate_pair() {
+    let claims = serde_json::from_str(r#"{"claim":"\ud83d\ude00"}"#)
+        .expect("surrogate-pair JSON fixture must parse");
+    assert_public_unicode_issuance(
+        claims,
+        ClaimsForSelectiveDisclosureStrategy::AllLevels,
+        json!("\u{1f600}"),
+    );
+}
+
+#[test]
+fn public_issuance_accepts_supplementary_unicode_in_selected_subtree() {
+    assert_public_unicode_issuance(
+        json!({ "profile": { "emoji": "\u{1f600}" } }),
+        ClaimsForSelectiveDisclosureStrategy::TopLevel,
+        json!({ "emoji": "\u{1f600}" }),
+    );
 }
 
 #[cfg(not(feature = "mock_salts"))]
