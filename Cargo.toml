@@ -17,7 +17,7 @@ parallel = []
 # issuance executor. This opt-in feature exposes only the deterministic
 # benchmark fixture; ordinary builds, including `parallel`-only builds, do not
 # compile the fixture or alter production routing.
-issuance_bench = ["parallel"]
+issuance_bench = ["parallel", "dep:libc", "dep:winapi-util"]
 
 [dependencies]
 base64 = "0.21"
@@ -38,6 +38,12 @@ getrandom = { version = "0.2", features = ["js"] }
 js-sys = "=0.3.69"
 wasm-bindgen = "=0.2.92"
 
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+winapi-util = { version = "0.1.6", optional = true }
+
 [dev-dependencies]
 criterion = { version = "=0.5.1", default-features = false }
 rstest = "0.18.2"
@@ -50,6 +56,10 @@ harness = false
 [[bench]]
 name = "sd_jwt_issuance"
 harness = false
+required-features = ["issuance_bench"]
+
+[[test]]
+name = "issuance_launch_barrier_fixed_binary"
 required-features = ["issuance_bench"]
 
 [[example]]

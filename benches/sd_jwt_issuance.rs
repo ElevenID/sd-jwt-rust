@@ -2,12 +2,13 @@
 // https://www.dsr-corporation.com
 // SPDX-License-Identifier: Apache-2.0
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use criterion::{black_box, criterion_group, BatchSize, Criterion, Throughput};
 use jsonwebtoken::EncodingKey;
 use sd_jwt_rs::issuer::issuance_benchmark::{
-    issuance_benchmark_cases, prepare_issuance_route_sink_from_env, IssuanceBenchmarkFixture,
-    IssuanceBenchmarkRoute, IssuanceBenchmarkRouteRecord, IssuanceBenchmarkStage,
-    ISSUANCE_BENCHMARK_GROUP_ID, ISSUANCE_BENCHMARK_ID_COUNT,
+    issuance_benchmark_cases, prepare_issuance_route_sink_from_env,
+    run_issuance_launch_barrier_from_env, IssuanceBenchmarkFixture, IssuanceBenchmarkRoute,
+    IssuanceBenchmarkRouteRecord, IssuanceBenchmarkStage, ISSUANCE_BENCHMARK_GROUP_ID,
+    ISSUANCE_BENCHMARK_ID_COUNT,
 };
 
 const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
@@ -118,4 +119,15 @@ fn benchmark_issuance(c: &mut Criterion) {
 }
 
 criterion_group!(benches, benchmark_issuance);
-criterion_main!(benches);
+
+fn main() {
+    if let Err(error) = run_issuance_launch_barrier_from_env() {
+        eprintln!("SD-JWT issuance launch barrier rejected: {error}");
+        std::process::exit(2);
+    }
+
+    // `benches` constructs Criterion internally. Keep it after the complete
+    // token/ready/release/receipt exchange above.
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+}

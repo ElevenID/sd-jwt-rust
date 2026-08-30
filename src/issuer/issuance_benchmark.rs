@@ -32,6 +32,10 @@ use super::{
 use crate::error::{Error, Result};
 use crate::SDJWTSerializationFormat;
 
+mod launch_barrier;
+
+pub use launch_barrier::run_issuance_launch_barrier_from_env;
+
 /// Disclosure counts shared by every required payload class.
 pub const ISSUANCE_DISCLOSURE_COUNTS: [usize; 5] = [1, 8, 32, 128, 512];
 

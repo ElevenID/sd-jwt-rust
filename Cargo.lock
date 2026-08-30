@@ -1020,6 +1020,7 @@ dependencies = [
  "js-sys",
  "jsonwebtoken",
  "lazy_static",
+ "libc",
  "log",
  "rand",
  "regex",
@@ -1030,6 +1031,7 @@ dependencies = [
  "strum",
  "thiserror 1.0.69",
  "wasm-bindgen",
+ "winapi-util",
 ]
 
 [[package]]
