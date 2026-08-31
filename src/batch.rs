@@ -411,6 +411,10 @@ fn batch_contract_error(message: impl Into<String>) -> Error {
 mod tests {
     use super::*;
     use crate::disclosure_preprocessing::preprocess_disclosures_serial;
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+    use crate::disclosure_preprocessing::{
+        process_wide_disclosure_worker_budget, MAX_PARALLEL_WORKERS,
+    };
     use serde_json::json;
 
     const OBJECT_DISCLOSURE: &str = "WyJzYWx0IiwibmFtZSIsIkFsaWNlIl0";
@@ -434,6 +438,16 @@ mod tests {
                 "debug output leaked {sensitive}"
             );
         }
+    }
+
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+    #[test]
+    fn single_and_cross_credential_paths_share_native_worker_budget() {
+        let single_credential = process_wide_disclosure_worker_budget();
+        let cross_credential = process_wide_disclosure_worker_budget();
+
+        assert!(std::ptr::eq(single_credential, cross_credential));
+        assert_eq!(MAX_PARALLEL_WORKERS, 4);
     }
 
     #[test]
