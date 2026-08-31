@@ -18,7 +18,7 @@ const PARALLEL_MIN_DISCLOSURES: usize = 128;
 #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
 const PARALLEL_MIN_TOTAL_ENCODED_BYTES: usize = 1024 * 1024;
 #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
-const MAX_PARALLEL_WORKERS: usize = 4;
+pub(crate) const MAX_PARALLEL_WORKERS: usize = 4;
 #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
 const PARALLEL_WORKER_FAILURE: &str = "Disclosure preprocessing executor failure: worker panicked";
 #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
@@ -222,7 +222,7 @@ fn static_chunk_size(job_count: usize, worker_count: usize) -> usize {
 /// preprocessing. When an exact lease is unavailable, the request uses the
 /// serial oracle instead of waiting or changing the measured chunk layout.
 #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
-struct ParallelWorkerBudget {
+pub(crate) struct ParallelWorkerBudget {
     available: AtomicUsize,
     capacity: usize,
 }
@@ -236,7 +236,7 @@ impl ParallelWorkerBudget {
         }
     }
 
-    fn try_acquire(&self, worker_count: usize) -> Option<ParallelWorkerLease<'_>> {
+    pub(crate) fn try_acquire(&self, worker_count: usize) -> Option<ParallelWorkerLease<'_>> {
         if worker_count < 2 || worker_count > self.capacity {
             return None;
         }
@@ -271,14 +271,14 @@ impl ParallelWorkerBudget {
 }
 
 #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
-struct ParallelWorkerLease<'a> {
+pub(crate) struct ParallelWorkerLease<'a> {
     budget: &'a ParallelWorkerBudget,
     worker_count: usize,
 }
 
 #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
 impl ParallelWorkerLease<'_> {
-    fn worker_count(&self) -> usize {
+    pub(crate) fn worker_count(&self) -> usize {
         self.worker_count
     }
 }
@@ -300,6 +300,11 @@ impl Drop for ParallelWorkerLease<'_> {
 #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
 static PARALLEL_WORKER_BUDGET: ParallelWorkerBudget =
     ParallelWorkerBudget::new(MAX_PARALLEL_WORKERS);
+
+#[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+pub(crate) fn process_wide_disclosure_worker_budget() -> &'static ParallelWorkerBudget {
+    &PARALLEL_WORKER_BUDGET
+}
 
 #[cfg(all(test, feature = "parallel", target_arch = "x86_64"))]
 std::thread_local! {
@@ -459,7 +464,7 @@ pub(super) fn preprocess_disclosures(encoded_disclosures: &[String]) -> Result<D
     {
         preprocess_disclosures_with_budget_and_thread_supplier(
             encoded_disclosures,
-            &PARALLEL_WORKER_BUDGET,
+            process_wide_disclosure_worker_budget(),
             available_worker_threads,
         )
     }
@@ -1240,25 +1245,28 @@ mod tests {
 
     #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
     #[test]
-    fn parallel_worker_budget_caps_overlapping_exact_leases() {
+    fn parallel_worker_budget_caps_overlapping_single_and_cross_credential_leases() {
         let budget = ParallelWorkerBudget::new(MAX_PARALLEL_WORKERS);
 
-        let first = budget.try_acquire(3).unwrap();
-        assert_eq!(first.worker_count(), 3);
+        let single_credential = budget.try_acquire(3).unwrap();
+        assert_eq!(single_credential.worker_count(), 3);
         assert_eq!(budget.available(), 1);
-        assert!(budget.try_acquire(2).is_none());
+        let cross_credential = budget.try_acquire(2);
+        assert!(cross_credential.is_none());
         assert_eq!(budget.available(), 1);
-        drop(first);
+        drop(single_credential);
         assert_eq!(budget.available(), MAX_PARALLEL_WORKERS);
 
-        let second = budget.try_acquire(2).unwrap();
-        let third = budget.try_acquire(2).unwrap();
+        let cross_credential = budget.try_acquire(2).unwrap();
+        let single_credential = budget.try_acquire(2).unwrap();
+        assert_eq!(cross_credential.worker_count(), 2);
+        assert_eq!(single_credential.worker_count(), 2);
         assert_eq!(budget.available(), 0);
         assert!(budget.try_acquire(2).is_none());
 
-        drop(second);
+        drop(cross_credential);
         assert_eq!(budget.available(), 2);
-        drop(third);
+        drop(single_credential);
         assert_eq!(budget.available(), MAX_PARALLEL_WORKERS);
     }
 
