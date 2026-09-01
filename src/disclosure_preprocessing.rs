@@ -215,7 +215,7 @@ impl NativeParallelDisclosureExecutor {
 fn static_chunk_size(job_count: usize, worker_count: usize) -> usize {
     debug_assert!(job_count > 0);
     debug_assert!(worker_count > 0);
-    job_count / worker_count + usize::from(job_count % worker_count != 0)
+    job_count / worker_count + usize::from(!job_count.is_multiple_of(worker_count))
 }
 
 /// A non-blocking, process-wide cap on OS threads spawned by disclosure
@@ -590,7 +590,7 @@ where
         current_chunk_bytes = current_chunk_bytes.saturating_add(encoded_length as u128);
         observed_count += 1;
 
-        if observed_count % chunk_size == 0 {
+        if observed_count.is_multiple_of(chunk_size) {
             largest_chunk_bytes = largest_chunk_bytes.max(current_chunk_bytes);
             current_chunk_bytes = 0;
         }
@@ -879,7 +879,7 @@ mod tests {
                 Self::Medium => json!({
                     "ordinal": ordinal,
                     "profile": {
-                        "active": ordinal % 2 == 0,
+                        "active": ordinal.is_multiple_of(2),
                         "display_name": format!("Credential subject {ordinal}"),
                         "notes": "medium-payload-".repeat(64),
                     },
