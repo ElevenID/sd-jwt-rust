@@ -776,10 +776,10 @@ fn route_record_has_canonical_shape(value: &Value) -> bool {
             return false;
         };
         static_chunks.is_null()
-            || static_chunks.as_array().map_or(false, |chunks| {
+            || static_chunks.as_array().is_some_and(|chunks| {
                 chunks.iter().all(|chunk| {
                     has_exact_keys(chunk, &ISSUANCE_STATIC_CHUNK_FIELDS)
-                        && chunk.as_object().map_or(false, |chunk| {
+                        && chunk.as_object().is_some_and(|chunk| {
                             ISSUANCE_STATIC_CHUNK_FIELDS
                                 .iter()
                                 .all(|field| chunk.get(*field).and_then(Value::as_u64).is_some())
@@ -1204,7 +1204,7 @@ fn validated_selected_route_payload(
         if record
             .len()
             .checked_add(1)
-            .map_or(true, |size| size > MAX_ISSUANCE_ROUTE_ARTIFACT_BYTES)
+            .is_none_or(|size| size > MAX_ISSUANCE_ROUTE_ARTIFACT_BYTES)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
