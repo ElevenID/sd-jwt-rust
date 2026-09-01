@@ -52,7 +52,7 @@ impl SDJWTDisclosure {
         let data = if let Some(key) = &key {
             format!(r#"["{}", {}, {}]"#, salt, escape_json(key), value_str)
         } else {
-            format!(r#"["{}", {}]"#, salt, value_str)
+            format!(r#"["{salt}", {value_str}]"#)
         };
 
         let raw_b64 = base64url_encode(data.as_bytes());

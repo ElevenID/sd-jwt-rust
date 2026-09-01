@@ -476,7 +476,7 @@ mod tests {
                 SDJWTSerializationFormat::Compact,
             )
             .unwrap();
-        trace!("{:?}", sd_jwt)
+        trace!("{sd_jwt:?}")
     }
 
     #[test]

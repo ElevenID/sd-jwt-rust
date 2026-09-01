@@ -125,7 +125,7 @@ impl SDJWTVerifier {
         // present it must be honored; jsonwebtoken leaves `validate_nbf` off.
         validation.validate_nbf = true;
         let claims = jsonwebtoken::decode(sd_jwt, &issuer_public_key, &validation)
-            .map_err(|e| Error::DeserializationError(format!("Cannot decode jwt: {}", e)))?
+            .map_err(|e| Error::DeserializationError(format!("Cannot decode jwt: {e}")))?
             .claims;
 
         let _ = sign_alg; //FIXME check algo
@@ -276,8 +276,7 @@ impl SDJWTVerifier {
         for disclosure_hash in &self.sd_jwt_engine.ordered_disclosure_digests {
             if !self.duplicate_hash_check.contains(disclosure_hash.as_str()) {
                 return Err(Error::InvalidDisclosure(format!(
-                    "Disclosure was not referenced by any digest in the SD-JWT: {}",
-                    disclosure_hash
+                    "Disclosure was not referenced by any digest in the SD-JWT: {disclosure_hash}"
                 )));
             }
         }
@@ -290,8 +289,7 @@ impl SDJWTVerifier {
             Value::Object(obj) => {
                 if obj.contains_key(DIGEST_ALG_KEY) {
                     return Err(Error::DataFieldMismatch(format!(
-                        "`{}` is only allowed at the top level of the SD-JWT payload",
-                        DIGEST_ALG_KEY
+                        "`{DIGEST_ALG_KEY}` is only allowed at the top level of the SD-JWT payload"
                     )));
                 }
                 obj.values().try_for_each(Self::reject_nested_sd_alg)
@@ -395,8 +393,7 @@ impl SDJWTVerifier {
                         ))?;
                 if disclosure.len() != 3 {
                     return Err(Error::InvalidDisclosure(format!(
-                        "Object-property Disclosure must be a 3-element array [salt, name, value]: {}",
-                        value_for_digest
+                        "Object-property Disclosure must be a 3-element array [salt, name, value]: {value_for_digest}"
                     )));
                 }
                 let key = disclosure[1]
@@ -405,8 +402,7 @@ impl SDJWTVerifier {
                     .to_owned();
                 if key == SD_DIGESTS_KEY || key == SD_LIST_PREFIX {
                     return Err(Error::InvalidDisclosure(format!(
-                        "Disclosure claim name must not be `_sd` or `...`: {}",
-                        key
+                        "Disclosure claim name must not be `_sd` or `...`: {key}"
                     )));
                 }
                 let value = disclosure[2].clone();
@@ -436,8 +432,7 @@ impl SDJWTVerifier {
                     ))?;
             if disclosure.len() != 2 {
                 return Err(Error::InvalidArrayDisclosureObject(format!(
-                    "Array-element Disclosure must be a 2-element array [salt, value]: {}",
-                    value_for_digest
+                    "Array-element Disclosure must be a 2-element array [salt, value]: {value_for_digest}"
                 )));
             }
 
@@ -1645,11 +1640,7 @@ mod tests {
         let injected = base64url_encode(br#"["unreferencedsalt", "unreferenced_claim", "value"]"#);
         let presentation = presentation.trim_end_matches(COMBINED_SERIALIZATION_FORMAT_SEPARATOR);
         let tampered = format!(
-            "{}{}{}{}",
-            presentation,
-            COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
-            injected,
-            COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
+            "{presentation}{COMBINED_SERIALIZATION_FORMAT_SEPARATOR}{injected}{COMBINED_SERIALIZATION_FORMAT_SEPARATOR}"
         );
 
         let result = SDJWTVerifier::new(
