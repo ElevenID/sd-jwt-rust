@@ -68,7 +68,7 @@ fn medium_value(ordinal: usize) -> Value {
     json!({
         "ordinal": ordinal,
         "profile": {
-            "active": ordinal % 2 == 0,
+            "active": ordinal.is_multiple_of(2),
             "display_name": format!("Credential subject {ordinal}"),
             "notes": "medium-payload-".repeat(64),
         },

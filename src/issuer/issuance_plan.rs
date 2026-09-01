@@ -881,7 +881,7 @@ impl NativeParallelIssuanceExecutor {
 fn static_chunk_size(job_count: usize, worker_count: usize) -> usize {
     debug_assert!(job_count != 0);
     debug_assert!(worker_count != 0);
-    job_count / worker_count + usize::from(job_count % worker_count != 0)
+    job_count / worker_count + usize::from(!job_count.is_multiple_of(worker_count))
 }
 
 #[cfg(all(feature = "parallel", target_arch = "x86_64"))]

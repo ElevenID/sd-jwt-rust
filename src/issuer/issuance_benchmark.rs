@@ -802,7 +802,7 @@ fn checked_ceil_div(value: u64, divisor: u64) -> Option<u64> {
     if divisor == 0 {
         return None;
     }
-    (value / divisor).checked_add(u64::from(value % divisor != 0))
+    (value / divisor).checked_add(u64::from(!value.is_multiple_of(divisor)))
 }
 
 fn ready_batch_serial_tail_is_unevaluated(batch: &Map<String, Value>) -> bool {
@@ -1845,7 +1845,7 @@ fn assert_ready_batch_trace(expected_ordinal: usize, batch: &BenchmarkReadyBatch
             assert_eq!(
                 chunk_size,
                 batch.job_count / selected_worker_count
-                    + usize::from(batch.job_count % selected_worker_count != 0)
+                    + usize::from(!batch.job_count.is_multiple_of(selected_worker_count))
             );
             let chunks = batch
                 .static_chunks
@@ -2060,7 +2060,7 @@ fn medium_value(ordinal: usize) -> Value {
     json!({
         "ordinal": ordinal,
         "profile": {
-            "active": ordinal % 2 == 0,
+            "active": ordinal.is_multiple_of(2),
             "display_name": format!("Credential subject {ordinal}"),
             "notes": "medium-payload-".repeat(64),
         },
