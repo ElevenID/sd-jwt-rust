@@ -150,7 +150,7 @@ impl SDJWTCommon {
         // expected audience is set, so disable that check for the signature step.
         validation.validate_aud = false;
         jsonwebtoken::decode::<Map<String, Value>>(sd_jwt, key, &validation).map_err(|e| {
-            Error::DeserializationError(format!("Issuer signature verification failed: {}", e))
+            Error::DeserializationError(format!("Issuer signature verification failed: {e}"))
         })?;
         Ok(())
     }
@@ -196,8 +196,7 @@ impl SDJWTCommon {
                 for (key, value) in obj.iter() {
                     if key == SD_DIGESTS_KEY || key == SD_LIST_PREFIX {
                         return Err(Error::DataFieldMismatch(format!(
-                            "Claim object cannot have `{}` field",
-                            key
+                            "Claim object cannot have `{key}` field"
                         )));
                     } else {
                         Self::check_for_sd_claim(value)?;
@@ -230,7 +229,7 @@ impl SDJWTCommon {
         let sd_jwt = parts.next().ok_or(Error::IndexOutOfBounds {
             idx: 0,
             length: parts.len(),
-            msg: format!("Invalid SD-JWT: {}", sd_jwt_with_disclosures),
+            msg: format!("Invalid SD-JWT: {sd_jwt_with_disclosures}"),
         })?;
         self.sign_alg = Self::decode_header_and_get_sign_algorithm(sd_jwt);
         let trailing = parts.next_back().unwrap_or("");

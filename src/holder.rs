@@ -397,7 +397,7 @@ impl SDJWTHolder {
             .insert("aud".to_string(), aud.into());
         let timestamp = time::SystemTime::now()
             .duration_since(time::UNIX_EPOCH)
-            .map_err(|e| Error::ConversionError(format!("timestamp: {}", e)))?
+            .map_err(|e| Error::ConversionError(format!("timestamp: {e}")))?
             .as_secs();
         self.key_binding_jwt_payload
             .insert("iat".to_string(), timestamp.into());
@@ -840,7 +840,7 @@ mod tests {
         user_claims["nationalities"] = Value::Array(vec![Value::Bool(true), Value::Bool(true)]);
 
         let issued = sd_jwt.clone();
-        println!("{}", issued);
+        println!("{issued}");
         let presentation = SDJWTHolder::new_unverified(sd_jwt, SDJWTSerializationFormat::Compact)
             .unwrap()
             .create_presentation(
@@ -851,7 +851,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        println!("{}", presentation);
+        println!("{presentation}");
         let mut issued_parts: HashSet<&str> = issued
             .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
             .collect();
