@@ -221,9 +221,13 @@ impl SDJWTIssuer {
     /// Issues a SD-JWT.
     ///
     /// # Arguments
-    /// * `user_claims` - The claims to be included in the SD-JWT.
+    /// * `user_claims` - The claims to be included in the SD-JWT. A top-level
+    ///   `cnf` claim is preserved when `holder_key` is not provided and replaced
+    ///   when it is provided.
     /// * `sd_strategy` - The strategy to be used to determine which claims to be selectively disclosed. See [ClaimsForSelectiveDisclosureStrategy] for more details.
-    /// * `holder_key` - The key used to sign the SD-JWT. If not provided, no key binding is added to the SD-JWT.
+    /// * `holder_key` - The Holder public JWK included in the top-level `cnf`
+    ///   claim for key binding. When provided, it takes precedence over a
+    ///   top-level `cnf` value in `user_claims`.
     /// * `add_decoy_claims` - If true, decoy claims are added to the SD-JWT.
     /// * `serialization_format` - The serialization format to be used for the SD-JWT, see [SDJWTSerializationFormat].
     ///
@@ -321,6 +325,9 @@ impl SDJWTIssuer {
         let claims_obj_ref = user_claims
             .as_object_mut()
             .ok_or(Error::ConversionError("json object".to_string()))?;
+        if self.holder_key.is_some() {
+            claims_obj_ref.shift_remove(CNF_KEY);
+        }
         let always_revealed_root_keys = vec!["iss", "iat", "exp"];
         let mut always_revealed_claims: Map<String, Value> = always_revealed_root_keys
             .into_iter()
@@ -349,8 +356,7 @@ impl SDJWTIssuer {
 
         if let Some(holder_key) = &self.holder_key {
             self.sd_jwt_payload
-                .entry(CNF_KEY)
-                .or_insert_with(|| json!({JWK_KEY: holder_key}));
+                .insert(CNF_KEY.to_owned(), json!({JWK_KEY: holder_key}));
         }
 
         Ok(())
