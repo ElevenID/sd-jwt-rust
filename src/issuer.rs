@@ -6,25 +6,34 @@ use crate::{
     error, SDJWTFlattenedJson, SDJWTGeneralJson, SDJWTGeneralJsonSignature, SDJWTUnprotectedHeader,
 };
 use error::Result;
-use std::collections::{HashMap, VecDeque};
+#[cfg(feature = "issuer-local")]
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::fmt;
 use std::ops::Range;
 use std::str::FromStr;
 use std::vec::Vec;
 
 use jsonwebtoken::jwk::Jwk;
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
+#[cfg(feature = "issuer-local")]
+use jsonwebtoken::EncodingKey;
+use jsonwebtoken::{Algorithm, Header};
 use rand::{rngs::ThreadRng, Rng, RngCore};
+#[cfg(feature = "issuer-local")]
+use serde_json::Map as SJMap;
 use serde_json::Value;
-use serde_json::{json, Map as SJMap, Map};
+use serde_json::{json, Map};
 
+#[cfg(feature = "issuer-local")]
 use crate::disclosure::SDJWTDisclosure;
 use crate::error::Error;
-use crate::utils::generate_salt_with_rng;
+use crate::utils::{base64url_encode, generate_salt_with_rng};
 use crate::{
     SDJWTCommon, SDJWTSerializationFormat, CNF_KEY, COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
     DEFAULT_DIGEST_ALG, DEFAULT_SIGNING_ALG, DIGEST_ALG_KEY, JWK_KEY,
 };
 
+#[cfg(feature = "issuer-local")]
 pub struct SDJWTIssuer {
     // parameters
     sign_alg: String,
@@ -55,6 +64,9 @@ mod issuance_plan;
 pub mod issuance_benchmark;
 
 use issuance_plan::IssuancePlan;
+
+const DECOY_MIN_ELEMENTS: u32 = 2;
+const DECOY_MAX_ELEMENTS: u32 = 5;
 
 /// ClaimsForSelectiveDisclosureStrategy is used to determine which claims can be selectively disclosed later by the holder.
 #[derive(PartialEq, Debug)]
@@ -125,6 +137,183 @@ impl<'a> ClaimsForSelectiveDisclosureStrategy<'a> {
     }
 }
 
+/// Issuer that prepares SD-JWT signing input without owning a signing key.
+///
+/// Call [`Self::prepare`], send [`PreparedSDJWT::signing_input`] to a remote
+/// signer, then supply its raw signature bytes to [`PreparedSDJWT::complete`].
+#[derive(Clone, Debug)]
+pub struct SDJWTIssuerPlanner {
+    sign_alg: String,
+}
+
+impl SDJWTIssuerPlanner {
+    /// Create a remote-signing issuer planner.
+    pub fn new(sign_alg: Option<String>) -> Self {
+        Self {
+            sign_alg: sign_alg.unwrap_or(DEFAULT_SIGNING_ALG.to_owned()),
+        }
+    }
+
+    /// Prepare disclosures, the issuer payload, and the exact JWS signing input.
+    pub fn prepare(
+        &self,
+        mut user_claims: Value,
+        mut sd_strategy: ClaimsForSelectiveDisclosureStrategy<'_>,
+        holder_key: Option<Jwk>,
+        add_decoy_claims: bool,
+        serialization_format: SDJWTSerializationFormat,
+    ) -> Result<PreparedSDJWT> {
+        #[cfg(all(feature = "mock_salts", test))]
+        let _mock_salt_guard = crate::utils::seed_mock_salts_for_test();
+
+        sd_strategy.finalize_input()?;
+        SDJWTCommon::check_for_sd_claim(&user_claims)?;
+
+        let claims_obj_ref = user_claims
+            .as_object_mut()
+            .ok_or(Error::ConversionError("json object".to_string()))?;
+        if holder_key.is_some() {
+            claims_obj_ref.shift_remove(CNF_KEY);
+        }
+        let mut always_revealed_claims: Map<String, Value> = ["iss", "iat", "exp"]
+            .into_iter()
+            .filter_map(|key| claims_obj_ref.shift_remove_entry(key))
+            .collect();
+
+        let mut random_source = LegacyIssuanceRandomSource::default();
+        let assembly = IssuancePlan::create(
+            user_claims,
+            sd_strategy,
+            add_decoy_claims,
+            &mut random_source,
+        )?
+        .execute()?;
+        let disclosures = assembly
+            .disclosures
+            .into_iter()
+            .map(|disclosure| disclosure.raw_b64)
+            .collect();
+        let mut payload = assembly
+            .claims
+            .as_object()
+            .ok_or(Error::ConversionError("json object".to_string()))?
+            .clone();
+        payload.insert(
+            DIGEST_ALG_KEY.to_owned(),
+            Value::String(DEFAULT_DIGEST_ALG.to_owned()),
+        );
+        payload.append(&mut always_revealed_claims);
+        if let Some(holder_key) = holder_key {
+            payload.insert(CNF_KEY.to_owned(), json!({JWK_KEY: holder_key}));
+        }
+
+        let algorithm = Algorithm::from_str(&self.sign_alg)
+            .map_err(|error| Error::DeserializationError(error.to_string()))?;
+        let mut header = Header::new(algorithm);
+        // Preserve the legacy issuer's current protected header exactly.
+        header.typ = None;
+        let protected = base64url_encode(
+            &serde_json::to_vec(&header)
+                .map_err(|error| Error::DeserializationError(error.to_string()))?,
+        );
+        let payload = base64url_encode(
+            &serde_json::to_vec(&payload)
+                .map_err(|error| Error::DeserializationError(error.to_string()))?,
+        );
+        let signing_input = format!("{protected}.{payload}");
+
+        Ok(PreparedSDJWT {
+            algorithm,
+            disclosures,
+            payload,
+            protected,
+            serialization_format,
+            signing_input,
+        })
+    }
+}
+
+/// Prepared SD-JWT state awaiting one remote signature.
+#[derive(Clone)]
+pub struct PreparedSDJWT {
+    algorithm: Algorithm,
+    disclosures: Vec<String>,
+    payload: String,
+    protected: String,
+    serialization_format: SDJWTSerializationFormat,
+    signing_input: String,
+}
+
+impl fmt::Debug for PreparedSDJWT {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSDJWT")
+            .field("algorithm", &self.algorithm)
+            .field("disclosure_count", &self.disclosures.len())
+            .field("contents", &"[redacted]")
+            .finish()
+    }
+}
+
+impl PreparedSDJWT {
+    /// Algorithm the remote signer must use.
+    pub fn algorithm(&self) -> Algorithm {
+        self.algorithm
+    }
+
+    /// Exact ASCII JWS signing input (`base64url(header).base64url(payload)`).
+    pub fn signing_input(&self) -> &[u8] {
+        self.signing_input.as_bytes()
+    }
+
+    /// Assemble the requested SD-JWT serialization from raw signature bytes.
+    pub fn complete(self, signature: &[u8]) -> Result<String> {
+        self.complete_encoded_signature(base64url_encode(signature))
+    }
+
+    fn complete_encoded_signature(self, signature: String) -> Result<String> {
+        let signed_sd_jwt = format!("{}.{}", self.signing_input, signature);
+        match self.serialization_format {
+            SDJWTSerializationFormat::Compact => {
+                let mut parts = VecDeque::with_capacity(self.disclosures.len() + 1);
+                parts.push_back(signed_sd_jwt);
+                parts.extend(self.disclosures);
+                Ok(format!(
+                    "{}{}",
+                    parts
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR),
+                    COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
+                ))
+            }
+            SDJWTSerializationFormat::FlattenedJson => serde_json::to_string(&SDJWTFlattenedJson {
+                protected: self.protected,
+                payload: self.payload,
+                signature,
+                header: SDJWTUnprotectedHeader {
+                    disclosures: self.disclosures,
+                    kb_jwt: None,
+                },
+            })
+            .map_err(|error| Error::DeserializationError(error.to_string())),
+            SDJWTSerializationFormat::GeneralJson => serde_json::to_string(&SDJWTGeneralJson {
+                payload: self.payload,
+                signatures: vec![SDJWTGeneralJsonSignature {
+                    protected: self.protected,
+                    signature,
+                    header: SDJWTUnprotectedHeader {
+                        disclosures: self.disclosures,
+                        kb_jwt: None,
+                    },
+                }],
+            })
+            .map_err(|error| Error::DeserializationError(error.to_string())),
+        }
+    }
+}
+
 trait IssuanceRandomSource {
     fn disclosure_salt(&mut self) -> String;
     fn decoy_count(&mut self, range: Range<u32>) -> u32;
@@ -136,6 +325,7 @@ struct LegacyIssuanceRandomSource<R> {
     initialize: fn() -> R,
 }
 
+#[cfg(feature = "issuer-local")]
 struct IssuanceOptions {
     holder_key: Option<Jwk>,
     add_decoy_claims: bool,
@@ -181,10 +371,8 @@ where
     }
 }
 
+#[cfg(feature = "issuer-local")]
 impl SDJWTIssuer {
-    const DECOY_MIN_ELEMENTS: u32 = 2;
-    const DECOY_MAX_ELEMENTS: u32 = 5;
-
     /// Creates a new SDJWTIssuer instance.
     ///
     /// The instance can be used mutliple times to issue SD-JWTs.
@@ -453,7 +641,7 @@ mod tests {
     use serde_json::json;
 
     use crate::issuer::ClaimsForSelectiveDisclosureStrategy;
-    use crate::{SDJWTIssuer, SDJWTSerializationFormat};
+    use crate::{SDJWTIssuer, SDJWTIssuerPlanner, SDJWTSerializationFormat};
 
     const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
 
@@ -483,6 +671,54 @@ mod tests {
             )
             .unwrap();
         trace!("{sd_jwt:?}")
+    }
+
+    #[test]
+    fn remote_planner_preserves_all_local_serializations() {
+        let claims = json!({
+            "sub": "6c5c0a49-b589-431d-bae7-219122a9ec2c",
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "exp": 1883000000,
+            "given_name": "Erika"
+        });
+        let issuer_key = EncodingKey::from_ec_pem(PRIVATE_ISSUER_PEM.as_bytes()).unwrap();
+
+        for serialization_format in [
+            SDJWTSerializationFormat::Compact,
+            SDJWTSerializationFormat::FlattenedJson,
+            SDJWTSerializationFormat::GeneralJson,
+        ] {
+            let prepared = SDJWTIssuerPlanner::new(None)
+                .prepare(
+                    claims.clone(),
+                    ClaimsForSelectiveDisclosureStrategy::NoSDClaims,
+                    None,
+                    false,
+                    serialization_format.clone(),
+                )
+                .unwrap();
+            let encoded_signature = jsonwebtoken::crypto::sign(
+                prepared.signing_input(),
+                &issuer_key,
+                prepared.algorithm(),
+            )
+            .unwrap();
+            let signature = crate::utils::base64url_decode(&encoded_signature).unwrap();
+            let remote = prepared.complete(&signature).unwrap();
+
+            let local = SDJWTIssuer::new(issuer_key.clone(), None)
+                .issue_sd_jwt(
+                    claims.clone(),
+                    ClaimsForSelectiveDisclosureStrategy::NoSDClaims,
+                    None,
+                    false,
+                    serialization_format,
+                )
+                .unwrap();
+
+            assert_eq!(remote, local);
+        }
     }
 
     #[test]

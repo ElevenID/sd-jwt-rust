@@ -12,7 +12,7 @@ use base64::Engine;
 use error::Result;
 #[cfg(feature = "mock_salts")]
 use lazy_static::lazy_static;
-#[cfg(feature = "issuer-local")]
+#[cfg(feature = "issuer-planning")]
 use rand::RngCore;
 #[cfg(any(feature = "holder", feature = "verifier"))]
 use serde_json::Value;
@@ -39,7 +39,7 @@ pub fn base64_hash(data: &[u8]) -> String {
     general_purpose::URL_SAFE_NO_PAD.encode(hash)
 }
 
-#[cfg(feature = "issuer-local")]
+#[cfg(feature = "issuer-planning")]
 pub(crate) fn base64url_encode(data: &[u8]) -> String {
     general_purpose::URL_SAFE_NO_PAD.encode(data)
 }
@@ -51,7 +51,7 @@ pub fn base64url_decode(b64data: &str) -> Result<Vec<u8>> {
         .map_err(|e| Error::DeserializationError(e.to_string()))
 }
 
-#[cfg(feature = "issuer-local")]
+#[cfg(feature = "issuer-planning")]
 pub(crate) fn generate_salt_with_rng<R>(rng: &mut R) -> String
 where
     R: RngCore + ?Sized,
@@ -62,7 +62,7 @@ where
 }
 
 #[cfg(all(test, not(feature = "mock_salts")))]
-#[cfg(feature = "issuer-local")]
+#[cfg(feature = "issuer-planning")]
 pub(crate) fn generate_salt() -> String {
     generate_salt_with_rng(&mut rand::thread_rng())
 }

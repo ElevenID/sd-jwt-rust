@@ -10,7 +10,9 @@ use error::Result;
 #[cfg(feature = "holder")]
 pub use holder::SDJWTHolder;
 #[cfg(feature = "issuer-local")]
-pub use issuer::{ClaimsForSelectiveDisclosureStrategy, SDJWTIssuer};
+pub use issuer::SDJWTIssuer;
+#[cfg(feature = "issuer-planning")]
+pub use issuer::{ClaimsForSelectiveDisclosureStrategy, PreparedSDJWT, SDJWTIssuerPlanner};
 #[cfg(feature = "holder")]
 use jsonwebtoken::Validation;
 #[cfg(any(feature = "holder", feature = "verifier"))]
@@ -91,14 +93,14 @@ impl Default for VerificationPolicy {
 
 #[cfg(feature = "verifier")]
 pub mod batch;
-#[cfg(feature = "issuer-local")]
+#[cfg(feature = "issuer-planning")]
 mod disclosure;
 #[cfg(any(feature = "holder", feature = "verifier"))]
 mod disclosure_preprocessing;
 pub mod error;
 #[cfg(feature = "holder")]
 pub mod holder;
-#[cfg(feature = "issuer-local")]
+#[cfg(feature = "issuer-planning")]
 pub mod issuer;
 pub mod utils;
 #[cfg(feature = "verifier")]
@@ -106,7 +108,7 @@ pub mod verifier;
 
 pub const DEFAULT_SIGNING_ALG: &str = "ES256";
 const SD_DIGESTS_KEY: &str = "_sd";
-#[cfg(any(feature = "issuer-local", feature = "verifier"))]
+#[cfg(any(feature = "issuer-planning", feature = "verifier"))]
 const DIGEST_ALG_KEY: &str = "_sd_alg";
 pub const DEFAULT_DIGEST_ALG: &str = "sha-256";
 const SD_LIST_PREFIX: &str = "...";
@@ -124,9 +126,9 @@ pub const MAX_SD_JWT_DISCLOSURES: usize = 8192;
 pub const MAX_SD_JWT_DISCLOSURE_BYTES: usize = 64 * 1024;
 #[cfg(any(feature = "holder", feature = "verifier"))]
 const JWT_SEPARATOR: &str = ".";
-#[cfg(any(feature = "issuer-local", feature = "verifier"))]
+#[cfg(any(feature = "issuer-planning", feature = "verifier"))]
 const CNF_KEY: &str = "cnf";
-#[cfg(any(feature = "issuer-local", feature = "verifier"))]
+#[cfg(any(feature = "issuer-planning", feature = "verifier"))]
 const JWK_KEY: &str = "jwk";
 
 #[cfg(test)]
@@ -174,6 +176,7 @@ pub enum SDJWTSerializationFormat {
 pub(crate) struct SDJWTCommon {
     #[cfg(feature = "issuer-local")]
     typ: Option<String>,
+    #[cfg(any(feature = "issuer-local", feature = "holder", feature = "verifier"))]
     serialization_format: SDJWTSerializationFormat,
     #[cfg(any(feature = "holder", feature = "verifier"))]
     unverified_input_key_binding_jwt: Option<String>,
@@ -299,7 +302,7 @@ impl SDJWTCommon {
         Ok(())
     }
 
-    #[cfg(feature = "issuer-local")]
+    #[cfg(feature = "issuer-planning")]
     fn check_for_sd_claim(the_object: &Value) -> Result<()> {
         match the_object {
             Value::Object(obj) => {

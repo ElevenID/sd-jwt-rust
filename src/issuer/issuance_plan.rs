@@ -29,7 +29,12 @@ use std::thread;
 
 #[cfg(test)]
 use super::IssuanceOptions;
-use super::{ClaimsForSelectiveDisclosureStrategy, IssuanceRandomSource, SDJWTIssuer};
+#[cfg(all(test, feature = "issuer-local"))]
+use super::SDJWTIssuer;
+use super::{
+    ClaimsForSelectiveDisclosureStrategy, IssuanceRandomSource, DECOY_MAX_ELEMENTS,
+    DECOY_MIN_ELEMENTS,
+};
 use crate::disclosure::SDJWTDisclosure;
 use crate::error::{Error, Result};
 use crate::utils::base64_hash;
@@ -614,8 +619,7 @@ impl Planner {
         }
 
         let decoy_job_ids = if self.add_decoy_claims {
-            let count = random_source
-                .decoy_count(SDJWTIssuer::DECOY_MIN_ELEMENTS..SDJWTIssuer::DECOY_MAX_ELEMENTS);
+            let count = random_source.decoy_count(DECOY_MIN_ELEMENTS..DECOY_MAX_ELEMENTS);
             let mut decoys = Vec::with_capacity(count as usize);
             for _ in 0..count {
                 decoys.push(self.plan_decoy(location_id, random_source)?);
