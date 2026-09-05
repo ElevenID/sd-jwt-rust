@@ -495,7 +495,7 @@ impl SDJWTCommon {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "holder", feature = "verifier")))]
 mod tests {
     use crate::{error::Error, utils, SDJWTCommon};
     use serde_json::json;

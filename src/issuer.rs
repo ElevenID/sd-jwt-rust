@@ -681,7 +681,7 @@ impl SDJWTIssuer {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "issuer-local"))]
 mod tests {
     use jsonwebtoken::{Algorithm, EncodingKey};
     use log::trace;
@@ -878,5 +878,79 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "issuer-planning"))]
+mod issuer_planning_tests {
+    use jsonwebtoken::Algorithm;
+    use serde_json::json;
+
+    use super::{validate_remote_signature, ClaimsForSelectiveDisclosureStrategy};
+    use crate::{SDJWTIssuerPlanner, SDJWTSerializationFormat};
+
+    #[test]
+    fn remote_planner_rejects_malformed_es256_signatures() {
+        let prepare = || {
+            SDJWTIssuerPlanner::new(Some("ES256".to_string()))
+                .prepare(
+                    json!({"sub": "example"}),
+                    ClaimsForSelectiveDisclosureStrategy::NoSDClaims,
+                    None,
+                    false,
+                    SDJWTSerializationFormat::Compact,
+                )
+                .unwrap()
+        };
+
+        assert!(prepare().complete(&[]).is_err());
+        assert!(prepare().complete(&[0u8; 63]).is_err());
+        let mut der_encoded = vec![0u8; 70];
+        der_encoded[0] = 0x30;
+        assert!(prepare().complete(&der_encoded).is_err());
+        assert!(prepare().complete(&[0u8; 64]).is_err());
+        assert!(prepare().complete(&[0xffu8; 64]).is_err());
+
+        let mut valid = [0u8; 64];
+        valid[31] = 1;
+        valid[63] = 1;
+        assert!(prepare().complete(&valid).is_ok());
+    }
+
+    #[test]
+    fn remote_signature_validation_covers_supported_algorithms() {
+        let mut es384 = [0u8; 96];
+        es384[47] = 1;
+        es384[95] = 1;
+        assert!(validate_remote_signature(Algorithm::ES384, &es384).is_ok());
+        assert!(validate_remote_signature(Algorithm::ES384, &[0u8; 96]).is_err());
+
+        let mut eddsa = [0u8; 64];
+        eddsa[..32].copy_from_slice(
+            curve25519_dalek::constants::ED25519_BASEPOINT_POINT
+                .compress()
+                .as_bytes(),
+        );
+        eddsa[32] = 1;
+        assert!(validate_remote_signature(Algorithm::EdDSA, &eddsa).is_ok());
+        assert!(validate_remote_signature(Algorithm::EdDSA, &[0u8; 64]).is_err());
+        let mut bad_s = eddsa;
+        bad_s[63] = 0xff;
+        assert!(validate_remote_signature(Algorithm::EdDSA, &bad_s).is_err());
+
+        for algorithm in [
+            Algorithm::RS256,
+            Algorithm::RS384,
+            Algorithm::RS512,
+            Algorithm::PS256,
+            Algorithm::PS384,
+            Algorithm::PS512,
+        ] {
+            assert!(validate_remote_signature(algorithm, &[1u8; 256]).is_ok());
+            assert!(validate_remote_signature(algorithm, &[1u8; 384]).is_ok());
+            assert!(validate_remote_signature(algorithm, &[0u8; 256]).is_err());
+            assert!(validate_remote_signature(algorithm, &[1u8; 255]).is_err());
+        }
+        assert!(validate_remote_signature(Algorithm::HS256, &[1u8; 256]).is_err());
+    }
+}
+
+#[cfg(all(test, feature = "issuer-local"))]
 mod issuance_contract_tests;
