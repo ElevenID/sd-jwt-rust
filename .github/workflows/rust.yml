@@ -34,6 +34,8 @@ jobs:
       run: cargo build --locked --verbose
     - name: Run tests
       run: cargo test --locked --verbose
+    - name: Test remote issuer-planning boundary
+      run: cargo test --locked --no-default-features --features issuer-planning --lib --verbose
     - name: Build interop tool
       run: cargo build --manifest-path generate/Cargo.toml --verbose
     - name: Run parallel-feature tests
