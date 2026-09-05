@@ -6,16 +6,27 @@ use crate::error::Error;
 use crate::utils::{base64url_decode, jwt_payload_decode};
 
 use error::Result;
+#[cfg(feature = "holder")]
+pub use holder::SDJWTHolder;
+#[cfg(feature = "issuer-local")]
+pub use issuer::{ClaimsForSelectiveDisclosureStrategy, SDJWTIssuer};
 use jsonwebtoken::{Algorithm, DecodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::str::FromStr;
 use strum::Display;
-pub use {
-    holder::SDJWTHolder, issuer::ClaimsForSelectiveDisclosureStrategy, issuer::SDJWTIssuer,
-    verifier::SDJWTVerifier,
-};
+#[cfg(feature = "verifier")]
+pub use verifier::SDJWTVerifier;
+
+#[cfg(not(feature = "issuer-local"))]
+/// Verification-only builds do not expose an issuer that owns an
+/// [`jsonwebtoken::EncodingKey`].
+///
+/// ```compile_fail
+/// use sd_jwt_rs::SDJWTIssuer;
+/// ```
+pub struct NoLocalIssuer;
 
 pub type KeyResolver = dyn Fn(&str, &Header) -> DecodingKey;
 /// Resolver used by verification paths that need to reject an unknown or
@@ -65,13 +76,17 @@ impl Default for VerificationPolicy {
     }
 }
 
+#[cfg(feature = "verifier")]
 pub mod batch;
 mod disclosure;
 mod disclosure_preprocessing;
 pub mod error;
+#[cfg(feature = "holder")]
 pub mod holder;
+#[cfg(feature = "issuer-local")]
 pub mod issuer;
 pub mod utils;
+#[cfg(feature = "verifier")]
 pub mod verifier;
 
 pub const DEFAULT_SIGNING_ALG: &str = "ES256";
