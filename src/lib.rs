@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::error::Error;
+#[cfg(any(feature = "holder", feature = "verifier"))]
 use crate::utils::{base64url_decode, jwt_payload_decode};
 
 use error::Result;
@@ -10,10 +11,17 @@ use error::Result;
 pub use holder::SDJWTHolder;
 #[cfg(feature = "issuer-local")]
 pub use issuer::{ClaimsForSelectiveDisclosureStrategy, SDJWTIssuer};
-use jsonwebtoken::{Algorithm, DecodingKey, Header, Validation};
+#[cfg(feature = "holder")]
+use jsonwebtoken::Validation;
+#[cfg(any(feature = "holder", feature = "verifier"))]
+use jsonwebtoken::{Algorithm, DecodingKey, Header};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+#[cfg(any(feature = "holder", feature = "verifier"))]
+use serde_json::Map;
+use serde_json::Value;
+#[cfg(any(feature = "holder", feature = "verifier"))]
 use std::collections::HashMap;
+#[cfg(feature = "holder")]
 use std::str::FromStr;
 use strum::Display;
 #[cfg(feature = "verifier")]
@@ -28,17 +36,21 @@ pub use verifier::SDJWTVerifier;
 /// ```
 pub struct NoLocalIssuer;
 
+#[cfg(any(feature = "holder", feature = "verifier"))]
 pub type KeyResolver = dyn Fn(&str, &Header) -> DecodingKey;
 /// Resolver used by verification paths that need to reject an unknown or
 /// policy-incompatible issuer key without panicking or fabricating a key.
+#[cfg(any(feature = "holder", feature = "verifier"))]
 pub type FallibleKeyResolver = dyn Fn(&str, &Header) -> Result<DecodingKey>;
 
 /// Cryptographic policy applied to untrusted JOSE headers during verification.
+#[cfg(any(feature = "holder", feature = "verifier"))]
 #[derive(Clone, Debug)]
 pub struct VerificationPolicy {
     allowed_algorithms: Vec<Algorithm>,
 }
 
+#[cfg(any(feature = "holder", feature = "verifier"))]
 impl VerificationPolicy {
     /// Create a policy with an explicit algorithm allowlist.
     pub fn new(allowed_algorithms: Vec<Algorithm>) -> Result<Self> {
@@ -55,6 +67,7 @@ impl VerificationPolicy {
     }
 }
 
+#[cfg(any(feature = "holder", feature = "verifier"))]
 impl Default for VerificationPolicy {
     fn default() -> Self {
         // Symmetric MAC algorithms are intentionally excluded: issuer keys are
@@ -78,7 +91,9 @@ impl Default for VerificationPolicy {
 
 #[cfg(feature = "verifier")]
 pub mod batch;
+#[cfg(feature = "issuer-local")]
 mod disclosure;
+#[cfg(any(feature = "holder", feature = "verifier"))]
 mod disclosure_preprocessing;
 pub mod error;
 #[cfg(feature = "holder")]
@@ -91,11 +106,14 @@ pub mod verifier;
 
 pub const DEFAULT_SIGNING_ALG: &str = "ES256";
 const SD_DIGESTS_KEY: &str = "_sd";
+#[cfg(any(feature = "issuer-local", feature = "verifier"))]
 const DIGEST_ALG_KEY: &str = "_sd_alg";
 pub const DEFAULT_DIGEST_ALG: &str = "sha-256";
 const SD_LIST_PREFIX: &str = "...";
 const _SD_JWT_TYP_HEADER: &str = "sd+jwt";
+#[cfg(any(feature = "holder", feature = "verifier"))]
 const KB_JWT_TYP_HEADER: &str = "kb+jwt";
+#[cfg(any(feature = "holder", feature = "verifier"))]
 const KB_DIGEST_KEY: &str = "sd_hash";
 pub const COMBINED_SERIALIZATION_FORMAT_SEPARATOR: &str = "~";
 /// Maximum accepted serialized presentation size before parsing or decoding.
@@ -104,8 +122,11 @@ pub const MAX_SD_JWT_INPUT_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_SD_JWT_DISCLOSURES: usize = 8192;
 /// Maximum encoded size of one disclosure.
 pub const MAX_SD_JWT_DISCLOSURE_BYTES: usize = 64 * 1024;
+#[cfg(any(feature = "holder", feature = "verifier"))]
 const JWT_SEPARATOR: &str = ".";
+#[cfg(any(feature = "issuer-local", feature = "verifier"))]
 const CNF_KEY: &str = "cnf";
+#[cfg(any(feature = "issuer-local", feature = "verifier"))]
 const JWK_KEY: &str = "jwk";
 
 #[cfg(test)]
@@ -151,15 +172,24 @@ pub enum SDJWTSerializationFormat {
 
 #[derive(Default)]
 pub(crate) struct SDJWTCommon {
+    #[cfg(feature = "issuer-local")]
     typ: Option<String>,
     serialization_format: SDJWTSerializationFormat,
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     unverified_input_key_binding_jwt: Option<String>,
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     unverified_sd_jwt: Option<String>,
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     unverified_input_sd_jwt_payload: Option<Map<String, Value>>,
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     hash_to_decoded_disclosure: HashMap<String, Value>,
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     hash_to_disclosure: HashMap<String, String>,
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     input_disclosures: Vec<String>,
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     ordered_disclosure_digests: Vec<String>,
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     sign_alg: Option<String>,
 }
 
@@ -193,6 +223,7 @@ pub struct SDJWTUnprotectedHeader {
 
 // Define the SDJWTCommon struct to hold common properties.
 impl SDJWTCommon {
+    #[cfg(feature = "holder")]
     fn verify_signature(
         &self,
         key: &DecodingKey,
@@ -231,6 +262,7 @@ impl SDJWTCommon {
         Ok(())
     }
 
+    #[cfg(feature = "holder")]
     fn create_hash_mappings(&mut self) -> Result<()> {
         #[cfg(test)]
         record_disclosure_preprocessing_route(DisclosurePreprocessingRoute::Serial);
@@ -250,6 +282,7 @@ impl SDJWTCommon {
         Ok(())
     }
 
+    #[cfg(feature = "verifier")]
     fn create_verifier_hash_mappings(&mut self) -> Result<()> {
         #[cfg(test)]
         record_disclosure_preprocessing_route(DisclosurePreprocessingRoute::Adaptive);
@@ -266,6 +299,7 @@ impl SDJWTCommon {
         Ok(())
     }
 
+    #[cfg(feature = "issuer-local")]
     fn check_for_sd_claim(the_object: &Value) -> Result<()> {
         match the_object {
             Value::Object(obj) => {
@@ -290,6 +324,7 @@ impl SDJWTCommon {
         Ok(())
     }
 
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     fn parse_compact_sd_jwt(&mut self, sd_jwt_with_disclosures: String) -> Result<()> {
         let separator_count = sd_jwt_with_disclosures
             .bytes()
@@ -337,6 +372,7 @@ impl SDJWTCommon {
         Ok(())
     }
 
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     fn parse_flattened_json_sd_jwt(&mut self, sd_jwt_with_disclosures: String) -> Result<()> {
         let parsed: SDJWTFlattenedJson = serde_json::from_str(&sd_jwt_with_disclosures)
             .map_err(|e| Error::DeserializationError(e.to_string()))?;
@@ -352,6 +388,7 @@ impl SDJWTCommon {
         Ok(())
     }
 
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     fn parse_general_json_sd_jwt(&mut self, sd_jwt_with_disclosures: String) -> Result<()> {
         let parsed: SDJWTGeneralJson = serde_json::from_str(&sd_jwt_with_disclosures)
             .map_err(|e| Error::DeserializationError(e.to_string()))?;
@@ -381,6 +418,7 @@ impl SDJWTCommon {
         Ok(())
     }
 
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     fn parse_sd_jwt(&mut self, sd_jwt_with_disclosures: String) -> Result<()> {
         if sd_jwt_with_disclosures.len() > MAX_SD_JWT_INPUT_BYTES {
             return Err(Error::InvalidInput(
@@ -420,6 +458,7 @@ impl SDJWTCommon {
     /// * `sd_jwt` - jwt format string.
     /// # Returns
     /// * `Option<String>` - The result containing the algorithm String e.g ES256 or on failure None.
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     fn decode_header_and_get_sign_algorithm(sd_jwt: &str) -> Option<String> {
         let parts: Vec<&str> = sd_jwt.split('.').collect();
         if parts.len() < 2 {
@@ -437,6 +476,7 @@ impl SDJWTCommon {
     }
 
     /// Splits a signed JWT (`protected.payload.signature`) into its three parts.
+    #[cfg(any(feature = "holder", feature = "issuer-local"))]
     fn split_jwt(jwt: &str) -> Result<(String, String, String)> {
         let parts: Vec<&str> = jwt.split('.').collect();
         let [protected, payload, signature] = parts.as_slice() else {

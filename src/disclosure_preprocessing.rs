@@ -461,6 +461,7 @@ pub(super) struct DisclosureMappings {
     pub(super) ordered_disclosure_digests: Vec<String>,
 }
 
+#[cfg(feature = "verifier")]
 pub(super) fn preprocess_disclosures(encoded_disclosures: &[String]) -> Result<DisclosureMappings> {
     #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
     {
@@ -477,6 +478,7 @@ pub(super) fn preprocess_disclosures(encoded_disclosures: &[String]) -> Result<D
     }
 }
 
+#[cfg(feature = "holder")]
 pub(super) fn preprocess_disclosures_serial(
     encoded_disclosures: &[String],
 ) -> Result<DisclosureMappings> {
@@ -654,6 +656,7 @@ pub(crate) fn process_disclosure<'a>(job: &DisclosureJob<'a>) -> DisclosureOutco
 
 /// Restore worker outcomes to input order, validate the executor contract, and
 /// only then publish complete mappings. Any failure discards all partial state.
+#[cfg(feature = "verifier")]
 pub(crate) fn assemble_disclosures<'a>(
     jobs: &[DisclosureJob<'a>],
     mut outcomes: Vec<DisclosureOutcome<'a>>,
@@ -696,6 +699,7 @@ pub(crate) fn assemble_disclosures<'a>(
     })
 }
 
+#[cfg(feature = "verifier")]
 fn validate_outcome_contract(
     jobs: &[DisclosureJob<'_>],
     outcomes: &[DisclosureOutcome<'_>],
