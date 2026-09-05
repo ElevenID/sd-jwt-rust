@@ -178,7 +178,11 @@ pub struct SDJWTUnprotectedHeader {
 
 // Define the SDJWTCommon struct to hold common properties.
 impl SDJWTCommon {
-    fn verify_signature(&self, key: &DecodingKey) -> Result<()> {
+    fn verify_signature(
+        &self,
+        key: &DecodingKey,
+        verification_policy: &VerificationPolicy,
+    ) -> Result<()> {
         let sd_jwt = self
             .unverified_sd_jwt
             .as_ref()
@@ -190,6 +194,11 @@ impl SDJWTCommon {
         })?;
         let algorithm =
             Algorithm::from_str(alg_str).map_err(|e| Error::DeserializationError(e.to_string()))?;
+        if !verification_policy.allows(algorithm) {
+            return Err(Error::InvalidInput(format!(
+                "Issuer-signed JWT algorithm {algorithm:?} is not allowed by verification policy"
+            )));
+        }
         let mut validation = Validation::new(algorithm);
         // RFC 9901 §4.1: `exp` is not mandated, so don't require it. `validate_exp`
         // stays true, so a present `exp` is still checked for expiry.
