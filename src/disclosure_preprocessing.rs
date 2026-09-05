@@ -860,16 +860,29 @@ mod tests {
 
     #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
     impl BenchmarkPayloadClass {
+        const TARGET_LARGE_RAW_BYTES: usize = crate::MAX_SD_JWT_INPUT_BYTES / 2;
+        const MAX_LARGE_VALUE_BYTES: usize = crate::MAX_SD_JWT_DISCLOSURE_BYTES / 2;
+
         fn label(self) -> &'static str {
             match self {
                 Self::Small => "small",
                 Self::Medium => "medium",
-                Self::Large => "large_64_kib",
+                Self::Large => "large_bounded",
                 Self::Mixed => "mixed",
             }
         }
 
-        fn value(self, ordinal: usize) -> Value {
+        fn large_value_count(self, disclosure_count: usize) -> usize {
+            match self {
+                Self::Large => disclosure_count,
+                Self::Mixed => (0..disclosure_count)
+                    .filter(|ordinal| ordinal % 3 == 2)
+                    .count(),
+                Self::Small | Self::Medium => 0,
+            }
+        }
+
+        fn value(self, ordinal: usize, large_payload_bytes: usize) -> Value {
             match self {
                 Self::Small => Value::String(format!("value-{ordinal}")),
                 Self::Medium => json!({
@@ -883,12 +896,13 @@ mod tests {
                 }),
                 Self::Large => {
                     let suffix = format!("-{ordinal}");
-                    Value::String(format!("{}{suffix}", "L".repeat(64 * 1024 - suffix.len())))
+                    let body_length = large_payload_bytes.saturating_sub(suffix.len());
+                    Value::String(format!("{}{suffix}", "L".repeat(body_length)))
                 }
                 Self::Mixed => match ordinal % 3 {
-                    0 => Self::Small.value(ordinal),
-                    1 => Self::Medium.value(ordinal),
-                    _ => Self::Large.value(ordinal),
+                    0 => Self::Small.value(ordinal, large_payload_bytes),
+                    1 => Self::Medium.value(ordinal, large_payload_bytes),
+                    _ => Self::Large.value(ordinal, large_payload_bytes),
                 },
             }
         }
@@ -903,15 +917,39 @@ mod tests {
         payload_class: BenchmarkPayloadClass,
     ) -> Vec<usize> {
         let salt = "A".repeat(22);
+        let large_value_count = payload_class.large_value_count(disclosure_count);
+        let large_payload_bytes = BenchmarkPayloadClass::TARGET_LARGE_RAW_BYTES
+            .checked_div(large_value_count)
+            .unwrap_or(0)
+            .min(BenchmarkPayloadClass::MAX_LARGE_VALUE_BYTES);
 
         (0..disclosure_count)
             .map(|ordinal| {
                 let key = Value::String(format!("claim_{ordinal:04}")).to_string();
-                let value = payload_class.value(ordinal).to_string();
+                let value = payload_class
+                    .value(ordinal, large_payload_bytes)
+                    .to_string();
                 let decoded = format!(r#"["{salt}", {key}, {value}]"#);
                 crate::utils::base64url_encode(decoded.as_bytes()).len()
             })
             .collect()
+    }
+
+    #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
+    fn expected_benchmark_mode(
+        payload_class: BenchmarkPayloadClass,
+        disclosure_count: usize,
+        available_threads: usize,
+    ) -> DisclosureExecutionMode {
+        match (payload_class, disclosure_count, available_threads) {
+            (BenchmarkPayloadClass::Large, 128 | 512, 2..)
+            | (BenchmarkPayloadClass::Mixed, 128 | 512, 3..) => {
+                DisclosureExecutionMode::NativeParallel {
+                    worker_count: available_threads.min(MAX_PARALLEL_WORKERS),
+                }
+            }
+            _ => DisclosureExecutionMode::Serial,
+        }
     }
 
     #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
@@ -1486,17 +1524,36 @@ mod tests {
             for disclosure_count in [1, 8, 32, 128, 512] {
                 let encoded_lengths = benchmark_encoded_lengths(disclosure_count, payload_class);
                 let total_encoded_bytes: usize = encoded_lengths.iter().sum();
+                assert!(
+                    encoded_lengths
+                        .iter()
+                        .all(|length| *length <= crate::MAX_SD_JWT_DISCLOSURE_BYTES),
+                    "benchmark disclosure exceeds the public encoded limit"
+                );
+                // The benchmark itself asserts its exact issued presentation size. This
+                // conservative test-side upper bound reserves 64 bytes of issuer-JWT
+                // digest-list overhead per disclosure plus 2 KiB for fixed JWT fields,
+                // signature, and separators so selector fixtures cannot silently grow
+                // beyond the same public input limit.
+                let presentation_upper_bound = total_encoded_bytes
+                    .saturating_add(disclosure_count.saturating_mul(64))
+                    .saturating_add(2 * 1024);
+                assert!(
+                    presentation_upper_bound <= crate::MAX_SD_JWT_INPUT_BYTES,
+                    "benchmark presentation exceeds the public input limit"
+                );
+                for policy_threads in 1..=MAX_PARALLEL_WORKERS {
+                    assert_eq!(
+                        mode_for_lengths(&encoded_lengths, policy_threads),
+                        expected_benchmark_mode(payload_class, disclosure_count, policy_threads),
+                        "unexpected route for {}/{} with {policy_threads} threads",
+                        payload_class.label(),
+                        disclosure_count,
+                    );
+                }
                 let mode = mode_for_lengths(&encoded_lengths, available_threads);
-                let expected = match (payload_class, disclosure_count, available_threads) {
-                    (
-                        BenchmarkPayloadClass::Large | BenchmarkPayloadClass::Mixed,
-                        128 | 512,
-                        2..,
-                    ) => DisclosureExecutionMode::NativeParallel {
-                        worker_count: available_threads.min(MAX_PARALLEL_WORKERS),
-                    },
-                    _ => DisclosureExecutionMode::Serial,
-                };
+                let expected =
+                    expected_benchmark_mode(payload_class, disclosure_count, available_threads);
 
                 eprintln!(
                     "benchmark_route id={}/{} disclosures={} encoded_bytes={} mode={mode:?}",
