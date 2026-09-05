@@ -504,14 +504,12 @@ mod tests {
         );
 
         let serial_error = preprocess_disclosure_verification_batch(credentials)
-            .err()
-            .expect("over-limit serial entry point must fail");
+            .expect_err("over-limit serial entry point must fail");
         assert_eq!(serial_error.to_string(), plan_error.to_string());
 
         let custom_error =
             preprocess_disclosure_verification_batch_with_executor(credentials, &MustNotExecute)
-                .err()
-                .expect("over-limit custom entry point must fail");
+                .expect_err("over-limit custom entry point must fail");
         assert_eq!(custom_error.to_string(), plan_error.to_string());
     }
 
