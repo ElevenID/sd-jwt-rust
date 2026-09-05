@@ -316,35 +316,49 @@ impl PreparedSDJWT {
 }
 
 fn validate_remote_signature(algorithm: Algorithm, signature: &[u8]) -> Result<()> {
-    let expected_len = match algorithm {
-        Algorithm::ES256 | Algorithm::EdDSA => Some(64),
-        Algorithm::ES384 => Some(96),
+    let valid = match algorithm {
+        Algorithm::ES256 => p256::ecdsa::Signature::from_slice(signature).is_ok(),
+        Algorithm::ES384 => p384::ecdsa::Signature::from_slice(signature).is_ok(),
+        Algorithm::EdDSA => validate_ed25519_encoding(signature),
         Algorithm::RS256
         | Algorithm::RS384
         | Algorithm::RS512
         | Algorithm::PS256
         | Algorithm::PS384
-        | Algorithm::PS512 => None,
+        | Algorithm::PS512 => signature.len() >= 256 && signature.iter().any(|byte| *byte != 0),
         _ => {
             return Err(Error::InvalidInput(format!(
                 "unsupported remote signing algorithm: {algorithm:?}"
             )))
         }
     };
-    if signature.is_empty() {
-        return Err(Error::InvalidInput(
-            "remote signature must not be empty".to_string(),
-        ));
-    }
-    if let Some(expected_len) = expected_len {
-        if signature.len() != expected_len {
-            return Err(Error::InvalidInput(format!(
-                "invalid {algorithm:?} signature length: expected {expected_len} bytes, got {}",
-                signature.len()
-            )));
-        }
+    if !valid {
+        return Err(Error::InvalidInput(format!(
+            "invalid {algorithm:?} remote signature encoding: got {} bytes",
+            signature.len()
+        )));
     }
     Ok(())
+}
+
+fn validate_ed25519_encoding(signature: &[u8]) -> bool {
+    let Ok(bytes) = <&[u8; 64]>::try_from(signature) else {
+        return false;
+    };
+    let (encoded_r, encoded_s) = bytes.split_at(32);
+    let Ok(encoded_r) = <[u8; 32]>::try_from(encoded_r) else {
+        return false;
+    };
+    let Ok(encoded_s) = <[u8; 32]>::try_from(encoded_s) else {
+        return false;
+    };
+    let Some(point) = curve25519_dalek::edwards::CompressedEdwardsY(encoded_r).decompress() else {
+        return false;
+    };
+    point.compress().to_bytes() == encoded_r
+        && !point.is_small_order()
+        && bool::from(curve25519_dalek::scalar::Scalar::from_canonical_bytes(encoded_s).is_some())
+        && signature.iter().any(|byte| *byte != 0)
 }
 
 trait IssuanceRandomSource {
@@ -669,11 +683,11 @@ impl SDJWTIssuer {
 
 #[cfg(test)]
 mod tests {
-    use jsonwebtoken::EncodingKey;
+    use jsonwebtoken::{Algorithm, EncodingKey};
     use log::trace;
     use serde_json::json;
 
-    use crate::issuer::ClaimsForSelectiveDisclosureStrategy;
+    use crate::issuer::{validate_remote_signature, ClaimsForSelectiveDisclosureStrategy};
     use crate::{SDJWTIssuer, SDJWTIssuerPlanner, SDJWTSerializationFormat};
 
     const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
@@ -775,7 +789,50 @@ mod tests {
         der_encoded[0] = 0x30;
         assert!(prepare().complete(&der_encoded).is_err());
 
-        assert!(prepare().complete(&[0u8; 64]).is_ok());
+        assert!(prepare().complete(&[0u8; 64]).is_err());
+        assert!(prepare().complete(&[0xffu8; 64]).is_err());
+
+        let mut valid = [0u8; 64];
+        valid[31] = 1;
+        valid[63] = 1;
+        assert!(prepare().complete(&valid).is_ok());
+    }
+
+    #[test]
+    fn remote_signature_validation_covers_supported_algorithms() {
+        let mut es384 = [0u8; 96];
+        es384[47] = 1;
+        es384[95] = 1;
+        assert!(validate_remote_signature(Algorithm::ES384, &es384).is_ok());
+        assert!(validate_remote_signature(Algorithm::ES384, &[0u8; 96]).is_err());
+
+        let mut eddsa = [0u8; 64];
+        eddsa[..32].copy_from_slice(
+            curve25519_dalek::constants::ED25519_BASEPOINT_POINT
+                .compress()
+                .as_bytes(),
+        );
+        eddsa[32] = 1;
+        assert!(validate_remote_signature(Algorithm::EdDSA, &eddsa).is_ok());
+        assert!(validate_remote_signature(Algorithm::EdDSA, &[0u8; 64]).is_err());
+        let mut bad_s = eddsa;
+        bad_s[63] = 0xff;
+        assert!(validate_remote_signature(Algorithm::EdDSA, &bad_s).is_err());
+
+        for algorithm in [
+            Algorithm::RS256,
+            Algorithm::RS384,
+            Algorithm::RS512,
+            Algorithm::PS256,
+            Algorithm::PS384,
+            Algorithm::PS512,
+        ] {
+            assert!(validate_remote_signature(algorithm, &[1u8; 256]).is_ok());
+            assert!(validate_remote_signature(algorithm, &[1u8; 384]).is_ok());
+            assert!(validate_remote_signature(algorithm, &[0u8; 256]).is_err());
+            assert!(validate_remote_signature(algorithm, &[1u8; 255]).is_err());
+        }
+        assert!(validate_remote_signature(Algorithm::HS256, &[1u8; 256]).is_err());
     }
 
     #[test]
