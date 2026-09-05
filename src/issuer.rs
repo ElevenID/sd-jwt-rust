@@ -268,6 +268,7 @@ impl PreparedSDJWT {
 
     /// Assemble the requested SD-JWT serialization from raw signature bytes.
     pub fn complete(self, signature: &[u8]) -> Result<String> {
+        validate_remote_signature(self.algorithm, signature)?;
         self.complete_encoded_signature(base64url_encode(signature))
     }
 
@@ -312,6 +313,38 @@ impl PreparedSDJWT {
             .map_err(|error| Error::DeserializationError(error.to_string())),
         }
     }
+}
+
+fn validate_remote_signature(algorithm: Algorithm, signature: &[u8]) -> Result<()> {
+    let expected_len = match algorithm {
+        Algorithm::ES256 | Algorithm::EdDSA => Some(64),
+        Algorithm::ES384 => Some(96),
+        Algorithm::RS256
+        | Algorithm::RS384
+        | Algorithm::RS512
+        | Algorithm::PS256
+        | Algorithm::PS384
+        | Algorithm::PS512 => None,
+        _ => {
+            return Err(Error::InvalidInput(format!(
+                "unsupported remote signing algorithm: {algorithm:?}"
+            )))
+        }
+    };
+    if signature.is_empty() {
+        return Err(Error::InvalidInput(
+            "remote signature must not be empty".to_string(),
+        ));
+    }
+    if let Some(expected_len) = expected_len {
+        if signature.len() != expected_len {
+            return Err(Error::InvalidInput(format!(
+                "invalid {algorithm:?} signature length: expected {expected_len} bytes, got {}",
+                signature.len()
+            )));
+        }
+    }
+    Ok(())
 }
 
 trait IssuanceRandomSource {
@@ -719,6 +752,30 @@ mod tests {
 
             assert_eq!(remote, local);
         }
+    }
+
+    #[test]
+    fn remote_planner_rejects_malformed_es256_signatures() {
+        let prepare = || {
+            SDJWTIssuerPlanner::new(Some("ES256".to_string()))
+                .prepare(
+                    json!({"sub": "example"}),
+                    ClaimsForSelectiveDisclosureStrategy::NoSDClaims,
+                    None,
+                    false,
+                    SDJWTSerializationFormat::Compact,
+                )
+                .unwrap()
+        };
+
+        assert!(prepare().complete(&[]).is_err());
+        assert!(prepare().complete(&[0u8; 63]).is_err());
+
+        let mut der_encoded = vec![0u8; 70];
+        der_encoded[0] = 0x30;
+        assert!(prepare().complete(&der_encoded).is_err());
+
+        assert!(prepare().complete(&[0u8; 64]).is_ok());
     }
 
     #[test]
