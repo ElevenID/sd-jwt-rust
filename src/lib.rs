@@ -18,6 +18,52 @@ pub use {
 };
 
 pub type KeyResolver = dyn Fn(&str, &Header) -> DecodingKey;
+/// Resolver used by verification paths that need to reject an unknown or
+/// policy-incompatible issuer key without panicking or fabricating a key.
+pub type FallibleKeyResolver = dyn Fn(&str, &Header) -> Result<DecodingKey>;
+
+/// Cryptographic policy applied to untrusted JOSE headers during verification.
+#[derive(Clone, Debug)]
+pub struct VerificationPolicy {
+    allowed_algorithms: Vec<Algorithm>,
+}
+
+impl VerificationPolicy {
+    /// Create a policy with an explicit algorithm allowlist.
+    pub fn new(allowed_algorithms: Vec<Algorithm>) -> Result<Self> {
+        if allowed_algorithms.is_empty() {
+            return Err(Error::InvalidInput(
+                "Verification algorithm allowlist must not be empty".to_string(),
+            ));
+        }
+        Ok(Self { allowed_algorithms })
+    }
+
+    pub(crate) fn allows(&self, algorithm: Algorithm) -> bool {
+        self.allowed_algorithms.contains(&algorithm)
+    }
+}
+
+impl Default for VerificationPolicy {
+    fn default() -> Self {
+        // Symmetric MAC algorithms are intentionally excluded: issuer keys are
+        // public verification keys, and accepting HS* from an untrusted header
+        // creates an algorithm-confusion boundary.
+        Self {
+            allowed_algorithms: vec![
+                Algorithm::ES256,
+                Algorithm::ES384,
+                Algorithm::EdDSA,
+                Algorithm::RS256,
+                Algorithm::RS384,
+                Algorithm::RS512,
+                Algorithm::PS256,
+                Algorithm::PS384,
+                Algorithm::PS512,
+            ],
+        }
+    }
+}
 
 pub mod batch;
 mod disclosure;

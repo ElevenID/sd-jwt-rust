@@ -17,9 +17,9 @@ use std::vec::Vec;
 
 use crate::utils::base64_hash;
 use crate::{
-    KeyResolver, SDJWTCommon, CNF_KEY, COMBINED_SERIALIZATION_FORMAT_SEPARATOR, DEFAULT_DIGEST_ALG,
-    DEFAULT_SIGNING_ALG, DIGEST_ALG_KEY, JWK_KEY, KB_DIGEST_KEY, KB_JWT_TYP_HEADER, SD_DIGESTS_KEY,
-    SD_LIST_PREFIX,
+    FallibleKeyResolver, KeyResolver, SDJWTCommon, VerificationPolicy, CNF_KEY,
+    COMBINED_SERIALIZATION_FORMAT_SEPARATOR, DEFAULT_DIGEST_ALG, DIGEST_ALG_KEY, JWK_KEY,
+    KB_DIGEST_KEY, KB_JWT_TYP_HEADER, SD_DIGESTS_KEY, SD_LIST_PREFIX,
 };
 
 const DISCLOSURE_PREPROCESSING_STATE_FAILURE: &str =
@@ -36,7 +36,8 @@ pub struct SDJWTVerifier {
     duplicate_hash_check: HashSet<String>,
     pub verified_claims: Value,
 
-    cb_get_issuer_key: Box<KeyResolver>,
+    cb_get_issuer_key: Box<FallibleKeyResolver>,
+    verification_policy: VerificationPolicy,
 }
 
 impl SDJWTVerifier {
@@ -58,11 +59,31 @@ impl SDJWTVerifier {
         expected_nonce: Option<String>,
         serialization_format: SDJWTSerializationFormat,
     ) -> Result<Self> {
+        Self::new_with_policy(
+            sd_jwt_presentation,
+            Box::new(move |issuer, header| Ok(cb_get_issuer_key(issuer, header))),
+            expected_aud,
+            expected_nonce,
+            serialization_format,
+            VerificationPolicy::default(),
+        )
+    }
+
+    /// Verify with a fallible key resolver and an explicit JOSE algorithm policy.
+    pub fn new_with_policy(
+        sd_jwt_presentation: String,
+        cb_get_issuer_key: Box<FallibleKeyResolver>,
+        expected_aud: Option<String>,
+        expected_nonce: Option<String>,
+        serialization_format: SDJWTSerializationFormat,
+        verification_policy: VerificationPolicy,
+    ) -> Result<Self> {
         let mut verifier = SDJWTVerifier {
             sd_jwt_payload: serde_json::Map::new(),
             _holder_public_key_payload: None,
             duplicate_hash_check: HashSet::new(),
             cb_get_issuer_key,
+            verification_policy,
             sd_jwt_engine: SDJWTCommon {
                 serialization_format,
                 ..Default::default()
@@ -77,17 +98,7 @@ impl SDJWTVerifier {
         verifier.verified_claims = verifier.extract_sd_claims()?;
 
         if let (Some(expected_aud), Some(expected_nonce)) = (&expected_aud, &expected_nonce) {
-            let sign_alg = verifier
-                .sd_jwt_engine
-                .unverified_input_key_binding_jwt
-                .as_ref()
-                .and_then(|value| SDJWTCommon::decode_header_and_get_sign_algorithm(value));
-
-            verifier.verify_key_binding_jwt(
-                expected_aud.to_owned(),
-                expected_nonce.to_owned(),
-                sign_alg.as_deref(),
-            )?;
+            verifier.verify_key_binding_jwt(expected_aud.to_owned(), expected_nonce.to_owned())?;
         } else if expected_aud.is_some() || expected_nonce.is_some() {
             return Err(Error::InvalidInput(
                 "Either both expected_aud and expected_nonce must be provided or both must be None"
@@ -107,6 +118,25 @@ impl SDJWTVerifier {
         let parsed_header_sd_jwt = jsonwebtoken::decode_header(sd_jwt)
             .map_err(|e| Error::DeserializationError(e.to_string()))?;
 
+        let algorithm = parsed_header_sd_jwt.alg;
+        if !self.verification_policy.allows(algorithm) {
+            return Err(Error::InvalidInput(format!(
+                "Issuer-signed JWT algorithm {algorithm:?} is not allowed by verification policy"
+            )));
+        }
+        let declared_algorithm = sign_alg.ok_or_else(|| {
+            Error::InvalidInput(
+                "Issuer-signed JWT header is missing the `alg` parameter".to_string(),
+            )
+        })?;
+        let decoded_algorithm = Algorithm::from_str(&declared_algorithm)
+            .map_err(|e| Error::DeserializationError(e.to_string()))?;
+        if decoded_algorithm != algorithm {
+            return Err(Error::InvalidInput(
+                "Issuer-signed JWT algorithm metadata is inconsistent".to_string(),
+            ));
+        }
+
         let unverified_issuer = self
             .sd_jwt_engine
             .unverified_input_sd_jwt_payload
@@ -114,12 +144,7 @@ impl SDJWTVerifier {
             .ok_or(Error::ConversionError("reference".to_string()))?["iss"]
             .as_str()
             .ok_or(Error::ConversionError("str".to_string()))?;
-        let issuer_public_key = (self.cb_get_issuer_key)(unverified_issuer, &parsed_header_sd_jwt);
-        let algorithm: Algorithm = match sign_alg {
-            Some(alg_str) => Algorithm::from_str(&alg_str)
-                .map_err(|e| Error::DeserializationError(e.to_string()))?,
-            None => Algorithm::ES256, // Default or handle as needed
-        };
+        let issuer_public_key = (self.cb_get_issuer_key)(unverified_issuer, &parsed_header_sd_jwt)?;
         let mut validation = Validation::new(algorithm);
         // RFC 9901 §4.1: `exp` is not mandated, so don't require it. `validate_exp`
         // stays true, so a present `exp` is still checked for expiry.
@@ -130,8 +155,6 @@ impl SDJWTVerifier {
         let claims = jsonwebtoken::decode(sd_jwt, &issuer_public_key, &validation)
             .map_err(|e| Error::DeserializationError(format!("Cannot decode jwt: {e}")))?
             .claims;
-
-        let _ = sign_alg; //FIXME check algo
 
         self.sd_jwt_payload = claims;
         self._holder_public_key_payload = self
@@ -147,9 +170,7 @@ impl SDJWTVerifier {
         &mut self,
         expected_aud: String,
         expected_nonce: String,
-        sign_alg: Option<&str>,
     ) -> Result<()> {
-        let sign_alg = sign_alg.unwrap_or(DEFAULT_SIGNING_ALG);
         let holder_public_key_payload_jwk = match &self._holder_public_key_payload {
             None => {
                 return Err(Error::KeyNotFound(
@@ -183,10 +204,15 @@ impl SDJWTVerifier {
         };
         let key_binding_jwt = match &self.sd_jwt_engine.unverified_input_key_binding_jwt {
             Some(payload) => {
-                let mut validation = Validation::new(
-                    Algorithm::from_str(sign_alg)
-                        .map_err(|e| Error::DeserializationError(e.to_string()))?,
-                );
+                let header = jsonwebtoken::decode_header(payload)
+                    .map_err(|e| Error::DeserializationError(e.to_string()))?;
+                if !self.verification_policy.allows(header.alg) {
+                    return Err(Error::InvalidInput(format!(
+                        "Key Binding JWT algorithm {:?} is not allowed by verification policy",
+                        header.alg
+                    )));
+                }
+                let mut validation = Validation::new(header.alg);
                 validation.set_audience(&[&expected_aud]);
                 validation.set_required_spec_claims(&["aud"]);
 
@@ -495,7 +521,7 @@ mod tests {
     use crate::{
         take_disclosure_preprocessing_route, DisclosurePreprocessingRoute, SDJWTFlattenedJson,
         SDJWTGeneralJson, SDJWTHolder, SDJWTIssuer, SDJWTSerializationFormat, SDJWTVerifier,
-        COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
+        VerificationPolicy, COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
     };
     use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header};
     use rstest::rstest;
@@ -682,6 +708,60 @@ mod tests {
             None,
             SDJWTSerializationFormat::Compact,
         )
+    }
+
+    #[test]
+    fn default_policy_rejects_symmetric_algorithm_from_untrusted_header() {
+        let payload = json!({
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "_sd_alg": "sha-256",
+        });
+        let secret = b"attacker-controlled-shared-secret";
+        let signed = jsonwebtoken::encode(
+            &Header::new(Algorithm::HS256),
+            &payload,
+            &EncodingKey::from_secret(secret),
+        )
+        .unwrap();
+
+        let error = SDJWTVerifier::new(
+            format!("{signed}~"),
+            Box::new(move |_, _| DecodingKey::from_secret(secret)),
+            None,
+            None,
+            SDJWTSerializationFormat::Compact,
+        )
+        .err()
+        .expect("HS256 must be rejected before signature verification");
+
+        assert!(error
+            .to_string()
+            .contains("not allowed by verification policy"));
+    }
+
+    #[test]
+    fn explicit_policy_and_fallible_resolver_fail_closed() {
+        let payload = json!({
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "_sd_alg": "sha-256",
+        });
+        let presentation = compact_presentation(&payload, &[]);
+        let policy = VerificationPolicy::new(vec![Algorithm::ES256]).unwrap();
+
+        let error = SDJWTVerifier::new_with_policy(
+            presentation,
+            Box::new(|_, _| Err(Error::KeyNotFound("issuer key unavailable".to_string()))),
+            None,
+            None,
+            SDJWTSerializationFormat::Compact,
+            policy,
+        )
+        .err()
+        .expect("resolver failure must be propagated");
+
+        assert!(matches!(error, Error::KeyNotFound(_)));
     }
 
     fn compact_verification_error(presentation: String) -> Error {
