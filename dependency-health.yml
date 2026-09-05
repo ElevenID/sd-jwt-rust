@@ -8,7 +8,7 @@ dependencies:
     target: upstream-main
     status: maintained
     decision: retain
-    advisories: []
+    advisories: [RUSTSEC-2023-0071]
     tracking-issue: https://github.com/ElevenID/sd-jwt-rust/issues/4
     review-after: 2026-10-18
-    rationale: The fork retains upstream behavior while adding ElevenID security and quality policy. Browser entropy remains supplied by getrandom's JS backend, whose transitive wasm-bindgen family is intentionally allowed to unify with maintained consumers and is compile-checked against the supported consumer family.
+    rationale: The fork retains upstream behavior while adding ElevenID security and quality policy. rsa 0.9.10 remains transitively required by jsonwebtoken and has no patched release as of 2026-09-04; the standalone issuer and holder key-binding APIs can invoke RSA private-key operations, so consumers must not treat this advisory as verification-only. ElevenID production bindings compile-gate local private-key operations and use remote KMS signing; the standalone residual is accepted temporarily and reviewed on the date above. Browser entropy remains supplied by getrandom's JS backend, whose transitive wasm-bindgen family is intentionally allowed to unify with maintained consumers and is compile-checked against the supported consumer family.
