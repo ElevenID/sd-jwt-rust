@@ -944,9 +944,8 @@ mod tests {
         let preprocessing_error = compact_verification_error(malformed_and_invalid_signature);
         match &preprocessing_error {
             Error::InvalidDisclosure(message) => assert!(
-                message.starts_with(&format!(
-                    "Error decoding disclosure {malformed_disclosure}:"
-                )),
+                message.starts_with("Error decoding disclosure:")
+                    && !message.contains(&malformed_disclosure),
                 "unexpected preprocessing message: {message}"
             ),
             other => panic!("expected InvalidDisclosure, got {other:?}"),
@@ -954,7 +953,8 @@ mod tests {
         assert!(
             preprocessing_error
                 .to_string()
-                .starts_with("invalid disclosure: Error decoding disclosure %:"),
+                .starts_with("invalid disclosure: Error decoding disclosure:")
+                && !preprocessing_error.to_string().contains(&malformed_disclosure),
             "unexpected preprocessing error: {preprocessing_error}"
         );
 
@@ -1197,7 +1197,7 @@ mod tests {
             format!("{signed}{separator}%{separator}{disclosures}");
         let preprocessing_error = compact_verification_error(malformed_and_invalid_signature);
         assert!(
-            matches!(&preprocessing_error, Error::InvalidDisclosure(message) if message.starts_with("Error decoding disclosure %:")),
+            matches!(&preprocessing_error, Error::InvalidDisclosure(message) if message.starts_with("Error decoding disclosure:") && !message.contains('%')),
             "expected preprocessing error, got {preprocessing_error:?}"
         );
     }

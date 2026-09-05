@@ -632,18 +632,10 @@ fn plan_disclosures(encoded_disclosures: &[String]) -> Vec<DisclosureJob<'_>> {
 /// state. Hashing deliberately uses the original encoded bytes.
 pub(crate) fn process_disclosure<'a>(job: &DisclosureJob<'a>) -> DisclosureOutcome<'a> {
     let result = (|| {
-        let decoded_disclosure = base64url_decode(job.encoded_disclosure).map_err(|err| {
-            Error::InvalidDisclosure(format!(
-                "Error decoding disclosure {}: {}",
-                job.encoded_disclosure, err
-            ))
-        })?;
-        let decoded_disclosure = serde_json::from_slice(&decoded_disclosure).map_err(|err| {
-            Error::InvalidDisclosure(format!(
-                "Error parsing disclosure {}: {}",
-                job.encoded_disclosure, err
-            ))
-        })?;
+        let decoded_disclosure = base64url_decode(job.encoded_disclosure)
+            .map_err(|err| Error::InvalidDisclosure(format!("Error decoding disclosure: {err}")))?;
+        let decoded_disclosure = serde_json::from_slice(&decoded_disclosure)
+            .map_err(|err| Error::InvalidDisclosure(format!("Error parsing disclosure: {err}")))?;
 
         Ok(ProcessedDisclosure {
             digest: base64_hash(job.encoded_disclosure.as_bytes()),
@@ -777,10 +769,10 @@ mod tests {
     const WHITESPACE_DISCLOSURE_HASH: &str = "heY8-8zXVWlYO5sT5PWM6IQGEGJcyW_aTHm-2D1DgTQ";
     const INVALID_BASE64_DISCLOSURE: &str = "%";
     const INVALID_BASE64_MESSAGE: &str =
-        "Error decoding disclosure %: invalid input: Invalid byte 37, offset 0.";
+        "Error decoding disclosure: invalid input: Invalid byte 37, offset 0.";
     const INVALID_JSON_DISCLOSURE: &str = "ew";
     const INVALID_JSON_MESSAGE: &str =
-        "Error parsing disclosure ew: EOF while parsing an object at line 1 column 1";
+        "Error parsing disclosure: EOF while parsing an object at line 1 column 1";
 
     fn owned(disclosures: &[&str]) -> Vec<String> {
         disclosures
@@ -1160,6 +1152,16 @@ mod tests {
 
             assert_invalid_disclosure(outcome.result.unwrap().unwrap_err(), expected_message);
         }
+    }
+
+    #[test]
+    fn malformed_disclosure_errors_do_not_echo_disclosure_material() {
+        const SENTINEL: &str = "not-base64-secret-sentinel%";
+        let disclosures = owned(&[SENTINEL]);
+        let jobs = plan_disclosures(&disclosures);
+        let error = process_disclosure(&jobs[0]).result.unwrap().unwrap_err();
+
+        assert!(!error.to_string().contains(SENTINEL));
     }
 
     #[cfg(all(feature = "parallel", target_arch = "x86_64"))]

@@ -83,6 +83,12 @@ const _SD_JWT_TYP_HEADER: &str = "sd+jwt";
 const KB_JWT_TYP_HEADER: &str = "kb+jwt";
 const KB_DIGEST_KEY: &str = "sd_hash";
 pub const COMBINED_SERIALIZATION_FORMAT_SEPARATOR: &str = "~";
+/// Maximum accepted serialized presentation size before parsing or decoding.
+pub const MAX_SD_JWT_INPUT_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum number of disclosures accepted in one presentation.
+pub const MAX_SD_JWT_DISCLOSURES: usize = 8192;
+/// Maximum encoded size of one disclosure.
+pub const MAX_SD_JWT_DISCLOSURE_BYTES: usize = 64 * 1024;
 const JWT_SEPARATOR: &str = ".";
 const CNF_KEY: &str = "cnf";
 const JWK_KEY: &str = "jwk";
@@ -261,6 +267,15 @@ impl SDJWTCommon {
     }
 
     fn parse_compact_sd_jwt(&mut self, sd_jwt_with_disclosures: String) -> Result<()> {
+        let separator_count = sd_jwt_with_disclosures
+            .bytes()
+            .filter(|byte| *byte == b'~')
+            .count();
+        if separator_count > MAX_SD_JWT_DISCLOSURES + 1 {
+            return Err(Error::InvalidInput(
+                "SD-JWT exceeds the disclosure count limit".to_string(),
+            ));
+        }
         let parts: Vec<&str> = sd_jwt_with_disclosures
             .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
             .collect();
@@ -275,7 +290,7 @@ impl SDJWTCommon {
         let sd_jwt = parts.next().ok_or(Error::IndexOutOfBounds {
             idx: 0,
             length: parts.len(),
-            msg: format!("Invalid SD-JWT: {sd_jwt_with_disclosures}"),
+            msg: "Invalid SD-JWT structure".to_string(),
         })?;
         self.sign_alg = Self::decode_header_and_get_sign_algorithm(sd_jwt);
         let trailing = parts.next_back().unwrap_or("");
@@ -292,10 +307,7 @@ impl SDJWTCommon {
         let jwt_body = sd_jwt.next().ok_or(Error::IndexOutOfBounds {
             idx: 1,
             length: 3,
-            msg: format!(
-                "Invalid JWT: Cannot extract JWT payload: {}",
-                self.unverified_sd_jwt.to_owned().unwrap_or("".to_string())
-            ),
+            msg: "Invalid JWT: cannot extract payload".to_string(),
         })?;
         self.unverified_input_sd_jwt_payload = Some(jwt_payload_decode(jwt_body)?);
         Ok(())
@@ -346,6 +358,12 @@ impl SDJWTCommon {
     }
 
     fn parse_sd_jwt(&mut self, sd_jwt_with_disclosures: String) -> Result<()> {
+        if sd_jwt_with_disclosures.len() > MAX_SD_JWT_INPUT_BYTES {
+            return Err(Error::InvalidInput(
+                "SD-JWT exceeds the serialized input size limit".to_string(),
+            ));
+        }
+
         match self.serialization_format {
             SDJWTSerializationFormat::Compact => self.parse_compact_sd_jwt(sd_jwt_with_disclosures),
             SDJWTSerializationFormat::FlattenedJson => {
@@ -354,7 +372,24 @@ impl SDJWTCommon {
             SDJWTSerializationFormat::GeneralJson => {
                 self.parse_general_json_sd_jwt(sd_jwt_with_disclosures)
             }
+        }?;
+
+        if self.input_disclosures.len() > MAX_SD_JWT_DISCLOSURES {
+            return Err(Error::InvalidInput(
+                "SD-JWT exceeds the disclosure count limit".to_string(),
+            ));
         }
+        if self
+            .input_disclosures
+            .iter()
+            .any(|disclosure| disclosure.len() > MAX_SD_JWT_DISCLOSURE_BYTES)
+        {
+            return Err(Error::InvalidInput(
+                "SD-JWT disclosure exceeds the encoded size limit".to_string(),
+            ));
+        }
+
+        Ok(())
     }
     /// Decodes a header jwt string and extracts the "alg" field from the JSON object.
     /// # Arguments
@@ -381,9 +416,9 @@ impl SDJWTCommon {
     fn split_jwt(jwt: &str) -> Result<(String, String, String)> {
         let parts: Vec<&str> = jwt.split('.').collect();
         let [protected, payload, signature] = parts.as_slice() else {
-            return Err(Error::InvalidState(format!(
-                "Invalid signed JWT, expected three parts: {jwt}"
-            )));
+            return Err(Error::InvalidState(
+                "Invalid signed JWT, expected three parts".to_string(),
+            ));
         };
         Ok((
             protected.to_string(),
@@ -406,10 +441,10 @@ mod tests {
     const ARRAY_DISCLOSURE_HASH: &str = "GiEJkgij2cXW0bIMz3Fwi09P0ZQLSXzQ-1CpxGGfl98";
     const INVALID_BASE64_DISCLOSURE: &str = "%";
     const INVALID_BASE64_MESSAGE: &str =
-        "Error decoding disclosure %: invalid input: Invalid byte 37, offset 0.";
+        "Error decoding disclosure: invalid input: Invalid byte 37, offset 0.";
     const INVALID_JSON_DISCLOSURE: &str = "ew";
     const INVALID_JSON_MESSAGE: &str =
-        "Error parsing disclosure ew: EOF while parsing an object at line 1 column 1";
+        "Error parsing disclosure: EOF while parsing an object at line 1 column 1";
 
     fn common_with_disclosures(disclosures: &[&str]) -> SDJWTCommon {
         SDJWTCommon {
@@ -443,6 +478,66 @@ mod tests {
             }
             other => panic!("expected DuplicateDigestError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn malformed_jwt_errors_do_not_echo_credential_material() {
+        const SENTINEL: &str = "credential-secret-sentinel";
+
+        let split_error = SDJWTCommon::split_jwt(SENTINEL).unwrap_err();
+        assert!(!split_error.to_string().contains(SENTINEL));
+
+        let mut common = SDJWTCommon {
+            serialization_format: crate::SDJWTSerializationFormat::Compact,
+            ..Default::default()
+        };
+        let parse_error = common
+            .parse_compact_sd_jwt(format!("{SENTINEL}~"))
+            .unwrap_err();
+        assert!(!parse_error.to_string().contains(SENTINEL));
+    }
+
+    #[test]
+    fn parsing_rejects_oversized_serialized_input_before_decoding() {
+        let mut common = SDJWTCommon {
+            serialization_format: crate::SDJWTSerializationFormat::Compact,
+            ..Default::default()
+        };
+        let oversized = "x".repeat(crate::MAX_SD_JWT_INPUT_BYTES + 1);
+
+        let error = common.parse_sd_jwt(oversized).unwrap_err();
+
+        assert!(error.to_string().contains("serialized input size limit"));
+    }
+
+    #[test]
+    fn compact_parsing_rejects_excessive_disclosure_count_before_collecting() {
+        let mut common = SDJWTCommon {
+            serialization_format: crate::SDJWTSerializationFormat::Compact,
+            ..Default::default()
+        };
+        let presentation = format!(
+            "e30.e30.signature{}",
+            "~x".repeat(crate::MAX_SD_JWT_DISCLOSURES + 2)
+        );
+
+        let error = common.parse_sd_jwt(presentation).unwrap_err();
+
+        assert!(error.to_string().contains("disclosure count limit"));
+    }
+
+    #[test]
+    fn parsing_rejects_oversized_individual_disclosure() {
+        let mut common = SDJWTCommon {
+            serialization_format: crate::SDJWTSerializationFormat::Compact,
+            ..Default::default()
+        };
+        let disclosure = "x".repeat(crate::MAX_SD_JWT_DISCLOSURE_BYTES + 1);
+        let presentation = format!("e30.e30.signature~{disclosure}~");
+
+        let error = common.parse_sd_jwt(presentation).unwrap_err();
+
+        assert!(error.to_string().contains("encoded size limit"));
     }
 
     #[test]
