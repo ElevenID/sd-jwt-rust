@@ -2,7 +2,7 @@
 // https://www.dsr-corporation.com
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, DUPLICATE_DISCLOSURE_DIGEST};
 use crate::utils::{base64_hash, base64url_decode};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -107,7 +107,9 @@ impl SerialDisclosureExecutor {
                 }
             };
             if hash_to_decoded_disclosure.contains_key(&processed.digest) {
-                return Err(Error::DuplicateDigestError(processed.digest));
+                return Err(Error::DuplicateDigestError(
+                    DUPLICATE_DISCLOSURE_DIGEST.to_owned(),
+                ));
             }
 
             hash_to_disclosure.insert(processed.digest.clone(), encoded_disclosure.to_owned());
@@ -674,7 +676,9 @@ pub(crate) fn assemble_disclosures<'a>(
             }
         };
         if hash_to_decoded_disclosure.contains_key(&processed.digest) {
-            return Err(Error::DuplicateDigestError(processed.digest));
+            return Err(Error::DuplicateDigestError(
+                DUPLICATE_DISCLOSURE_DIGEST.to_owned(),
+            ));
         }
 
         hash_to_disclosure.insert(
@@ -1073,8 +1077,8 @@ mod tests {
         let error = assemble_disclosures(&jobs, outcomes).unwrap_err();
 
         match error {
-            Error::DuplicateDigestError(digest) => {
-                assert_eq!(digest, OBJECT_DISCLOSURE_HASH)
+            Error::DuplicateDigestError(message) => {
+                assert_eq!(message, DUPLICATE_DISCLOSURE_DIGEST)
             }
             other => panic!("expected DuplicateDigestError, got {other:?}"),
         }

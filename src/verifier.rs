@@ -2,8 +2,8 @@
 // https://www.dsr-corporation.com
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::error::Error;
 use crate::error::Result;
+use crate::error::{Error, DUPLICATE_DISCLOSURE_DIGEST};
 use crate::SDJWTSerializationFormat;
 use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
@@ -27,6 +27,17 @@ const DISCLOSURE_PREPROCESSING_STATE_FAILURE: &str =
 const MAX_PROCESSED_SD_JWT_DEPTH: usize = 128;
 const PROCESSED_SD_JWT_DEPTH_FAILURE: &str =
     "Processed SD-JWT exceeds maximum supported nesting depth";
+const INVALID_OBJECT_DISCLOSURE_TYPE: &str = "Object-property Disclosure must be a JSON array";
+const INVALID_OBJECT_DISCLOSURE_LENGTH: &str =
+    "Object-property Disclosure must be a 3-element array [salt, name, value]";
+const RESERVED_DISCLOSURE_CLAIM_NAME: &str =
+    "Disclosure claim name must not use a reserved SD-JWT structural marker";
+const INVALID_ARRAY_DISCLOSURE_TYPE: &str = "Array-element Disclosure must be a JSON array";
+const INVALID_ARRAY_DISCLOSURE_LENGTH: &str =
+    "Array-element Disclosure must be a 2-element array [salt, value]";
+const INVALID_DIGEST_ALGORITHM: &str = "SD-JWT digest algorithm is not supported";
+const UNREFERENCED_DISCLOSURE: &str = "Disclosure was not referenced by the SD-JWT";
+const DUPLICATE_DISCLOSED_CLAIM: &str = "Duplicate disclosed claim";
 
 pub struct SDJWTVerifier {
     sd_jwt_engine: SDJWTCommon,
@@ -270,10 +281,9 @@ impl SDJWTVerifier {
         if self.sd_jwt_payload.contains_key(DIGEST_ALG_KEY)
             && self.sd_jwt_payload[DIGEST_ALG_KEY] != DEFAULT_DIGEST_ALG
         {
-            return Err(Error::DeserializationError(format!(
-                "Invalid hash algorithm {}",
-                self.sd_jwt_payload[DIGEST_ALG_KEY]
-            )));
+            return Err(Error::DeserializationError(
+                INVALID_DIGEST_ALGORITHM.to_owned(),
+            ));
         }
 
         for (key, value) in self.sd_jwt_payload.iter() {
@@ -304,9 +314,7 @@ impl SDJWTVerifier {
         // that set is unreferenced.
         for disclosure_hash in &self.sd_jwt_engine.ordered_disclosure_digests {
             if !self.duplicate_hash_check.contains(disclosure_hash.as_str()) {
-                return Err(Error::InvalidDisclosure(format!(
-                    "Disclosure was not referenced by any digest in the SD-JWT: {disclosure_hash}"
-                )));
+                return Err(Error::InvalidDisclosure(UNREFERENCED_DISCLOSURE.to_owned()));
             }
         }
 
@@ -330,7 +338,9 @@ impl SDJWTVerifier {
 
     fn record_digest(&mut self, digest: &str) -> Result<()> {
         if self.duplicate_hash_check.contains(digest) {
-            return Err(Error::DuplicateDigestError(digest.to_owned()));
+            return Err(Error::DuplicateDigestError(
+                DUPLICATE_DISCLOSURE_DIGEST.to_owned(),
+            ));
         }
         self.duplicate_hash_check.insert(digest.to_owned());
         Ok(())
@@ -449,29 +459,28 @@ impl SDJWTVerifier {
             if let Some(value_for_digest) =
                 self.sd_jwt_engine.hash_to_decoded_disclosure.get(digest)
             {
-                let disclosure =
-                    value_for_digest
-                        .as_array()
-                        .ok_or(Error::InvalidArrayDisclosureObject(
-                            value_for_digest.to_string(),
-                        ))?;
+                let disclosure = value_for_digest.as_array().ok_or_else(|| {
+                    Error::InvalidArrayDisclosureObject(INVALID_OBJECT_DISCLOSURE_TYPE.to_owned())
+                })?;
                 if disclosure.len() != 3 {
-                    return Err(Error::InvalidDisclosure(format!(
-                        "Object-property Disclosure must be a 3-element array [salt, name, value]: {value_for_digest}"
-                    )));
+                    return Err(Error::InvalidDisclosure(
+                        INVALID_OBJECT_DISCLOSURE_LENGTH.to_owned(),
+                    ));
                 }
                 let key = disclosure[1]
                     .as_str()
                     .ok_or(Error::ConversionError("str".to_string()))?
                     .to_owned();
                 if key == SD_DIGESTS_KEY || key == SD_LIST_PREFIX {
-                    return Err(Error::InvalidDisclosure(format!(
-                        "Disclosure claim name must not be `_sd` or `...`: {key}"
-                    )));
+                    return Err(Error::InvalidDisclosure(
+                        RESERVED_DISCLOSURE_CLAIM_NAME.to_owned(),
+                    ));
                 }
                 let value = disclosure[2].clone();
                 if pre_output.contains_key(&key) {
-                    return Err(Error::DuplicateKeyError(key.to_string()));
+                    return Err(Error::DuplicateKeyError(
+                        DUPLICATE_DISCLOSED_CLAIM.to_owned(),
+                    ));
                 }
                 let unpacked_value = self.unpack_disclosed_claims(&value, processed_depth)?;
                 pre_output.insert(key, unpacked_value);
@@ -492,16 +501,13 @@ impl SDJWTVerifier {
         self.record_digest(digest)?;
 
         if let Some(value_for_digest) = self.sd_jwt_engine.hash_to_decoded_disclosure.get(digest) {
-            let disclosure =
-                value_for_digest
-                    .as_array()
-                    .ok_or(Error::InvalidArrayDisclosureObject(
-                        value_for_digest.to_string(),
-                    ))?;
+            let disclosure = value_for_digest.as_array().ok_or_else(|| {
+                Error::InvalidArrayDisclosureObject(INVALID_ARRAY_DISCLOSURE_TYPE.to_owned())
+            })?;
             if disclosure.len() != 2 {
-                return Err(Error::InvalidArrayDisclosureObject(format!(
-                    "Array-element Disclosure must be a 2-element array [salt, value]: {value_for_digest}"
-                )));
+                return Err(Error::InvalidArrayDisclosureObject(
+                    INVALID_ARRAY_DISCLOSURE_LENGTH.to_owned(),
+                ));
             }
 
             let value = disclosure[1].clone();
@@ -801,13 +807,12 @@ mod tests {
             let error = compact_verification_error(compact_presentation(&payload, &disclosures));
 
             match &error {
-                Error::DuplicateDigestError(actual) => assert_eq!(actual, &digest),
+                Error::DuplicateDigestError(message) => {
+                    assert_eq!(message, super::DUPLICATE_DISCLOSURE_DIGEST)
+                }
                 other => panic!("expected DuplicateDigestError, got {other:?}"),
             }
-            assert_eq!(
-                error.to_string(),
-                format!("Digest {digest} appears multiple times")
-            );
+            assert!(!error.to_string().contains(&digest));
         }
     }
 
@@ -824,10 +829,12 @@ mod tests {
 
         let error = compact_verification_error(compact_presentation(&payload, &[disclosure]));
         match &error {
-            Error::DuplicateKeyError(key) => assert_eq!(key, "family_name"),
+            Error::DuplicateKeyError(message) => {
+                assert_eq!(message, super::DUPLICATE_DISCLOSED_CLAIM)
+            }
             other => panic!("expected DuplicateKeyError, got {other:?}"),
         }
-        assert_eq!(error.to_string(), "Key family_name appears multiple times");
+        assert!(!error.to_string().contains("family_name"));
     }
 
     #[test]
@@ -844,10 +851,12 @@ mod tests {
 
         let error = compact_verification_error(compact_presentation(&payload, &[first, second]));
         match &error {
-            Error::DuplicateKeyError(key) => assert_eq!(key, "family_name"),
+            Error::DuplicateKeyError(message) => {
+                assert_eq!(message, super::DUPLICATE_DISCLOSED_CLAIM)
+            }
             other => panic!("expected DuplicateKeyError, got {other:?}"),
         }
-        assert_eq!(error.to_string(), "Key family_name appears multiple times");
+        assert!(!error.to_string().contains("family_name"));
     }
 
     #[test]
@@ -892,13 +901,16 @@ mod tests {
             let error = compact_verification_error(compact_presentation(&payload, &[disclosure]));
             match &error {
                 Error::InvalidArrayDisclosureObject(actual) => {
-                    assert_eq!(actual, &decoded.to_string())
+                    assert_eq!(actual, super::INVALID_OBJECT_DISCLOSURE_TYPE)
                 }
                 other => panic!("expected InvalidArrayDisclosureObject, got {other:?}"),
             }
             assert_eq!(
                 error.to_string(),
-                format!("invalid array disclosure: {decoded}")
+                format!(
+                    "invalid array disclosure: {}",
+                    super::INVALID_OBJECT_DISCLOSURE_TYPE
+                )
             );
         }
     }
@@ -954,7 +966,9 @@ mod tests {
             preprocessing_error
                 .to_string()
                 .starts_with("invalid disclosure: Error decoding disclosure:")
-                && !preprocessing_error.to_string().contains(&malformed_disclosure),
+                && !preprocessing_error
+                    .to_string()
+                    .contains(&malformed_disclosure),
             "unexpected preprocessing error: {preprocessing_error}"
         );
 
@@ -976,13 +990,16 @@ mod tests {
         let reconstruction_error = compact_verification_error(valid);
         match &reconstruction_error {
             Error::InvalidArrayDisclosureObject(actual) => {
-                assert_eq!(actual, "\"not-an-array\"")
+                assert_eq!(actual, super::INVALID_OBJECT_DISCLOSURE_TYPE)
             }
             other => panic!("expected InvalidArrayDisclosureObject, got {other:?}"),
         }
         assert_eq!(
             reconstruction_error.to_string(),
-            "invalid array disclosure: \"not-an-array\""
+            format!(
+                "invalid array disclosure: {}",
+                super::INVALID_OBJECT_DISCLOSURE_TYPE
+            )
         );
     }
 
@@ -1030,23 +1047,19 @@ mod tests {
             "_sd_alg": "sha-256",
         });
 
-        for (disclosures, expected_digest) in [
+        for (disclosures, untrusted_digest) in [
             (vec![first.clone(), second.clone()], first_digest.clone()),
             (vec![second, first], second_digest),
         ] {
             let error = compact_verification_error(compact_presentation(&payload, &disclosures));
-            let expected_message = format!(
-                "Disclosure was not referenced by any digest in the SD-JWT: {expected_digest}"
-            );
 
             match &error {
-                Error::InvalidDisclosure(message) => assert_eq!(message, &expected_message),
+                Error::InvalidDisclosure(message) => {
+                    assert_eq!(message, super::UNREFERENCED_DISCLOSURE)
+                }
                 other => panic!("expected InvalidDisclosure, got {other:?}"),
             }
-            assert_eq!(
-                error.to_string(),
-                format!("invalid disclosure: {expected_message}")
-            );
+            assert!(!error.to_string().contains(&untrusted_digest));
         }
     }
 
@@ -1096,13 +1109,16 @@ mod tests {
             compact_verification_error(compact_presentation(&payload, &[unreferenced, scalar]));
         match &error {
             Error::InvalidArrayDisclosureObject(actual) => {
-                assert_eq!(actual, "\"not-an-array\"")
+                assert_eq!(actual, super::INVALID_OBJECT_DISCLOSURE_TYPE)
             }
             other => panic!("expected InvalidArrayDisclosureObject, got {other:?}"),
         }
         assert_eq!(
             error.to_string(),
-            "invalid array disclosure: \"not-an-array\""
+            format!(
+                "invalid array disclosure: {}",
+                super::INVALID_OBJECT_DISCLOSURE_TYPE
+            )
         );
     }
 
@@ -1216,7 +1232,7 @@ mod tests {
         ]);
         let duplicate_error = compact_verification_error(duplicate_fixture.presentation());
         assert!(
-            matches!(&duplicate_error, Error::DuplicateDigestError(digest) if digest == "repeated-decoy-before-recursion"),
+            matches!(&duplicate_error, Error::DuplicateDigestError(message) if message == super::DUPLICATE_DISCLOSURE_DIGEST),
             "expected duplicate digest error, got {duplicate_error:?}"
         );
 
@@ -1225,7 +1241,7 @@ mod tests {
         collision_fixture.payload["recursive-root"] = json!("visible");
         let collision_error = compact_verification_error(collision_fixture.presentation());
         assert!(
-            matches!(&collision_error, Error::DuplicateKeyError(key) if key == "recursive-root"),
+            matches!(&collision_error, Error::DuplicateKeyError(message) if message == super::DUPLICATE_DISCLOSED_CLAIM),
             "expected duplicate key error, got {collision_error:?}"
         );
 
@@ -1243,6 +1259,65 @@ mod tests {
             matches!(&malformed_error, Error::InvalidDisclosure(message) if message.starts_with("Object-property Disclosure must be a 3-element array")),
             "expected malformed Disclosure error, got {malformed_error:?}"
         );
+    }
+
+    #[test]
+    fn structural_disclosure_errors_do_not_echo_decoded_material() {
+        const SENTINEL: &str = "decoded-private-disclosure-sentinel";
+        let malformed_values = [
+            (json!({ "secret": SENTINEL }), false),
+            (json!([SENTINEL, "name", "value", "extra"]), false),
+            (json!({ "secret": SENTINEL }), true),
+            (json!([SENTINEL, "value", "extra"]), true),
+        ];
+
+        for (malformed, array_element) in malformed_values {
+            let (encoded, digest) = encoded_disclosure(&malformed);
+            let payload = if array_element {
+                json!({
+                    "iss": "https://example.com/issuer",
+                    "iat": 1683000000,
+                    "items": [{ "...": digest }],
+                })
+            } else {
+                json!({
+                    "iss": "https://example.com/issuer",
+                    "iat": 1683000000,
+                    "_sd_alg": "sha-256",
+                    "_sd": [digest],
+                })
+            };
+            let presentation = compact_presentation(&payload, &[encoded]);
+            let error = compact_verification_error(presentation);
+            assert!(
+                matches!(
+                    &error,
+                    Error::InvalidDisclosure(_) | Error::InvalidArrayDisclosureObject(_)
+                ),
+                "expected structural Disclosure error, got {error:?}"
+            );
+            assert!(
+                !error.to_string().contains(SENTINEL),
+                "structural error exposed decoded Disclosure material: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn digest_algorithm_error_does_not_echo_untrusted_value() {
+        const SENTINEL: &str = "untrusted-digest-algorithm-sentinel";
+        let payload = json!({
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "_sd_alg": SENTINEL,
+        });
+        let error = compact_verification_error(compact_presentation(&payload, &[]));
+
+        assert!(matches!(
+            &error,
+            Error::DeserializationError(message) if message == super::INVALID_DIGEST_ALGORITHM
+        ));
+        assert!(!error.to_string().contains(SENTINEL));
     }
 
     #[test]
@@ -2179,10 +2254,20 @@ mod tests {
                 None,
                 SDJWTSerializationFormat::Compact,
             );
-            assert!(
-                result.is_err(),
-                "verifier accepted a Disclosure with reserved claim name `{reserved}`",
+            let error = match result {
+                Ok(_) => {
+                    panic!("verifier accepted a Disclosure with reserved claim name `{reserved}`")
+                }
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "invalid disclosure: {}",
+                    super::RESERVED_DISCLOSURE_CLAIM_NAME
+                )
             );
+            assert!(!error.to_string().contains(reserved));
         }
     }
 

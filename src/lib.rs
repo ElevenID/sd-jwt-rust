@@ -479,11 +479,14 @@ mod tests {
     fn assert_duplicate_disclosure(error: Error) {
         assert_eq!(
             error.to_string(),
-            format!("Digest {OBJECT_DISCLOSURE_HASH} appears multiple times")
+            format!(
+                "Digest {} appears multiple times",
+                crate::error::DUPLICATE_DISCLOSURE_DIGEST
+            )
         );
         match error {
-            Error::DuplicateDigestError(digest) => {
-                assert_eq!(digest, OBJECT_DISCLOSURE_HASH)
+            Error::DuplicateDigestError(message) => {
+                assert_eq!(message, crate::error::DUPLICATE_DISCLOSURE_DIGEST)
             }
             other => panic!("expected DuplicateDigestError, got {other:?}"),
         }
