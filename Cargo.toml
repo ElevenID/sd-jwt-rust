@@ -12,7 +12,7 @@ homepage = "https://github.com/openwallet-foundation-labs/sd-jwt-rust"
 
 [features]
 default = ["issuer-local", "holder", "verifier"]
-issuer-local = []
+issuer-local = ["dep:getrandom", "dep:rand"]
 holder = []
 verifier = []
 mock_salts = ["issuer-local", "lazy_static"]
@@ -25,11 +25,9 @@ issuance_bench = ["issuer-local", "parallel", "dep:libc", "dep:winapi-util"]
 
 [dependencies]
 base64 = "0.21"
-hmac = "0.12"
 jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
 lazy_static = {  version = "1.4", optional = true }
-log = "0.4"
-rand = "0.8"
+rand = { version = "0.8", optional = true }
 serde = { version = "1.0.193", features = ["derive"] }
 serde_json = { version = "1.0.113", features = ["preserve_order"] }
 sha2 = "0.10"
@@ -40,7 +38,7 @@ strum = { version = "0.25", default-features = false, features = ["std", "derive
 # `rand` 0.8 delegates browser entropy to `getrandom` 0.2. Let that
 # dependency own the JS bindings so its wasm-bindgen family can unify with the
 # embedding application instead of forcing one exact transitive release.
-getrandom = { version = "0.2", features = ["js"] }
+getrandom = { version = "0.2", features = ["js"], optional = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
 # Resolver/compile regression for the JS binding family used by maintained
@@ -55,6 +53,8 @@ winapi-util = { version = "0.1.6", optional = true }
 
 [dev-dependencies]
 criterion = { version = "=0.5.1", default-features = false }
+log = "0.4"
+rand = "0.8"
 rstest = "0.18.2"
 regex = "1.10"
 

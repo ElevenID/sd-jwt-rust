@@ -1018,7 +1018,6 @@ dependencies = [
  "base64 0.21.7",
  "criterion",
  "getrandom",
- "hmac",
  "jsonwebtoken",
  "lazy_static",
  "libc",
