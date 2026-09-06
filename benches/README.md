@@ -76,9 +76,11 @@ Each fixture registers four IDs:
 - `executor_assembly` constructs the complete immutable `IssuancePlan` in
   Criterion's untimed `iter_batched` setup and times only execution,
   deterministic restoration, and assembly.
-- `full_issuance` clones claims and the random tape, then constructs issuer
-  state around a pre-parsed signing key in untimed setup. It times planning,
-  assembly, ES256 signing, and compact serialization.
+- `full_issuance` clones claims and the random tape, then constructs the
+  remote-signing planner in untimed setup. It times planning, assembly, signing
+  input preparation, remote-response validation, and compact serialization
+  using a non-secret encoding-valid signature fixture. It does not measure KMS,
+  network, or cryptographic signer latency.
 - `serial_oracle` calls the exact serial implementation.
 - `adaptive_candidate` uses the real per-ready-batch adaptive selector, shared
   non-blocking worker-budget lease, four-worker cap, bounded native executor,
