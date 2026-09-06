@@ -2,10 +2,12 @@
 // https://www.dsr-corporation.com
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(any(feature = "holder", feature = "issuer-planning", feature = "verifier"))]
 use crate::error::Error;
 #[cfg(any(feature = "holder", feature = "verifier"))]
 use crate::utils::{base64url_decode, jwt_payload_decode};
 
+#[cfg(any(feature = "holder", feature = "issuer-planning", feature = "verifier"))]
 use error::Result;
 #[cfg(feature = "holder")]
 pub use holder::SDJWTHolder;
@@ -20,6 +22,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, Header};
 use serde::{Deserialize, Serialize};
 #[cfg(any(feature = "holder", feature = "verifier"))]
 use serde_json::Map;
+#[cfg(any(feature = "holder", feature = "issuer-planning", feature = "verifier"))]
 use serde_json::Value;
 #[cfg(any(feature = "holder", feature = "verifier"))]
 use std::collections::HashMap;
@@ -107,10 +110,12 @@ pub mod utils;
 pub mod verifier;
 
 pub const DEFAULT_SIGNING_ALG: &str = "ES256";
+#[cfg(any(feature = "issuer-planning", feature = "holder", feature = "verifier"))]
 const SD_DIGESTS_KEY: &str = "_sd";
 #[cfg(any(feature = "issuer-planning", feature = "verifier"))]
 const DIGEST_ALG_KEY: &str = "_sd_alg";
 pub const DEFAULT_DIGEST_ALG: &str = "sha-256";
+#[cfg(any(feature = "issuer-planning", feature = "holder", feature = "verifier"))]
 const SD_LIST_PREFIX: &str = "...";
 const _SD_JWT_TYP_HEADER: &str = "sd+jwt";
 #[cfg(any(feature = "holder", feature = "verifier"))]
@@ -131,25 +136,25 @@ const CNF_KEY: &str = "cnf";
 #[cfg(any(feature = "issuer-planning", feature = "verifier"))]
 const JWK_KEY: &str = "jwk";
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "holder", feature = "verifier")))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DisclosurePreprocessingRoute {
     Serial,
     Adaptive,
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "holder", feature = "verifier")))]
 std::thread_local! {
     static LAST_DISCLOSURE_PREPROCESSING_ROUTE: std::cell::Cell<Option<DisclosurePreprocessingRoute>> =
         const { std::cell::Cell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "holder", feature = "verifier")))]
 fn record_disclosure_preprocessing_route(route: DisclosurePreprocessingRoute) {
     LAST_DISCLOSURE_PREPROCESSING_ROUTE.with(|last_route| last_route.set(Some(route)));
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "holder", feature = "verifier")))]
 pub(crate) fn take_disclosure_preprocessing_route() -> Option<DisclosurePreprocessingRoute> {
     LAST_DISCLOSURE_PREPROCESSING_ROUTE.with(std::cell::Cell::take)
 }
@@ -172,6 +177,7 @@ pub enum SDJWTSerializationFormat {
     Compact,
 }
 
+#[cfg(any(feature = "issuer-planning", feature = "holder", feature = "verifier"))]
 #[derive(Default)]
 pub(crate) struct SDJWTCommon {
     #[cfg(feature = "issuer-local")]
@@ -225,6 +231,7 @@ pub struct SDJWTUnprotectedHeader {
 }
 
 // Define the SDJWTCommon struct to hold common properties.
+#[cfg(any(feature = "issuer-planning", feature = "holder", feature = "verifier"))]
 impl SDJWTCommon {
     #[cfg(feature = "holder")]
     fn verify_signature(

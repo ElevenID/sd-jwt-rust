@@ -99,7 +99,7 @@ pub(crate) fn jwt_payload_decode(b64data: &str) -> Result<serde_json::Map<String
     .map_err(|e| DeserializationError(e.to_string()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "issuer-planning"))]
 mod salt_tests {
     use super::{base64url_decode, generate_salt_with_rng};
     use rand::{Error as RandError, RngCore};

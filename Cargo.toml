@@ -65,6 +65,7 @@ regex = "1.10"
 [[bench]]
 name = "sd_jwt_verification"
 harness = false
+required-features = ["issuer-local", "holder", "verifier"]
 
 [[bench]]
 name = "sd_jwt_issuance"
@@ -74,10 +75,23 @@ required-features = ["issuance_bench"]
 [[bench]]
 name = "sd_jwt_production_rng"
 harness = false
+required-features = ["issuer-local"]
 
 [[test]]
 name = "issuance_launch_barrier_fixed_binary"
 required-features = ["issuance_bench"]
+
+[[test]]
+name = "cross_credential_schedule_independence"
+required-features = ["verifier"]
+
+[[test]]
+name = "cross_credential_verification_batch"
+required-features = ["verifier"]
+
+[[test]]
+name = "demos"
+required-features = ["issuer-local", "holder", "verifier"]
 
 [[example]]
 name = "issuance_qualification_manifest"
