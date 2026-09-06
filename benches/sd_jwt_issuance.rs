@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use criterion::{black_box, criterion_group, BatchSize, Criterion, Throughput};
-use jsonwebtoken::EncodingKey;
 use sd_jwt_rs::issuer::issuance_benchmark::{
     issuance_benchmark_cases, prepare_issuance_route_sink_from_env,
     run_issuance_launch_barrier_from_env, IssuanceBenchmarkFixture, IssuanceBenchmarkRoute,
@@ -11,18 +10,13 @@ use sd_jwt_rs::issuer::issuance_benchmark::{
     ISSUANCE_BENCHMARK_ID_COUNT,
 };
 
-const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
-
 fn benchmark_issuance(c: &mut Criterion) {
     let route_sink = prepare_issuance_route_sink_from_env()
         .expect("issuance route evidence destination must be an absolute new file");
     let mut route_records = Vec::with_capacity(ISSUANCE_BENCHMARK_ID_COUNT);
     let mut group = c.benchmark_group(ISSUANCE_BENCHMARK_GROUP_ID);
-    let issuer_key = EncodingKey::from_ec_pem(PRIVATE_ISSUER_PEM.as_bytes())
-        .expect("benchmark issuer key must be valid");
-
     for case in issuance_benchmark_cases() {
-        let fixture = IssuanceBenchmarkFixture::new(case, issuer_key.clone(), "ES256".to_owned())
+        let fixture = IssuanceBenchmarkFixture::new(case, "ES256".to_owned())
             .expect("issuance benchmark fixture construction must succeed");
         let preflight = fixture
             .preflight()

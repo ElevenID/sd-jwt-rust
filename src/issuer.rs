@@ -194,14 +194,39 @@ impl SDJWTIssuerPlanner {
 
     fn prepare_with_random_source<R: IssuanceRandomSource>(
         &self,
-        mut user_claims: Value,
-        mut sd_strategy: ClaimsForSelectiveDisclosureStrategy<'_>,
+        user_claims: Value,
+        sd_strategy: ClaimsForSelectiveDisclosureStrategy<'_>,
         holder_key: Option<Jwk>,
         add_decoy_claims: bool,
         serialization_format: SDJWTSerializationFormat,
         random_source: &mut R,
     ) -> Result<PreparedSDJWT> {
-        validate_public_holder_key(holder_key.as_ref())?;
+        self.prepare_with_random_source_and_plan_executor(
+            user_claims,
+            sd_strategy,
+            IssuanceOptions {
+                holder_key,
+                add_decoy_claims,
+                serialization_format,
+            },
+            random_source,
+            IssuancePlan::execute,
+        )
+    }
+
+    fn prepare_with_random_source_and_plan_executor<R, F>(
+        &self,
+        mut user_claims: Value,
+        mut sd_strategy: ClaimsForSelectiveDisclosureStrategy<'_>,
+        options: IssuanceOptions,
+        random_source: &mut R,
+        execute_plan: F,
+    ) -> Result<PreparedSDJWT>
+    where
+        R: IssuanceRandomSource,
+        F: FnOnce(IssuancePlan) -> Result<issuance_plan::IssuanceAssembly>,
+    {
+        validate_public_holder_key(options.holder_key.as_ref())?;
         validate_public_confirmation_claim(&user_claims)?;
         sd_strategy.finalize_input()?;
         SDJWTCommon::check_for_sd_claim(&user_claims)?;
@@ -209,7 +234,7 @@ impl SDJWTIssuerPlanner {
         let claims_obj_ref = user_claims
             .as_object_mut()
             .ok_or(Error::ConversionError("json object".to_string()))?;
-        if holder_key.is_some() {
+        if options.holder_key.is_some() {
             claims_obj_ref.shift_remove(CNF_KEY);
         }
         let mut always_revealed_claims: Map<String, Value> = ["iss", "iat", "exp"]
@@ -217,9 +242,12 @@ impl SDJWTIssuerPlanner {
             .filter_map(|key| claims_obj_ref.shift_remove_entry(key))
             .collect();
 
-        let assembly =
-            IssuancePlan::create(user_claims, sd_strategy, add_decoy_claims, random_source)?
-                .execute()?;
+        let assembly = execute_plan(IssuancePlan::create(
+            user_claims,
+            sd_strategy,
+            options.add_decoy_claims,
+            random_source,
+        )?)?;
         let disclosures = assembly
             .disclosures
             .into_iter()
@@ -235,7 +263,7 @@ impl SDJWTIssuerPlanner {
             Value::String(DEFAULT_DIGEST_ALG.to_owned()),
         );
         payload.append(&mut always_revealed_claims);
-        if let Some(holder_key) = holder_key {
+        if let Some(holder_key) = options.holder_key {
             payload.insert(CNF_KEY.to_owned(), json!({JWK_KEY: holder_key}));
         }
 
@@ -259,7 +287,7 @@ impl SDJWTIssuerPlanner {
             disclosures,
             payload,
             protected,
-            serialization_format,
+            serialization_format: options.serialization_format,
             signing_input,
         })
     }
@@ -555,7 +583,6 @@ struct LegacyIssuanceRandomSource<R> {
     initialize: fn() -> R,
 }
 
-#[cfg(feature = "issuer-local")]
 struct IssuanceOptions {
     holder_key: Option<Jwk>,
     add_decoy_claims: bool,
