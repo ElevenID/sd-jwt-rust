@@ -69,18 +69,10 @@ fn escape_unicode_chars(s: &str) -> String {
         if c.is_ascii() {
             result.push(c);
         } else {
-            let esc_c = c.escape_unicode().to_string();
-
-            let esc_c_new = match esc_c.chars().count() {
-                6 => esc_c.replace("\\u{", "\\u00").replace('}', ""), // example: \u{de}
-                7 => esc_c.replace("\\u{", "\\u0").replace('}', ""),  // example: \u{980}
-                8 => esc_c.replace("\\u{", "\\u").replace('}', ""),   // example: \u{23f0}
-                _ => {
-                    panic!("unexpected value")
-                }
-            };
-
-            result.push_str(&esc_c_new);
+            let mut utf16 = [0; 2];
+            for code_unit in c.encode_utf16(&mut utf16) {
+                result.push_str(&format!("\\u{code_unit:04x}"));
+            }
         }
     }
 
@@ -119,5 +111,52 @@ mod tests {
 
         let re = Regex::new(r#"\[".*", "key", test]"#).unwrap();
         assert!(re.is_match(&decoded));
+    }
+
+    fn legacy_bmp_escape(c: char) -> String {
+        let escaped = c.escape_unicode().to_string();
+        match escaped.chars().count() {
+            6 => escaped.replace("\\u{", "\\u00").replace('}', ""),
+            7 => escaped.replace("\\u{", "\\u0").replace('}', ""),
+            8 => escaped.replace("\\u{", "\\u").replace('}', ""),
+            _ => panic!("test input was not a non-ASCII BMP scalar"),
+        }
+    }
+
+    #[test]
+    fn utf16_escape_preserves_every_existing_bmp_scalar_byte() {
+        for code_point in 0x80..=0xffff {
+            let Some(c) = char::from_u32(code_point) else {
+                continue;
+            };
+            assert_eq!(escape_unicode_chars(&c.to_string()), legacy_bmp_escape(c));
+        }
+    }
+
+    #[test]
+    fn supplementary_scalars_use_exact_json_surrogate_pairs_and_disclosure_bytes() {
+        #[cfg(feature = "mock_salts")]
+        let _mock_salt_guard = crate::utils::seed_mock_salts_for_test();
+
+        for (source, escaped) in [
+            ("\u{10000}", "\\ud800\\udc00"),
+            ("\u{1f600}", "\\ud83d\\ude00"),
+            ("\u{10ffff}", "\\udbff\\udfff"),
+        ] {
+            assert_eq!(escape_unicode_chars(source), escaped);
+
+            let disclosure =
+                SDJWTDisclosure::new(Some("claim".to_owned()), serde_json::json!(source));
+            let decoded =
+                String::from_utf8(base64url_decode(&disclosure.raw_b64).unwrap()).unwrap();
+            let parsed: Value = serde_json::from_str(&decoded).unwrap();
+            let salt = parsed[0].as_str().expect("disclosure salt must be text");
+            let expected = format!(r#"["{salt}", "claim", "{escaped}"]"#);
+            assert_eq!(decoded, expected);
+            assert_eq!(disclosure.raw_b64, base64url_encode(expected.as_bytes()));
+            assert_eq!(disclosure.hash, base64_hash(disclosure.raw_b64.as_bytes()));
+
+            assert_eq!(parsed[2], source);
+        }
     }
 }

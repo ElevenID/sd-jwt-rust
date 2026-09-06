@@ -16,7 +16,6 @@ use std::io::{self, Write};
 use std::ops::Range;
 use std::path::PathBuf;
 
-use jsonwebtoken::EncodingKey;
 use serde_json::{json, Map, Value};
 
 use super::issuance_plan::{
@@ -27,7 +26,7 @@ use super::issuance_plan::{
     BENCHMARK_WORK_ESTIMATOR_VERSION,
 };
 use super::{
-    ClaimsForSelectiveDisclosureStrategy, IssuanceOptions, IssuanceRandomSource, SDJWTIssuer,
+    ClaimsForSelectiveDisclosureStrategy, IssuanceOptions, IssuanceRandomSource, SDJWTIssuerPlanner,
 };
 use crate::error::{Error, Result};
 use crate::SDJWTSerializationFormat;
@@ -56,6 +55,8 @@ pub const MAX_ISSUANCE_ROUTE_ARTIFACT_BYTES: usize = 1024 * 1024;
 
 const ISSUANCE_ROUTE_SCHEMA: &str = "sd_jwt_issuance_route_v2";
 const ISSUANCE_QUALIFICATION_MANIFEST_SCHEMA: &str = "sd_jwt_issuance_qualification_manifest_v1";
+// Non-secret, encoding-valid stand-in for the response from a remote signer.
+const BENCHMARK_REMOTE_ES256_SIGNATURE: [u8; 64] = [1; 64];
 
 /// Twenty core cases, ten focused decoy cases, and three structural cases.
 pub const ISSUANCE_FIXTURE_CASE_COUNT: usize = 33;
@@ -1320,19 +1321,14 @@ pub struct IssuanceBenchmarkFixture {
     selective_claims: Value,
     full_claims: Value,
     random_tape: BenchmarkRandomTape,
-    issuer_key: EncodingKey,
     sign_alg: String,
     executor_input_bytes: usize,
     full_input_bytes: usize,
 }
 
 impl IssuanceBenchmarkFixture {
-    /// Build all expensive input data around an already-parsed signing key.
-    pub fn new(
-        case: IssuanceBenchmarkCase,
-        issuer_key: EncodingKey,
-        sign_alg: String,
-    ) -> Result<Self> {
+    /// Build all expensive input data for a remote-signing issuance plan.
+    pub fn new(case: IssuanceBenchmarkCase, sign_alg: String) -> Result<Self> {
         let selective_claims = selective_claims(case);
         let full_claims = full_claims(&selective_claims)?;
         let random_tape = BenchmarkRandomTape::new(&selective_claims, case);
@@ -1348,7 +1344,6 @@ impl IssuanceBenchmarkFixture {
             selective_claims,
             full_claims,
             random_tape,
-            issuer_key,
             sign_alg,
             executor_input_bytes,
             full_input_bytes,
@@ -1382,7 +1377,7 @@ impl IssuanceBenchmarkFixture {
         PreparedFullIssuanceBenchmark {
             claims: self.full_claims.clone(),
             random_tape: self.random_tape.clone(),
-            issuer: SDJWTIssuer::new(self.issuer_key.clone(), Some(self.sign_alg.clone())),
+            planner: SDJWTIssuerPlanner::new(Some(self.sign_alg.clone())),
             case: self.case,
         }
     }
@@ -1469,55 +1464,46 @@ impl PreparedExecutorBenchmark {
     }
 }
 
-/// Cloned claims, random tape, and parsed signing key used by full issuance.
+/// Cloned claims, random tape, and KMS-compatible planner used by full issuance.
 pub struct PreparedFullIssuanceBenchmark {
     claims: Value,
     random_tape: BenchmarkRandomTape,
-    issuer: SDJWTIssuer,
+    planner: SDJWTIssuerPlanner,
     case: IssuanceBenchmarkCase,
 }
 
 impl PreparedFullIssuanceBenchmark {
-    /// Plan, assemble, sign, and compact-serialize one credential.
+    /// Plan, prepare remote signing, and compact-serialize one credential.
     pub fn execute(mut self, route: IssuanceBenchmarkRoute) -> Result<String> {
-        let options = IssuanceOptions {
-            holder_key: None,
-            add_decoy_claims: self.case.add_decoy_claims(),
-            serialization_format: SDJWTSerializationFormat::Compact,
+        let execute_plan = match route {
+            IssuanceBenchmarkRoute::SerialOracle => IssuancePlan::execute_serial,
+            IssuanceBenchmarkRoute::AdaptiveCandidate => IssuancePlan::execute_benchmark_candidate,
         };
-        let credential = match route {
-            IssuanceBenchmarkRoute::SerialOracle => self.issuer.issue_sd_jwt_with_plan_executor(
-                self.claims,
-                self.case.disclosure_strategy(),
-                options,
-                &mut self.random_tape,
-                IssuancePlan::execute_serial,
-            )?,
-            IssuanceBenchmarkRoute::AdaptiveCandidate => {
-                self.issuer.issue_sd_jwt_with_plan_executor(
-                    self.claims,
-                    self.case.disclosure_strategy(),
-                    options,
-                    &mut self.random_tape,
-                    IssuancePlan::execute_benchmark_candidate,
-                )?
-            }
-        };
+        let prepared = self.planner.prepare_with_random_source_and_plan_executor(
+            self.claims,
+            self.case.disclosure_strategy(),
+            IssuanceOptions {
+                holder_key: None,
+                add_decoy_claims: self.case.add_decoy_claims(),
+                serialization_format: SDJWTSerializationFormat::Compact,
+            },
+            &mut self.random_tape,
+            execute_plan,
+        )?;
         self.random_tape.finish()?;
-        Ok(credential)
+        prepared.complete(&BENCHMARK_REMOTE_ES256_SIGNATURE)
     }
 
     fn execute_candidate_with_trace(mut self) -> Result<(String, IssuanceBenchmarkRouteRecord)> {
-        let options = IssuanceOptions {
-            holder_key: None,
-            add_decoy_claims: self.case.add_decoy_claims(),
-            serialization_format: SDJWTSerializationFormat::Compact,
-        };
         let mut trace_summary = None;
-        let credential = self.issuer.issue_sd_jwt_with_plan_executor(
+        let prepared = self.planner.prepare_with_random_source_and_plan_executor(
             self.claims,
             self.case.disclosure_strategy(),
-            options,
+            IssuanceOptions {
+                holder_key: None,
+                add_decoy_claims: self.case.add_decoy_claims(),
+                serialization_format: SDJWTSerializationFormat::Compact,
+            },
             &mut self.random_tape,
             |plan| {
                 let (assembly, summary) = plan.execute_benchmark_candidate_with_trace()?;
@@ -1526,6 +1512,7 @@ impl PreparedFullIssuanceBenchmark {
             },
         )?;
         self.random_tape.finish()?;
+        let credential = prepared.complete(&BENCHMARK_REMOTE_ES256_SIGNATURE)?;
         let summary = trace_summary.ok_or_else(|| {
             Error::InvalidState("full issuance benchmark route was not recorded".to_owned())
         })?;
@@ -1537,16 +1524,15 @@ impl PreparedFullIssuanceBenchmark {
         mut self,
         available_parallelism: usize,
     ) -> Result<(String, IssuanceBenchmarkRouteRecord)> {
-        let options = IssuanceOptions {
-            holder_key: None,
-            add_decoy_claims: self.case.add_decoy_claims(),
-            serialization_format: SDJWTSerializationFormat::Compact,
-        };
         let mut trace_summary = None;
-        let credential = self.issuer.issue_sd_jwt_with_plan_executor(
+        let prepared = self.planner.prepare_with_random_source_and_plan_executor(
             self.claims,
             self.case.disclosure_strategy(),
-            options,
+            IssuanceOptions {
+                holder_key: None,
+                add_decoy_claims: self.case.add_decoy_claims(),
+                serialization_format: SDJWTSerializationFormat::Compact,
+            },
             &mut self.random_tape,
             |plan| {
                 let (assembly, summary) =
@@ -1556,6 +1542,7 @@ impl PreparedFullIssuanceBenchmark {
             },
         )?;
         self.random_tape.finish()?;
+        let credential = prepared.complete(&BENCHMARK_REMOTE_ES256_SIGNATURE)?;
         let summary = trace_summary.ok_or_else(|| {
             Error::InvalidState("full issuance benchmark route was not recorded".to_owned())
         })?;
@@ -2120,12 +2107,7 @@ mod tests {
     }
 
     fn fixture(case: IssuanceBenchmarkCase) -> IssuanceBenchmarkFixture {
-        IssuanceBenchmarkFixture::new(
-            case,
-            EncodingKey::from_secret(b"issuance-benchmark-test-key"),
-            "HS256".to_owned(),
-        )
-        .unwrap()
+        IssuanceBenchmarkFixture::new(case, "ES256".to_owned()).unwrap()
     }
 
     fn structural_case(kind: IssuanceBenchmarkFixtureKind) -> IssuanceBenchmarkCase {

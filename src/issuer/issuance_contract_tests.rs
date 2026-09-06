@@ -5,21 +5,23 @@
 #[cfg(not(feature = "mock_salts"))]
 use super::IssuanceRandomSource;
 use super::{ClaimsForSelectiveDisclosureStrategy, LegacyIssuanceRandomSource, SDJWTIssuer};
+#[cfg(not(feature = "mock_salts"))]
+use crate::error::Error;
 use crate::utils::{base64_hash, base64url_decode, base64url_encode};
 #[cfg(feature = "mock_salts")]
 use crate::SD_LIST_PREFIX;
-use crate::{SDJWTSerializationFormat, DEFAULT_DIGEST_ALG, SD_DIGESTS_KEY};
-#[cfg(feature = "mock_salts")]
+use crate::{SDJWTSerializationFormat, SDJWTVerifier, DEFAULT_DIGEST_ALG, SD_DIGESTS_KEY};
 use jsonwebtoken::jwk::Jwk;
-use jsonwebtoken::EncodingKey;
+use jsonwebtoken::{DecodingKey, EncodingKey};
 use rand::{Error as RandError, RngCore};
 use serde_json::{json, Value};
 use std::cell::Cell;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 #[cfg(not(feature = "mock_salts"))]
 use std::{collections::VecDeque, ops::Range};
 
 const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
-#[cfg(feature = "mock_salts")]
+const PUBLIC_ISSUER_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEb28d4MwZMjw8+00CG4xfnn9SLMVM\nM19SlqZpVb/uNtRe/nNbC6hpOB1LqFXjfIjqAHBOeO6SYVBCcn+QLHOqTw==\n-----END PUBLIC KEY-----\n";
 const HOLDER_JWK: &str = r#"{
     "kty": "EC",
     "crv": "P-256",
@@ -109,6 +111,65 @@ fn nested_claims() -> Value {
     })
 }
 
+fn assert_public_unicode_issuance(
+    claims: Value,
+    strategy: ClaimsForSelectiveDisclosureStrategy<'_>,
+    expected_disclosed_value: Value,
+) {
+    let mut issuer = new_issuer();
+    let issuance = catch_unwind(AssertUnwindSafe(|| {
+        issuer.issue_sd_jwt(
+            claims,
+            strategy,
+            None,
+            false,
+            SDJWTSerializationFormat::Compact,
+        )
+    }));
+    issuance
+        .expect("supplementary Unicode must not panic")
+        .expect("supplementary Unicode issuance must succeed");
+
+    assert_eq!(issuer.all_disclosures.len(), 1);
+    let decoded = String::from_utf8(
+        base64url_decode(&issuer.all_disclosures[0].raw_b64)
+            .expect("disclosure must be valid Base64url"),
+    )
+    .expect("disclosure must be UTF-8 JSON");
+    assert!(decoded.contains(r"\ud83d\ude00"));
+    let disclosure: Value = serde_json::from_str(&decoded).expect("disclosure must be valid JSON");
+    assert_eq!(disclosure[2], expected_disclosed_value);
+}
+
+#[test]
+fn public_issuance_accepts_direct_supplementary_unicode() {
+    assert_public_unicode_issuance(
+        json!({ "claim": "\u{1f600}" }),
+        ClaimsForSelectiveDisclosureStrategy::AllLevels,
+        json!("\u{1f600}"),
+    );
+}
+
+#[test]
+fn public_issuance_accepts_parsed_json_surrogate_pair() {
+    let claims = serde_json::from_str(r#"{"claim":"\ud83d\ude00"}"#)
+        .expect("surrogate-pair JSON fixture must parse");
+    assert_public_unicode_issuance(
+        claims,
+        ClaimsForSelectiveDisclosureStrategy::AllLevels,
+        json!("\u{1f600}"),
+    );
+}
+
+#[test]
+fn public_issuance_accepts_supplementary_unicode_in_selected_subtree() {
+    assert_public_unicode_issuance(
+        json!({ "profile": { "emoji": "\u{1f600}" } }),
+        ClaimsForSelectiveDisclosureStrategy::TopLevel,
+        json!({ "emoji": "\u{1f600}" }),
+    );
+}
+
 #[cfg(not(feature = "mock_salts"))]
 #[derive(Debug, Eq, PartialEq)]
 enum RandomCall {
@@ -170,6 +231,179 @@ fn counted_random_source() -> LegacyIssuanceRandomSource<InstrumentedIssuanceRng
 
 fn rng_initialization_count() -> usize {
     RNG_INITIALIZATION_COUNT.with(Cell::get)
+}
+
+fn holder_jwk() -> Jwk {
+    serde_json::from_str(HOLDER_JWK).expect("holder JWK must be valid")
+}
+
+fn disclosure_strategy(case: usize) -> ClaimsForSelectiveDisclosureStrategy<'static> {
+    match case {
+        0 => ClaimsForSelectiveDisclosureStrategy::NoSDClaims,
+        1 => ClaimsForSelectiveDisclosureStrategy::TopLevel,
+        2 => ClaimsForSelectiveDisclosureStrategy::AllLevels,
+        3 => ClaimsForSelectiveDisclosureStrategy::Custom(vec!["$.cnf"]),
+        _ => panic!("unknown disclosure strategy case"),
+    }
+}
+
+fn caller_cnf() -> Value {
+    json!({
+        "jwk": serde_json::from_str::<Value>(HOLDER_JWK).expect("holder JWK must be JSON"),
+        "marker": "caller-controlled"
+    })
+}
+
+#[test]
+#[cfg(not(feature = "mock_salts"))]
+fn legacy_issuer_rejects_symmetric_holder_key_before_state_or_randomness() {
+    let holder_key: Jwk = serde_json::from_value(json!({
+        "kty": "oct",
+        "k": "c3VwZXItc2VjcmV0"
+    }))
+    .expect("valid symmetric JWK fixture");
+    let mut random_source = FixedIssuanceRandomSource {
+        disclosure_salts: VecDeque::new(),
+        decoy_counts: VecDeque::new(),
+        decoy_salts: VecDeque::new(),
+        calls: Vec::new(),
+    };
+    let mut issuer = new_issuer();
+
+    let error = issuer
+        .issue_sd_jwt_with_random_source(
+            json!({"name":"Alice"}),
+            ClaimsForSelectiveDisclosureStrategy::AllLevels,
+            Some(holder_key),
+            true,
+            SDJWTSerializationFormat::Compact,
+            &mut random_source,
+        )
+        .expect_err("symmetric holder key must be rejected");
+
+    assert!(matches!(error, Error::InvalidInput(_)));
+    assert!(random_source.calls.is_empty());
+    assert!(issuer.holder_key.is_none());
+    assert!(issuer.sd_jwt_payload.is_empty());
+    assert!(issuer.serialized_sd_jwt.is_empty());
+}
+
+fn verify_all_disclosures(credential: String) -> Value {
+    SDJWTVerifier::new(
+        credential,
+        Box::new(|_, _| DecodingKey::from_ec_pem(PUBLIC_ISSUER_PEM.as_bytes()).unwrap()),
+        None,
+        None,
+        SDJWTSerializationFormat::Compact,
+    )
+    .expect("issued credential must verify")
+    .verified_claims
+}
+
+#[test]
+fn holder_key_overwrites_caller_cnf_for_every_disclosure_strategy() {
+    let expected_cnf = json!({
+        "jwk": serde_json::from_str::<Value>(HOLDER_JWK).expect("holder JWK must be JSON")
+    });
+
+    for case in 0..4 {
+        let mut issuer = new_issuer();
+        let credential = issuer
+            .issue_sd_jwt(
+                json!({
+                    "iss": "https://issuer.example",
+                    "name": "Alice",
+                    "cnf": caller_cnf()
+                }),
+                disclosure_strategy(case),
+                Some(holder_jwk()),
+                false,
+                SDJWTSerializationFormat::Compact,
+            )
+            .unwrap_or_else(|error| panic!("strategy case {case} failed: {error}"));
+
+        let signed_payload: Value =
+            serde_json::from_str(&decoded_jwt_payload(&issuer.signed_sd_jwt))
+                .expect("signed payload must be JSON");
+        assert_eq!(signed_payload["cnf"], expected_cnf, "strategy case {case}");
+
+        let decoded_disclosures = issuer
+            .all_disclosures
+            .iter()
+            .map(|disclosure| {
+                let decoded = base64url_decode(&disclosure.raw_b64)
+                    .expect("disclosure must be valid Base64url");
+                serde_json::from_slice::<Value>(&decoded).expect("disclosure must be valid JSON")
+            })
+            .collect::<Vec<_>>();
+        let issuance_artifacts = serde_json::to_string(&json!({
+            "payload": signed_payload,
+            "disclosures": decoded_disclosures
+        }))
+        .expect("issuance artifacts must serialize");
+        assert!(
+            !issuance_artifacts.contains("caller-controlled"),
+            "strategy case {case} retained caller cnf material"
+        );
+
+        let verified = verify_all_disclosures(credential);
+        assert_eq!(verified["cnf"], expected_cnf, "strategy case {case}");
+    }
+}
+
+#[test]
+fn absent_holder_key_preserves_raw_caller_cnf_for_every_disclosure_strategy() {
+    for case in 0..4 {
+        let raw_cnf = caller_cnf();
+        let mut issuer = new_issuer();
+        let credential = issuer
+            .issue_sd_jwt(
+                json!({
+                    "iss": "https://issuer.example",
+                    "name": "Alice",
+                    "cnf": raw_cnf.clone()
+                }),
+                disclosure_strategy(case),
+                None,
+                false,
+                SDJWTSerializationFormat::Compact,
+            )
+            .unwrap_or_else(|error| panic!("strategy case {case} failed: {error}"));
+
+        let verified = verify_all_disclosures(credential);
+        assert_eq!(verified["cnf"], raw_cnf, "strategy case {case}");
+    }
+}
+
+#[test]
+#[cfg(not(feature = "mock_salts"))]
+fn holder_override_removes_caller_cnf_before_planning_or_random_draws() {
+    for case in 0..4 {
+        let mut random_source = FixedIssuanceRandomSource {
+            disclosure_salts: VecDeque::new(),
+            decoy_counts: VecDeque::new(),
+            decoy_salts: VecDeque::new(),
+            calls: Vec::new(),
+        };
+        let mut issuer = new_issuer();
+        issuer
+            .issue_sd_jwt_with_random_source(
+                json!({
+                    "iss": "https://issuer.example",
+                    "cnf": caller_cnf()
+                }),
+                disclosure_strategy(case),
+                Some(holder_jwk()),
+                false,
+                SDJWTSerializationFormat::Compact,
+                &mut random_source,
+            )
+            .unwrap_or_else(|error| panic!("strategy case {case} failed: {error}"));
+
+        assert!(random_source.calls.is_empty(), "strategy case {case}");
+        random_source.assert_exhausted();
+        assert!(issuer.all_disclosures.is_empty(), "strategy case {case}");
+    }
 }
 
 #[cfg(not(feature = "mock_salts"))]

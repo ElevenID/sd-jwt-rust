@@ -16,13 +16,26 @@ use crate::disclosure_preprocessing::{
     assemble_disclosures, process_disclosure, DisclosureJob, DisclosureMappings, DisclosureOutcome,
     ProcessedDisclosure,
 };
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, DUPLICATE_DISCLOSURE_DIGEST};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::{MAX_SD_JWT_DISCLOSURES, MAX_SD_JWT_DISCLOSURE_BYTES, MAX_SD_JWT_INPUT_BYTES};
+
 static NEXT_PLAN_ID: AtomicUsize = AtomicUsize::new(1);
+
+/// Maximum number of credentials accepted by one public preprocessing batch.
+pub const MAX_DISCLOSURE_BATCH_CREDENTIALS: usize = 1024;
+
+const BATCH_CREDENTIAL_LIMIT_ERROR: &str =
+    "Disclosure verification batch exceeds the credential limit";
+const BATCH_DISCLOSURE_LIMIT_ERROR: &str =
+    "Disclosure verification batch exceeds the disclosure limit";
+const BATCH_DISCLOSURE_SIZE_ERROR: &str = "Disclosure exceeds the encoded size limit";
+const BATCH_INPUT_SIZE_ERROR: &str = "Disclosure verification batch exceeds the input size limit";
+const BATCH_CAPACITY_ERROR: &str = "Disclosure verification batch capacity is unavailable";
 
 /// The disclosures belonging to one credential, in caller-defined order.
 #[derive(Clone, Copy)]
@@ -178,7 +191,9 @@ impl DisclosureVerificationExecutor for SerialDisclosureVerificationExecutor {
             match outcome.result.take() {
                 Some(Ok(processed)) => {
                     if !observed_digests.insert(processed.digest.clone()) {
-                        return Err(Error::DuplicateDigestError(processed.digest));
+                        return Err(Error::DuplicateDigestError(
+                            DUPLICATE_DISCLOSURE_DIGEST.to_owned(),
+                        ));
                     }
                     outcome.result = Some(Ok(processed));
                     outcomes.push(outcome);
@@ -242,6 +257,32 @@ pub struct DisclosureVerificationBatchPlan<'a> {
 
 impl<'a> DisclosureVerificationBatchPlan<'a> {
     pub fn new(credentials: &[CredentialDisclosures<'a>]) -> Result<Self> {
+        if credentials.len() > MAX_DISCLOSURE_BATCH_CREDENTIALS {
+            return Err(Error::InvalidInput(BATCH_CREDENTIAL_LIMIT_ERROR.to_owned()));
+        }
+
+        let mut total_jobs = 0usize;
+        let mut total_encoded_bytes = 0usize;
+        for credential in credentials {
+            total_jobs = total_jobs
+                .checked_add(credential.disclosures.len())
+                .ok_or_else(|| Error::InvalidInput(BATCH_DISCLOSURE_LIMIT_ERROR.to_owned()))?;
+            if total_jobs > MAX_SD_JWT_DISCLOSURES {
+                return Err(Error::InvalidInput(BATCH_DISCLOSURE_LIMIT_ERROR.to_owned()));
+            }
+            for disclosure in credential.disclosures {
+                if disclosure.len() > MAX_SD_JWT_DISCLOSURE_BYTES {
+                    return Err(Error::InvalidInput(BATCH_DISCLOSURE_SIZE_ERROR.to_owned()));
+                }
+                total_encoded_bytes = total_encoded_bytes
+                    .checked_add(disclosure.len())
+                    .ok_or_else(|| Error::InvalidInput(BATCH_INPUT_SIZE_ERROR.to_owned()))?;
+                if total_encoded_bytes > MAX_SD_JWT_INPUT_BYTES {
+                    return Err(Error::InvalidInput(BATCH_INPUT_SIZE_ERROR.to_owned()));
+                }
+            }
+        }
+
         let plan_id = NEXT_PLAN_ID
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
@@ -249,16 +290,18 @@ impl<'a> DisclosureVerificationBatchPlan<'a> {
             .map_err(|_| {
                 Error::InvalidState("Disclosure verification batch plan space exhausted".to_owned())
             })?;
-        let disclosure_counts = credentials
-            .iter()
-            .map(|credential| credential.disclosures.len())
-            .collect::<Vec<_>>();
-        let total_jobs = disclosure_counts.iter().try_fold(0usize, |total, count| {
-            total.checked_add(*count).ok_or_else(|| {
-                Error::InvalidState("Disclosure verification batch size overflow".to_owned())
-            })
-        })?;
-        let mut jobs = Vec::with_capacity(total_jobs);
+        let mut disclosure_counts = Vec::new();
+        disclosure_counts
+            .try_reserve_exact(credentials.len())
+            .map_err(|_| Error::InvalidInput(BATCH_CAPACITY_ERROR.to_owned()))?;
+        disclosure_counts.extend(
+            credentials
+                .iter()
+                .map(|credential| credential.disclosures.len()),
+        );
+        let mut jobs = Vec::new();
+        jobs.try_reserve_exact(total_jobs)
+            .map_err(|_| Error::InvalidInput(BATCH_CAPACITY_ERROR.to_owned()))?;
         for (credential_ordinal, credential) in credentials.iter().enumerate() {
             let credential_id = CredentialBatchId {
                 ordinal: credential_ordinal,
@@ -438,6 +481,64 @@ mod tests {
                 "debug output leaked {sensitive}"
             );
         }
+    }
+
+    struct MustNotExecute;
+
+    impl DisclosureVerificationExecutor for MustNotExecute {
+        fn execute<'a>(
+            &self,
+            _jobs: &[DisclosureVerificationJob<'a>],
+        ) -> Result<Vec<DisclosureVerificationOutcome<'a>>> {
+            panic!("over-limit batch reached the executor")
+        }
+    }
+
+    fn assert_batch_limit(credentials: &[CredentialDisclosures<'_>], expected_message: &str) {
+        let plan_error = DisclosureVerificationBatchPlan::new(credentials)
+            .err()
+            .expect("over-limit plan must fail");
+        assert_eq!(
+            plan_error.to_string(),
+            format!("invalid input: {expected_message}")
+        );
+
+        let serial_error = preprocess_disclosure_verification_batch(credentials)
+            .expect_err("over-limit serial entry point must fail");
+        assert_eq!(serial_error.to_string(), plan_error.to_string());
+
+        let custom_error =
+            preprocess_disclosure_verification_batch_with_executor(credentials, &MustNotExecute)
+                .expect_err("over-limit custom entry point must fail");
+        assert_eq!(custom_error.to_string(), plan_error.to_string());
+    }
+
+    #[test]
+    fn public_batch_entry_points_bound_credentials_jobs_and_encoded_bytes() {
+        let empty = Vec::<String>::new();
+        let too_many_credentials =
+            vec![CredentialDisclosures::new(&empty); MAX_DISCLOSURE_BATCH_CREDENTIALS + 1];
+        assert_batch_limit(&too_many_credentials, BATCH_CREDENTIAL_LIMIT_ERROR);
+
+        let too_many_jobs = vec![OBJECT_DISCLOSURE.to_owned(); MAX_SD_JWT_DISCLOSURES + 1];
+        assert_batch_limit(
+            &[CredentialDisclosures::new(&too_many_jobs)],
+            BATCH_DISCLOSURE_LIMIT_ERROR,
+        );
+
+        let oversized_disclosure = "A".repeat(MAX_SD_JWT_DISCLOSURE_BYTES + 1);
+        assert_batch_limit(
+            &[CredentialDisclosures::new(&[oversized_disclosure])],
+            BATCH_DISCLOSURE_SIZE_ERROR,
+        );
+
+        let maximum_disclosure = "A".repeat(MAX_SD_JWT_DISCLOSURE_BYTES);
+        let aggregate =
+            vec![maximum_disclosure; (MAX_SD_JWT_INPUT_BYTES / MAX_SD_JWT_DISCLOSURE_BYTES) + 1];
+        assert_batch_limit(
+            &[CredentialDisclosures::new(&aggregate)],
+            BATCH_INPUT_SIZE_ERROR,
+        );
     }
 
     #[cfg(all(feature = "parallel", target_arch = "x86_64"))]

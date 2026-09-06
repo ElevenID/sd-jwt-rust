@@ -2,64 +2,185 @@
 // https://www.dsr-corporation.com
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(any(feature = "holder", feature = "issuer-planning", feature = "verifier"))]
 use crate::error::Error;
+#[cfg(any(feature = "holder", feature = "verifier"))]
 use crate::utils::{base64url_decode, jwt_payload_decode};
 
+#[cfg(any(feature = "holder", feature = "issuer-planning", feature = "verifier"))]
 use error::Result;
-use jsonwebtoken::{Algorithm, DecodingKey, Header, Validation};
+#[cfg(feature = "holder")]
+pub use holder::SDJWTHolder;
+#[cfg(feature = "issuer-local")]
+pub use issuer::SDJWTIssuer;
+#[cfg(feature = "issuer-planning")]
+pub use issuer::{ClaimsForSelectiveDisclosureStrategy, PreparedSDJWT, SDJWTIssuerPlanner};
+#[cfg(feature = "holder")]
+use jsonwebtoken::Validation;
+#[cfg(any(feature = "holder", feature = "verifier"))]
+use jsonwebtoken::{Algorithm, DecodingKey, Header};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+#[cfg(any(feature = "holder", feature = "issuer-planning", feature = "verifier"))]
+use serde_json::Map;
+#[cfg(any(feature = "holder", feature = "issuer-planning", feature = "verifier"))]
+use serde_json::Value;
+#[cfg(any(feature = "holder", feature = "verifier"))]
 use std::collections::HashMap;
+#[cfg(feature = "holder")]
 use std::str::FromStr;
 use strum::Display;
-pub use {
-    holder::SDJWTHolder, issuer::ClaimsForSelectiveDisclosureStrategy, issuer::SDJWTIssuer,
-    verifier::SDJWTVerifier,
-};
+#[cfg(feature = "verifier")]
+pub use verifier::SDJWTVerifier;
 
+#[cfg(not(feature = "issuer-local"))]
+/// Verification-only builds do not expose an issuer that owns an
+/// [`jsonwebtoken::EncodingKey`].
+///
+/// ```compile_fail
+/// use sd_jwt_rs::SDJWTIssuer;
+/// ```
+pub struct NoLocalIssuer;
+
+#[cfg(any(feature = "holder", feature = "verifier"))]
 pub type KeyResolver = dyn Fn(&str, &Header) -> DecodingKey;
+/// Resolver used by verification paths that need to reject an unknown or
+/// policy-incompatible issuer key without panicking or fabricating a key.
+#[cfg(any(feature = "holder", feature = "verifier"))]
+pub type FallibleKeyResolver = dyn Fn(&str, &Header) -> Result<DecodingKey>;
 
+/// Cryptographic policy applied to untrusted JOSE headers during verification.
+#[cfg(any(feature = "holder", feature = "verifier"))]
+#[derive(Clone, Debug)]
+pub struct VerificationPolicy {
+    allowed_algorithms: Vec<Algorithm>,
+}
+
+#[cfg(any(feature = "holder", feature = "verifier"))]
+impl VerificationPolicy {
+    /// Create a policy with an explicit algorithm allowlist.
+    pub fn new(allowed_algorithms: Vec<Algorithm>) -> Result<Self> {
+        if allowed_algorithms.is_empty() {
+            return Err(Error::InvalidInput(
+                "Verification algorithm allowlist must not be empty".to_string(),
+            ));
+        }
+        Ok(Self { allowed_algorithms })
+    }
+
+    pub(crate) fn allows(&self, algorithm: Algorithm) -> bool {
+        self.allowed_algorithms.contains(&algorithm)
+    }
+}
+
+#[cfg(any(feature = "holder", feature = "verifier"))]
+impl Default for VerificationPolicy {
+    fn default() -> Self {
+        // Symmetric MAC algorithms are intentionally excluded: issuer keys are
+        // public verification keys, and accepting HS* from an untrusted header
+        // creates an algorithm-confusion boundary.
+        Self {
+            allowed_algorithms: vec![
+                Algorithm::ES256,
+                Algorithm::ES384,
+                Algorithm::EdDSA,
+                Algorithm::RS256,
+                Algorithm::RS384,
+                Algorithm::RS512,
+                Algorithm::PS256,
+                Algorithm::PS384,
+                Algorithm::PS512,
+            ],
+        }
+    }
+}
+
+#[cfg(feature = "verifier")]
 pub mod batch;
+#[cfg(feature = "issuer-planning")]
 mod disclosure;
+#[cfg(any(feature = "holder", feature = "verifier"))]
 mod disclosure_preprocessing;
 pub mod error;
+#[cfg(feature = "holder")]
 pub mod holder;
+#[cfg(feature = "issuer-planning")]
 pub mod issuer;
 pub mod utils;
+#[cfg(feature = "verifier")]
 pub mod verifier;
 
 pub const DEFAULT_SIGNING_ALG: &str = "ES256";
+#[cfg(any(feature = "issuer-planning", feature = "holder", feature = "verifier"))]
 const SD_DIGESTS_KEY: &str = "_sd";
+#[cfg(any(feature = "issuer-planning", feature = "verifier"))]
 const DIGEST_ALG_KEY: &str = "_sd_alg";
 pub const DEFAULT_DIGEST_ALG: &str = "sha-256";
+#[cfg(any(feature = "issuer-planning", feature = "holder", feature = "verifier"))]
 const SD_LIST_PREFIX: &str = "...";
 const _SD_JWT_TYP_HEADER: &str = "sd+jwt";
+#[cfg(any(feature = "holder", feature = "verifier"))]
 const KB_JWT_TYP_HEADER: &str = "kb+jwt";
+#[cfg(any(feature = "holder", feature = "verifier"))]
 const KB_DIGEST_KEY: &str = "sd_hash";
 pub const COMBINED_SERIALIZATION_FORMAT_SEPARATOR: &str = "~";
+/// Maximum accepted serialized presentation size before parsing or decoding.
+pub const MAX_SD_JWT_INPUT_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum number of disclosures accepted in one presentation.
+pub const MAX_SD_JWT_DISCLOSURES: usize = 8192;
+/// Maximum encoded size of one disclosure.
+pub const MAX_SD_JWT_DISCLOSURE_BYTES: usize = 64 * 1024;
+#[cfg(any(feature = "holder", feature = "verifier"))]
 const JWT_SEPARATOR: &str = ".";
+#[cfg(any(feature = "issuer-planning", feature = "verifier"))]
 const CNF_KEY: &str = "cnf";
+#[cfg(any(feature = "issuer-planning", feature = "verifier"))]
 const JWK_KEY: &str = "jwk";
+#[cfg(any(feature = "issuer-planning", feature = "verifier"))]
+const PRIVATE_JWK_MEMBERS: [&str; 9] = ["d", "rsa_d", "p", "q", "dp", "dq", "qi", "oth", "k"];
 
-#[cfg(test)]
+#[cfg(any(feature = "issuer-planning", feature = "verifier"))]
+fn validate_public_confirmation_claim(claims: &Map<String, Value>) -> Result<()> {
+    let Some(jwk) = claims
+        .get(CNF_KEY)
+        .and_then(Value::as_object)
+        .and_then(|confirmation| confirmation.get(JWK_KEY))
+    else {
+        return Ok(());
+    };
+    let object = jwk.as_object().ok_or_else(|| {
+        Error::InvalidInput("cnf.jwk must be a public asymmetric JWK object".to_owned())
+    })?;
+    if object.get("kty").and_then(Value::as_str) == Some("oct")
+        || PRIVATE_JWK_MEMBERS
+            .iter()
+            .any(|member| object.contains_key(*member))
+    {
+        return Err(Error::InvalidInput(
+            "cnf.jwk must be a public asymmetric JWK".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(test, any(feature = "holder", feature = "verifier")))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DisclosurePreprocessingRoute {
     Serial,
     Adaptive,
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "holder", feature = "verifier")))]
 std::thread_local! {
     static LAST_DISCLOSURE_PREPROCESSING_ROUTE: std::cell::Cell<Option<DisclosurePreprocessingRoute>> =
         const { std::cell::Cell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "holder", feature = "verifier")))]
 fn record_disclosure_preprocessing_route(route: DisclosurePreprocessingRoute) {
     LAST_DISCLOSURE_PREPROCESSING_ROUTE.with(|last_route| last_route.set(Some(route)));
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "holder", feature = "verifier")))]
 pub(crate) fn take_disclosure_preprocessing_route() -> Option<DisclosurePreprocessingRoute> {
     LAST_DISCLOSURE_PREPROCESSING_ROUTE.with(std::cell::Cell::take)
 }
@@ -82,17 +203,28 @@ pub enum SDJWTSerializationFormat {
     Compact,
 }
 
+#[cfg(any(feature = "issuer-planning", feature = "holder", feature = "verifier"))]
 #[derive(Default)]
 pub(crate) struct SDJWTCommon {
+    #[cfg(feature = "issuer-local")]
     typ: Option<String>,
+    #[cfg(any(feature = "issuer-local", feature = "holder", feature = "verifier"))]
     serialization_format: SDJWTSerializationFormat,
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     unverified_input_key_binding_jwt: Option<String>,
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     unverified_sd_jwt: Option<String>,
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     unverified_input_sd_jwt_payload: Option<Map<String, Value>>,
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     hash_to_decoded_disclosure: HashMap<String, Value>,
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     hash_to_disclosure: HashMap<String, String>,
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     input_disclosures: Vec<String>,
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     ordered_disclosure_digests: Vec<String>,
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     sign_alg: Option<String>,
 }
 
@@ -125,8 +257,14 @@ pub struct SDJWTUnprotectedHeader {
 }
 
 // Define the SDJWTCommon struct to hold common properties.
+#[cfg(any(feature = "issuer-planning", feature = "holder", feature = "verifier"))]
 impl SDJWTCommon {
-    fn verify_signature(&self, key: &DecodingKey) -> Result<()> {
+    #[cfg(feature = "holder")]
+    fn verify_signature(
+        &self,
+        key: &DecodingKey,
+        verification_policy: &VerificationPolicy,
+    ) -> Result<()> {
         let sd_jwt = self
             .unverified_sd_jwt
             .as_ref()
@@ -138,6 +276,11 @@ impl SDJWTCommon {
         })?;
         let algorithm =
             Algorithm::from_str(alg_str).map_err(|e| Error::DeserializationError(e.to_string()))?;
+        if !verification_policy.allows(algorithm) {
+            return Err(Error::InvalidInput(format!(
+                "Issuer-signed JWT algorithm {algorithm:?} is not allowed by verification policy"
+            )));
+        }
         let mut validation = Validation::new(algorithm);
         // RFC 9901 §4.1: `exp` is not mandated, so don't require it. `validate_exp`
         // stays true, so a present `exp` is still checked for expiry.
@@ -155,6 +298,7 @@ impl SDJWTCommon {
         Ok(())
     }
 
+    #[cfg(feature = "holder")]
     fn create_hash_mappings(&mut self) -> Result<()> {
         #[cfg(test)]
         record_disclosure_preprocessing_route(DisclosurePreprocessingRoute::Serial);
@@ -174,6 +318,7 @@ impl SDJWTCommon {
         Ok(())
     }
 
+    #[cfg(feature = "verifier")]
     fn create_verifier_hash_mappings(&mut self) -> Result<()> {
         #[cfg(test)]
         record_disclosure_preprocessing_route(DisclosurePreprocessingRoute::Adaptive);
@@ -190,6 +335,7 @@ impl SDJWTCommon {
         Ok(())
     }
 
+    #[cfg(feature = "issuer-planning")]
     fn check_for_sd_claim(the_object: &Value) -> Result<()> {
         match the_object {
             Value::Object(obj) => {
@@ -214,7 +360,17 @@ impl SDJWTCommon {
         Ok(())
     }
 
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     fn parse_compact_sd_jwt(&mut self, sd_jwt_with_disclosures: String) -> Result<()> {
+        let separator_count = sd_jwt_with_disclosures
+            .bytes()
+            .filter(|byte| *byte == b'~')
+            .count();
+        if separator_count > MAX_SD_JWT_DISCLOSURES + 1 {
+            return Err(Error::InvalidInput(
+                "SD-JWT exceeds the disclosure count limit".to_string(),
+            ));
+        }
         let parts: Vec<&str> = sd_jwt_with_disclosures
             .split(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
             .collect();
@@ -229,7 +385,7 @@ impl SDJWTCommon {
         let sd_jwt = parts.next().ok_or(Error::IndexOutOfBounds {
             idx: 0,
             length: parts.len(),
-            msg: format!("Invalid SD-JWT: {sd_jwt_with_disclosures}"),
+            msg: "Invalid SD-JWT structure".to_string(),
         })?;
         self.sign_alg = Self::decode_header_and_get_sign_algorithm(sd_jwt);
         let trailing = parts.next_back().unwrap_or("");
@@ -246,15 +402,13 @@ impl SDJWTCommon {
         let jwt_body = sd_jwt.next().ok_or(Error::IndexOutOfBounds {
             idx: 1,
             length: 3,
-            msg: format!(
-                "Invalid JWT: Cannot extract JWT payload: {}",
-                self.unverified_sd_jwt.to_owned().unwrap_or("".to_string())
-            ),
+            msg: "Invalid JWT: cannot extract payload".to_string(),
         })?;
         self.unverified_input_sd_jwt_payload = Some(jwt_payload_decode(jwt_body)?);
         Ok(())
     }
 
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     fn parse_flattened_json_sd_jwt(&mut self, sd_jwt_with_disclosures: String) -> Result<()> {
         let parsed: SDJWTFlattenedJson = serde_json::from_str(&sd_jwt_with_disclosures)
             .map_err(|e| Error::DeserializationError(e.to_string()))?;
@@ -270,6 +424,7 @@ impl SDJWTCommon {
         Ok(())
     }
 
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     fn parse_general_json_sd_jwt(&mut self, sd_jwt_with_disclosures: String) -> Result<()> {
         let parsed: SDJWTGeneralJson = serde_json::from_str(&sd_jwt_with_disclosures)
             .map_err(|e| Error::DeserializationError(e.to_string()))?;
@@ -299,7 +454,14 @@ impl SDJWTCommon {
         Ok(())
     }
 
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     fn parse_sd_jwt(&mut self, sd_jwt_with_disclosures: String) -> Result<()> {
+        if sd_jwt_with_disclosures.len() > MAX_SD_JWT_INPUT_BYTES {
+            return Err(Error::InvalidInput(
+                "SD-JWT exceeds the serialized input size limit".to_string(),
+            ));
+        }
+
         match self.serialization_format {
             SDJWTSerializationFormat::Compact => self.parse_compact_sd_jwt(sd_jwt_with_disclosures),
             SDJWTSerializationFormat::FlattenedJson => {
@@ -308,13 +470,31 @@ impl SDJWTCommon {
             SDJWTSerializationFormat::GeneralJson => {
                 self.parse_general_json_sd_jwt(sd_jwt_with_disclosures)
             }
+        }?;
+
+        if self.input_disclosures.len() > MAX_SD_JWT_DISCLOSURES {
+            return Err(Error::InvalidInput(
+                "SD-JWT exceeds the disclosure count limit".to_string(),
+            ));
         }
+        if self
+            .input_disclosures
+            .iter()
+            .any(|disclosure| disclosure.len() > MAX_SD_JWT_DISCLOSURE_BYTES)
+        {
+            return Err(Error::InvalidInput(
+                "SD-JWT disclosure exceeds the encoded size limit".to_string(),
+            ));
+        }
+
+        Ok(())
     }
     /// Decodes a header jwt string and extracts the "alg" field from the JSON object.
     /// # Arguments
     /// * `sd_jwt` - jwt format string.
     /// # Returns
     /// * `Option<String>` - The result containing the algorithm String e.g ES256 or on failure None.
+    #[cfg(any(feature = "holder", feature = "verifier"))]
     fn decode_header_and_get_sign_algorithm(sd_jwt: &str) -> Option<String> {
         let parts: Vec<&str> = sd_jwt.split('.').collect();
         if parts.len() < 2 {
@@ -332,12 +512,13 @@ impl SDJWTCommon {
     }
 
     /// Splits a signed JWT (`protected.payload.signature`) into its three parts.
+    #[cfg(any(feature = "holder", feature = "issuer-local"))]
     fn split_jwt(jwt: &str) -> Result<(String, String, String)> {
         let parts: Vec<&str> = jwt.split('.').collect();
         let [protected, payload, signature] = parts.as_slice() else {
-            return Err(Error::InvalidState(format!(
-                "Invalid signed JWT, expected three parts: {jwt}"
-            )));
+            return Err(Error::InvalidState(
+                "Invalid signed JWT, expected three parts".to_string(),
+            ));
         };
         Ok((
             protected.to_string(),
@@ -347,7 +528,7 @@ impl SDJWTCommon {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "holder", feature = "verifier")))]
 mod tests {
     use crate::{error::Error, utils, SDJWTCommon};
     use serde_json::json;
@@ -360,10 +541,10 @@ mod tests {
     const ARRAY_DISCLOSURE_HASH: &str = "GiEJkgij2cXW0bIMz3Fwi09P0ZQLSXzQ-1CpxGGfl98";
     const INVALID_BASE64_DISCLOSURE: &str = "%";
     const INVALID_BASE64_MESSAGE: &str =
-        "Error decoding disclosure %: invalid input: Invalid byte 37, offset 0.";
+        "Error decoding disclosure: invalid input: Invalid byte 37, offset 0.";
     const INVALID_JSON_DISCLOSURE: &str = "ew";
     const INVALID_JSON_MESSAGE: &str =
-        "Error parsing disclosure ew: EOF while parsing an object at line 1 column 1";
+        "Error parsing disclosure: EOF while parsing an object at line 1 column 1";
 
     fn common_with_disclosures(disclosures: &[&str]) -> SDJWTCommon {
         SDJWTCommon {
@@ -389,14 +570,77 @@ mod tests {
     fn assert_duplicate_disclosure(error: Error) {
         assert_eq!(
             error.to_string(),
-            format!("Digest {OBJECT_DISCLOSURE_HASH} appears multiple times")
+            format!(
+                "Digest {} appears multiple times",
+                crate::error::DUPLICATE_DISCLOSURE_DIGEST
+            )
         );
         match error {
-            Error::DuplicateDigestError(digest) => {
-                assert_eq!(digest, OBJECT_DISCLOSURE_HASH)
+            Error::DuplicateDigestError(message) => {
+                assert_eq!(message, crate::error::DUPLICATE_DISCLOSURE_DIGEST)
             }
             other => panic!("expected DuplicateDigestError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn malformed_jwt_errors_do_not_echo_credential_material() {
+        const SENTINEL: &str = "credential-secret-sentinel";
+
+        let split_error = SDJWTCommon::split_jwt(SENTINEL).unwrap_err();
+        assert!(!split_error.to_string().contains(SENTINEL));
+
+        let mut common = SDJWTCommon {
+            serialization_format: crate::SDJWTSerializationFormat::Compact,
+            ..Default::default()
+        };
+        let parse_error = common
+            .parse_compact_sd_jwt(format!("{SENTINEL}~"))
+            .unwrap_err();
+        assert!(!parse_error.to_string().contains(SENTINEL));
+    }
+
+    #[test]
+    fn parsing_rejects_oversized_serialized_input_before_decoding() {
+        let mut common = SDJWTCommon {
+            serialization_format: crate::SDJWTSerializationFormat::Compact,
+            ..Default::default()
+        };
+        let oversized = "x".repeat(crate::MAX_SD_JWT_INPUT_BYTES + 1);
+
+        let error = common.parse_sd_jwt(oversized).unwrap_err();
+
+        assert!(error.to_string().contains("serialized input size limit"));
+    }
+
+    #[test]
+    fn compact_parsing_rejects_excessive_disclosure_count_before_collecting() {
+        let mut common = SDJWTCommon {
+            serialization_format: crate::SDJWTSerializationFormat::Compact,
+            ..Default::default()
+        };
+        let presentation = format!(
+            "e30.e30.signature{}",
+            "~x".repeat(crate::MAX_SD_JWT_DISCLOSURES + 2)
+        );
+
+        let error = common.parse_sd_jwt(presentation).unwrap_err();
+
+        assert!(error.to_string().contains("disclosure count limit"));
+    }
+
+    #[test]
+    fn parsing_rejects_oversized_individual_disclosure() {
+        let mut common = SDJWTCommon {
+            serialization_format: crate::SDJWTSerializationFormat::Compact,
+            ..Default::default()
+        };
+        let disclosure = "x".repeat(crate::MAX_SD_JWT_DISCLOSURE_BYTES + 1);
+        let presentation = format!("e30.e30.signature~{disclosure}~");
+
+        let error = common.parse_sd_jwt(presentation).unwrap_err();
+
+        assert!(error.to_string().contains("encoded size limit"));
     }
 
     #[test]

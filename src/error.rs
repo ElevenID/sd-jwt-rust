@@ -4,6 +4,9 @@
 
 pub type Result<T> = ::core::result::Result<T, Error>;
 
+#[cfg(any(feature = "holder", feature = "verifier"))]
+pub(crate) const DUPLICATE_DISCLOSURE_DIGEST: &str = "Duplicate Disclosure digest";
+
 #[derive(Debug, thiserror::Error, strum::IntoStaticStr)]
 #[non_exhaustive]
 pub enum Error {

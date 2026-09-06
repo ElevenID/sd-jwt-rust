@@ -8,13 +8,20 @@ use criterion::{
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use sd_jwt_rs::{
     ClaimsForSelectiveDisclosureStrategy, SDJWTIssuer, SDJWTSerializationFormat, SDJWTVerifier,
+    MAX_SD_JWT_DISCLOSURE_BYTES, MAX_SD_JWT_INPUT_BYTES,
 };
 use serde_json::{json, Map, Value};
 
 const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
 const PUBLIC_ISSUER_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEb28d4MwZMjw8+00CG4xfnn9SLMVM\nM19SlqZpVb/uNtRe/nNbC6hpOB1LqFXjfIjqAHBOeO6SYVBCcn+QLHOqTw==\n-----END PUBLIC KEY-----\n";
 const DISCLOSURE_COUNTS: [usize; 5] = [1, 8, 32, 128, 512];
-const LARGE_PAYLOAD_BYTES: usize = 64 * 1024;
+// Keep the aggregate raw value data large enough to exercise the byte gate while
+// leaving room for JSON, Base64url, the issuer JWT, and compact separators.
+const TARGET_LARGE_RAW_BYTES: usize = MAX_SD_JWT_INPUT_BYTES / 2;
+// Base64url expands by roughly 4/3 and each disclosure also carries its salt and
+// claim name. Half the encoded limit is therefore an intentionally conservative
+// per-value ceiling.
+const MAX_LARGE_VALUE_BYTES: usize = MAX_SD_JWT_DISCLOSURE_BYTES / 2;
 
 #[cfg(feature = "mock_salts")]
 fn seed_benchmark_salts() {
@@ -41,21 +48,31 @@ impl PayloadClass {
         match self {
             Self::Small => "small",
             Self::Medium => "medium",
-            Self::Large => "large_64_kib",
+            Self::Large => "large_bounded",
             Self::Mixed => "mixed",
         }
     }
 
-    fn value(self, ordinal: usize) -> Value {
+    fn value(self, ordinal: usize, large_payload_bytes: usize) -> Value {
         match self {
             Self::Small => small_value(ordinal),
             Self::Medium => medium_value(ordinal),
-            Self::Large => large_value(ordinal),
+            Self::Large => large_value(ordinal, large_payload_bytes),
             Self::Mixed => match ordinal % 3 {
                 0 => small_value(ordinal),
                 1 => medium_value(ordinal),
-                _ => large_value(ordinal),
+                _ => large_value(ordinal, large_payload_bytes),
             },
+        }
+    }
+
+    fn large_value_count(self, disclosure_count: usize) -> usize {
+        match self {
+            Self::Large => disclosure_count,
+            Self::Mixed => (0..disclosure_count)
+                .filter(|ordinal| ordinal % 3 == 2)
+                .count(),
+            Self::Small | Self::Medium => 0,
         }
     }
 }
@@ -76,13 +93,18 @@ fn medium_value(ordinal: usize) -> Value {
     })
 }
 
-fn large_value(ordinal: usize) -> Value {
+fn large_value(ordinal: usize, payload_bytes: usize) -> Value {
     let suffix = format!("-{ordinal}");
-    let body_length = LARGE_PAYLOAD_BYTES.saturating_sub(suffix.len());
+    let body_length = payload_bytes.saturating_sub(suffix.len());
     Value::String(format!("{}{suffix}", "L".repeat(body_length)))
 }
 
 fn claims(disclosure_count: usize, payload_class: PayloadClass) -> Value {
+    let large_value_count = payload_class.large_value_count(disclosure_count);
+    let large_payload_bytes = TARGET_LARGE_RAW_BYTES
+        .checked_div(large_value_count)
+        .unwrap_or(0)
+        .min(MAX_LARGE_VALUE_BYTES);
     let mut claims = Map::new();
     claims.insert(
         "iss".to_string(),
@@ -91,7 +113,10 @@ fn claims(disclosure_count: usize, payload_class: PayloadClass) -> Value {
     claims.insert("iat".to_string(), Value::from(1_700_000_000_i64));
 
     for ordinal in 0..disclosure_count {
-        claims.insert(format!("claim_{ordinal:04}"), payload_class.value(ordinal));
+        claims.insert(
+            format!("claim_{ordinal:04}"),
+            payload_class.value(ordinal, large_payload_bytes),
+        );
     }
 
     Value::Object(claims)
@@ -113,6 +138,18 @@ fn issue_fixture(disclosure_count: usize, payload_class: PayloadClass) -> String
 
     let segments = presentation.split('~').count();
     assert_eq!(segments, disclosure_count + 2);
+    assert!(
+        presentation.len() <= MAX_SD_JWT_INPUT_BYTES,
+        "benchmark fixture exceeds the public presentation limit"
+    );
+    assert!(
+        presentation
+            .split('~')
+            .skip(1)
+            .take(disclosure_count)
+            .all(|disclosure| disclosure.len() <= MAX_SD_JWT_DISCLOSURE_BYTES),
+        "benchmark fixture exceeds the public disclosure limit"
+    );
     presentation
 }
 
