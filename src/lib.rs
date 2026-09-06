@@ -20,7 +20,7 @@ use jsonwebtoken::Validation;
 #[cfg(any(feature = "holder", feature = "verifier"))]
 use jsonwebtoken::{Algorithm, DecodingKey, Header};
 use serde::{Deserialize, Serialize};
-#[cfg(any(feature = "holder", feature = "verifier"))]
+#[cfg(any(feature = "holder", feature = "issuer-planning", feature = "verifier"))]
 use serde_json::Map;
 #[cfg(any(feature = "holder", feature = "issuer-planning", feature = "verifier"))]
 use serde_json::Value;
