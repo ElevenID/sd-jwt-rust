@@ -135,6 +135,9 @@ mod tests {
 
     #[test]
     fn supplementary_scalars_use_exact_json_surrogate_pairs_and_disclosure_bytes() {
+        #[cfg(feature = "mock_salts")]
+        let _mock_salt_guard = crate::utils::seed_mock_salts_for_test();
+
         for (source, escaped) in [
             ("\u{10000}", "\\ud800\\udc00"),
             ("\u{1f600}", "\\ud83d\\ude00"),
@@ -142,19 +145,17 @@ mod tests {
         ] {
             assert_eq!(escape_unicode_chars(source), escaped);
 
-            let disclosure = SDJWTDisclosure::new_with_salt(
-                Some("claim".to_owned()),
-                serde_json::json!(source),
-                "salt".to_owned(),
-            );
-            let expected = format!(r#"["salt", "claim", "{escaped}"]"#);
+            let disclosure =
+                SDJWTDisclosure::new(Some("claim".to_owned()), serde_json::json!(source));
             let decoded =
                 String::from_utf8(base64url_decode(&disclosure.raw_b64).unwrap()).unwrap();
+            let parsed: Value = serde_json::from_str(&decoded).unwrap();
+            let salt = parsed[0].as_str().expect("disclosure salt must be text");
+            let expected = format!(r#"["{salt}", "claim", "{escaped}"]"#);
             assert_eq!(decoded, expected);
             assert_eq!(disclosure.raw_b64, base64url_encode(expected.as_bytes()));
             assert_eq!(disclosure.hash, base64_hash(disclosure.raw_b64.as_bytes()));
 
-            let parsed: Value = serde_json::from_str(&decoded).unwrap();
             assert_eq!(parsed[2], source);
         }
     }
