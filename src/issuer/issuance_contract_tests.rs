@@ -5,6 +5,7 @@
 #[cfg(not(feature = "mock_salts"))]
 use super::IssuanceRandomSource;
 use super::{ClaimsForSelectiveDisclosureStrategy, LegacyIssuanceRandomSource, SDJWTIssuer};
+use crate::error::Error;
 use crate::utils::{base64_hash, base64url_decode, base64url_encode};
 #[cfg(feature = "mock_salts")]
 use crate::SD_LIST_PREFIX;
@@ -247,12 +248,42 @@ fn disclosure_strategy(case: usize) -> ClaimsForSelectiveDisclosureStrategy<'sta
 
 fn caller_cnf() -> Value {
     json!({
-        "jwk": {
-            "kty": "oct",
-            "k": "caller-controlled"
-        },
+        "jwk": serde_json::from_str::<Value>(HOLDER_JWK).expect("holder JWK must be JSON"),
         "marker": "caller-controlled"
     })
+}
+
+#[test]
+fn legacy_issuer_rejects_symmetric_holder_key_before_state_or_randomness() {
+    let holder_key: Jwk = serde_json::from_value(json!({
+        "kty": "oct",
+        "k": "c3VwZXItc2VjcmV0"
+    }))
+    .expect("valid symmetric JWK fixture");
+    let mut random_source = FixedIssuanceRandomSource {
+        disclosure_salts: VecDeque::new(),
+        decoy_counts: VecDeque::new(),
+        decoy_salts: VecDeque::new(),
+        calls: Vec::new(),
+    };
+    let mut issuer = new_issuer();
+
+    let error = issuer
+        .issue_sd_jwt_with_random_source(
+            json!({"name":"Alice"}),
+            ClaimsForSelectiveDisclosureStrategy::AllLevels,
+            Some(holder_key),
+            true,
+            SDJWTSerializationFormat::Compact,
+            &mut random_source,
+        )
+        .expect_err("symmetric holder key must be rejected");
+
+    assert!(matches!(error, Error::InvalidInput(_)));
+    assert!(random_source.calls.is_empty());
+    assert!(issuer.holder_key.is_none());
+    assert!(issuer.sd_jwt_payload.is_empty());
+    assert!(issuer.serialized_sd_jwt.is_empty());
 }
 
 fn verify_all_disclosures(credential: String) -> Value {

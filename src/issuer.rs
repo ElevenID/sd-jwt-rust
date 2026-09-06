@@ -14,7 +14,7 @@ use std::ops::Range;
 use std::str::FromStr;
 use std::vec::Vec;
 
-use jsonwebtoken::jwk::Jwk;
+use jsonwebtoken::jwk::{AlgorithmParameters, Jwk};
 #[cfg(feature = "issuer-local")]
 use jsonwebtoken::EncodingKey;
 use jsonwebtoken::{Algorithm, Header};
@@ -67,6 +67,38 @@ use issuance_plan::IssuancePlan;
 
 const DECOY_MIN_ELEMENTS: u32 = 2;
 const DECOY_MAX_ELEMENTS: u32 = 5;
+const PRIVATE_JWK_MEMBERS: [&str; 9] = ["d", "rsa_d", "p", "q", "dp", "dq", "qi", "oth", "k"];
+
+fn validate_public_holder_key(holder_key: Option<&Jwk>) -> Result<()> {
+    if holder_key.is_some_and(|key| matches!(key.algorithm, AlgorithmParameters::OctetKey(_))) {
+        return Err(Error::InvalidInput(
+            "holder_key must be a public asymmetric JWK".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_public_confirmation_claim(user_claims: &Value) -> Result<()> {
+    let Some(jwk) = user_claims
+        .get(CNF_KEY)
+        .and_then(|confirmation| confirmation.get(JWK_KEY))
+    else {
+        return Ok(());
+    };
+    let object = jwk.as_object().ok_or_else(|| {
+        Error::InvalidInput("cnf.jwk must be a public asymmetric JWK object".to_owned())
+    })?;
+    if object.get("kty").and_then(Value::as_str) == Some("oct")
+        || PRIVATE_JWK_MEMBERS
+            .iter()
+            .any(|member| object.contains_key(*member))
+    {
+        return Err(Error::InvalidInput(
+            "cnf.jwk must be a public asymmetric JWK".to_owned(),
+        ));
+    }
+    Ok(())
+}
 
 /// ClaimsForSelectiveDisclosureStrategy is used to determine which claims can be selectively disclosed later by the holder.
 #[derive(PartialEq, Debug)]
@@ -157,8 +189,8 @@ impl SDJWTIssuerPlanner {
     /// Prepare disclosures, the issuer payload, and the exact JWS signing input.
     pub fn prepare(
         &self,
-        mut user_claims: Value,
-        mut sd_strategy: ClaimsForSelectiveDisclosureStrategy<'_>,
+        user_claims: Value,
+        sd_strategy: ClaimsForSelectiveDisclosureStrategy<'_>,
         holder_key: Option<Jwk>,
         add_decoy_claims: bool,
         serialization_format: SDJWTSerializationFormat,
@@ -166,6 +198,30 @@ impl SDJWTIssuerPlanner {
         #[cfg(all(feature = "mock_salts", test))]
         let _mock_salt_guard = crate::utils::seed_mock_salts_for_test();
 
+        let mut random_source = LegacyIssuanceRandomSource::default();
+        self.prepare_with_random_source(
+            user_claims,
+            sd_strategy,
+            holder_key,
+            add_decoy_claims,
+            serialization_format,
+            &mut random_source,
+        )
+    }
+
+    fn prepare_with_random_source<R: IssuanceRandomSource>(
+        &self,
+        mut user_claims: Value,
+        mut sd_strategy: ClaimsForSelectiveDisclosureStrategy<'_>,
+        holder_key: Option<Jwk>,
+        add_decoy_claims: bool,
+        serialization_format: SDJWTSerializationFormat,
+        random_source: &mut R,
+    ) -> Result<PreparedSDJWT> {
+        validate_public_holder_key(holder_key.as_ref())?;
+        if holder_key.is_none() {
+            validate_public_confirmation_claim(&user_claims)?;
+        }
         sd_strategy.finalize_input()?;
         SDJWTCommon::check_for_sd_claim(&user_claims)?;
 
@@ -180,14 +236,9 @@ impl SDJWTIssuerPlanner {
             .filter_map(|key| claims_obj_ref.shift_remove_entry(key))
             .collect();
 
-        let mut random_source = LegacyIssuanceRandomSource::default();
-        let assembly = IssuancePlan::create(
-            user_claims,
-            sd_strategy,
-            add_decoy_claims,
-            &mut random_source,
-        )?
-        .execute()?;
+        let assembly =
+            IssuancePlan::create(user_claims, sd_strategy, add_decoy_claims, random_source)?
+                .execute()?;
         let disclosures = assembly
             .disclosures
             .into_iter()
@@ -230,6 +281,80 @@ impl SDJWTIssuerPlanner {
             serialization_format,
             signing_input,
         })
+    }
+}
+
+#[cfg(test)]
+mod public_holder_key_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct CountingRandomSource {
+        calls: usize,
+    }
+
+    impl IssuanceRandomSource for CountingRandomSource {
+        fn disclosure_salt(&mut self) -> String {
+            self.calls += 1;
+            "salt".to_owned()
+        }
+
+        fn decoy_count(&mut self, _range: Range<u32>) -> u32 {
+            self.calls += 1;
+            2
+        }
+
+        fn decoy_salt(&mut self) -> String {
+            self.calls += 1;
+            "decoy".to_owned()
+        }
+    }
+
+    #[test]
+    fn planner_rejects_symmetric_holder_key_before_randomness() {
+        let holder_key: Jwk = serde_json::from_value(json!({
+            "kty": "oct",
+            "k": "c3VwZXItc2VjcmV0"
+        }))
+        .expect("valid symmetric JWK fixture");
+        let mut random_source = CountingRandomSource::default();
+
+        let error = SDJWTIssuerPlanner::new(None)
+            .prepare_with_random_source(
+                json!({"given_name":"Alice"}),
+                ClaimsForSelectiveDisclosureStrategy::AllLevels,
+                Some(holder_key),
+                true,
+                SDJWTSerializationFormat::Compact,
+                &mut random_source,
+            )
+            .expect_err("symmetric holder key must be rejected");
+
+        assert!(matches!(error, Error::InvalidInput(_)));
+        assert_eq!(random_source.calls, 0);
+    }
+
+    #[test]
+    fn planner_rejects_private_raw_confirmation_before_randomness() {
+        for member in PRIVATE_JWK_MEMBERS {
+            let mut jwk = json!({"kty":"EC","crv":"P-256","x":"x","y":"y"});
+            jwk.as_object_mut()
+                .unwrap()
+                .insert(member.to_owned(), json!("secret"));
+            let mut random_source = CountingRandomSource::default();
+            let error = SDJWTIssuerPlanner::new(None)
+                .prepare_with_random_source(
+                    json!({"given_name":"Alice","cnf":{"jwk":jwk}}),
+                    ClaimsForSelectiveDisclosureStrategy::AllLevels,
+                    None,
+                    true,
+                    SDJWTSerializationFormat::Compact,
+                    &mut random_source,
+                )
+                .expect_err("private cnf.jwk must be rejected");
+            assert!(matches!(error, Error::InvalidInput(_)));
+            assert_eq!(random_source.calls, 0, "randomness consumed for {member}");
+        }
     }
 }
 
@@ -525,6 +650,10 @@ impl SDJWTIssuer {
         R: IssuanceRandomSource,
         F: FnOnce(IssuancePlan) -> Result<issuance_plan::IssuanceAssembly>,
     {
+        validate_public_holder_key(options.holder_key.as_ref())?;
+        if options.holder_key.is_none() {
+            validate_public_confirmation_claim(&user_claims)?;
+        }
         let inner = SDJWTCommon {
             serialization_format: options.serialization_format,
             ..Default::default()
