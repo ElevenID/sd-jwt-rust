@@ -4,6 +4,7 @@
 
 use crate::error;
 use crate::error::Error;
+#[cfg(any(feature = "holder", feature = "verifier"))]
 use crate::error::Error::DeserializationError;
 
 use base64::engine::general_purpose;
@@ -11,7 +12,9 @@ use base64::Engine;
 use error::Result;
 #[cfg(feature = "mock_salts")]
 use lazy_static::lazy_static;
+#[cfg(feature = "issuer-planning")]
 use rand::RngCore;
+#[cfg(any(feature = "holder", feature = "verifier"))]
 use serde_json::Value;
 use sha2::Digest;
 #[cfg(all(feature = "mock_salts", test))]
@@ -36,6 +39,7 @@ pub fn base64_hash(data: &[u8]) -> String {
     general_purpose::URL_SAFE_NO_PAD.encode(hash)
 }
 
+#[cfg(feature = "issuer-planning")]
 pub(crate) fn base64url_encode(data: &[u8]) -> String {
     general_purpose::URL_SAFE_NO_PAD.encode(data)
 }
@@ -47,6 +51,7 @@ pub fn base64url_decode(b64data: &str) -> Result<Vec<u8>> {
         .map_err(|e| Error::DeserializationError(e.to_string()))
 }
 
+#[cfg(feature = "issuer-planning")]
 pub(crate) fn generate_salt_with_rng<R>(rng: &mut R) -> String
 where
     R: RngCore + ?Sized,
@@ -57,6 +62,7 @@ where
 }
 
 #[cfg(all(test, not(feature = "mock_salts")))]
+#[cfg(feature = "issuer-planning")]
 pub(crate) fn generate_salt() -> String {
     generate_salt_with_rng(&mut rand::thread_rng())
 }
@@ -82,6 +88,7 @@ pub(crate) fn seed_mock_salts_for_test() -> MutexGuard<'static, ()> {
     guard
 }
 
+#[cfg(any(feature = "holder", feature = "verifier"))]
 pub(crate) fn jwt_payload_decode(b64data: &str) -> Result<serde_json::Map<String, Value>> {
     serde_json::from_str(
         &String::from_utf8(
@@ -92,7 +99,7 @@ pub(crate) fn jwt_payload_decode(b64data: &str) -> Result<serde_json::Map<String
     .map_err(|e| DeserializationError(e.to_string()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "issuer-planning"))]
 mod salt_tests {
     use super::{base64url_decode, generate_salt_with_rng};
     use rand::{Error as RandError, RngCore};

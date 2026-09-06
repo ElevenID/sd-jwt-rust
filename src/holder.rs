@@ -3,8 +3,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    error, KeyResolver, SDJWTFlattenedJson, SDJWTGeneralJson, SDJWTGeneralJsonSignature,
-    SDJWTSerializationFormat, SDJWTUnprotectedHeader,
+    error, FallibleKeyResolver, KeyResolver, SDJWTFlattenedJson, SDJWTGeneralJson,
+    SDJWTGeneralJsonSignature, SDJWTSerializationFormat, SDJWTUnprotectedHeader,
+    VerificationPolicy,
 };
 use error::{Error, Result};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
@@ -51,10 +52,27 @@ impl SDJWTHolder {
         serialization_format: SDJWTSerializationFormat,
         cb_get_issuer_key: Box<KeyResolver>,
     ) -> Result<Self> {
+        Self::new_with_policy(
+            sd_jwt_with_disclosures,
+            serialization_format,
+            Box::new(move |issuer, header| Ok(cb_get_issuer_key(issuer, header))),
+            VerificationPolicy::default(),
+        )
+    }
+
+    /// Build a holder after verifying the Issuer signature with a fallible key
+    /// resolver and an explicit JOSE algorithm policy.
+    pub fn new_with_policy(
+        sd_jwt_with_disclosures: String,
+        serialization_format: SDJWTSerializationFormat,
+        cb_get_issuer_key: Box<FallibleKeyResolver>,
+        verification_policy: VerificationPolicy,
+    ) -> Result<Self> {
         Self::build(
             sd_jwt_with_disclosures,
             serialization_format,
             Some(cb_get_issuer_key),
+            verification_policy,
         )
     }
 
@@ -76,13 +94,19 @@ impl SDJWTHolder {
         sd_jwt_with_disclosures: String,
         serialization_format: SDJWTSerializationFormat,
     ) -> Result<Self> {
-        Self::build(sd_jwt_with_disclosures, serialization_format, None)
+        Self::build(
+            sd_jwt_with_disclosures,
+            serialization_format,
+            None,
+            VerificationPolicy::default(),
+        )
     }
 
     fn build(
         sd_jwt_with_disclosures: String,
         serialization_format: SDJWTSerializationFormat,
-        cb_get_issuer_key: Option<Box<KeyResolver>>,
+        cb_get_issuer_key: Option<Box<FallibleKeyResolver>>,
+        verification_policy: VerificationPolicy,
     ) -> Result<Self> {
         let mut holder = SDJWTHolder {
             sd_jwt_engine: SDJWTCommon {
@@ -119,6 +143,12 @@ impl SDJWTHolder {
                 .ok_or(Error::InvalidState("Cannot reference jwt".to_string()))?;
             let header = jsonwebtoken::decode_header(sd_jwt)
                 .map_err(|e| Error::DeserializationError(e.to_string()))?;
+            if !verification_policy.allows(header.alg) {
+                return Err(Error::InvalidInput(format!(
+                    "Issuer-signed JWT algorithm {:?} is not allowed by verification policy",
+                    header.alg
+                )));
+            }
             let unverified_issuer = engine
                 .unverified_input_sd_jwt_payload
                 .as_ref()
@@ -128,8 +158,8 @@ impl SDJWTHolder {
                 .ok_or_else(|| {
                     Error::InvalidInput("Issuer-signed JWT is missing `iss`".to_string())
                 })?;
-            let key = cb_get_issuer_key(unverified_issuer, &header);
-            engine.verify_signature(&key)?;
+            let key = cb_get_issuer_key(unverified_issuer, &header)?;
+            engine.verify_signature(&key, &verification_policy)?;
         }
 
         holder.sd_jwt_payload = holder
@@ -475,6 +505,57 @@ mod tests {
             issuer_key_resolver(),
         );
         assert!(holder.is_ok());
+    }
+
+    #[test]
+    fn legacy_holder_constructor_rejects_symmetric_header_confusion() {
+        let secret = b"attacker-controlled-shared-secret";
+        let payload = json!({
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "_sd_alg": "sha-256",
+        });
+        let signed = jsonwebtoken::encode(
+            &Header::new(Algorithm::HS256),
+            &payload,
+            &EncodingKey::from_secret(secret),
+        )
+        .unwrap();
+
+        let error = SDJWTHolder::new(
+            format!("{signed}~"),
+            SDJWTSerializationFormat::Compact,
+            Box::new(move |_, _| DecodingKey::from_secret(secret)),
+        )
+        .err()
+        .expect("HS256 must be rejected before holder signature verification");
+
+        assert!(error
+            .to_string()
+            .contains("not allowed by verification policy"));
+    }
+
+    #[test]
+    fn holder_policy_constructor_propagates_resolver_failure() {
+        let payload = json!({
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "_sd_alg": "sha-256",
+        });
+        let issuer_key = EncodingKey::from_ec_pem(PRIVATE_ISSUER_PEM.as_bytes()).unwrap();
+        let signed =
+            jsonwebtoken::encode(&Header::new(Algorithm::ES256), &payload, &issuer_key).unwrap();
+
+        let error = SDJWTHolder::new_with_policy(
+            format!("{signed}~"),
+            SDJWTSerializationFormat::Compact,
+            Box::new(|_, _| Err(crate::error::Error::KeyNotFound("unavailable".to_owned()))),
+            crate::VerificationPolicy::default(),
+        )
+        .err()
+        .expect("fallible holder resolver failure must propagate");
+
+        assert!(matches!(error, crate::error::Error::KeyNotFound(_)));
     }
 
     #[test]

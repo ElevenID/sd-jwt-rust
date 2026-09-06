@@ -209,8 +209,8 @@ fn mixed_errors_use_lowest_credential_then_local_ordinal_and_publish_nothing() {
     )
     .unwrap_err();
 
-    assert!(error.to_string().contains("Error parsing disclosure ew"));
-    assert!(!error.to_string().contains("Error decoding disclosure %"));
+    assert!(error.to_string().contains("Error parsing disclosure:"));
+    assert!(!error.to_string().contains("Error decoding disclosure:"));
 }
 
 #[test]

@@ -247,13 +247,13 @@ fn malformed_precedence_cases(
     [
         (
             build(INVALID_JSON_DISCLOSURE, INVALID_BASE64_DISCLOSURE),
-            "Error parsing disclosure ew",
-            "Error decoding disclosure %",
+            "Error parsing disclosure:",
+            "Error decoding disclosure:",
         ),
         (
             build(INVALID_BASE64_DISCLOSURE, INVALID_JSON_DISCLOSURE),
-            "Error decoding disclosure %",
-            "Error parsing disclosure ew",
+            "Error decoding disclosure:",
+            "Error parsing disclosure:",
         ),
     ]
 }

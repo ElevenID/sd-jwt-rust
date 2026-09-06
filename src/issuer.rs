@@ -6,25 +6,34 @@ use crate::{
     error, SDJWTFlattenedJson, SDJWTGeneralJson, SDJWTGeneralJsonSignature, SDJWTUnprotectedHeader,
 };
 use error::Result;
-use std::collections::{HashMap, VecDeque};
+#[cfg(feature = "issuer-local")]
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::fmt;
 use std::ops::Range;
 use std::str::FromStr;
 use std::vec::Vec;
 
-use jsonwebtoken::jwk::Jwk;
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use jsonwebtoken::jwk::{AlgorithmParameters, Jwk};
+#[cfg(feature = "issuer-local")]
+use jsonwebtoken::EncodingKey;
+use jsonwebtoken::{Algorithm, Header};
 use rand::{rngs::ThreadRng, Rng, RngCore};
+#[cfg(feature = "issuer-local")]
+use serde_json::Map as SJMap;
 use serde_json::Value;
-use serde_json::{json, Map as SJMap, Map};
+use serde_json::{json, Map};
 
+#[cfg(feature = "issuer-local")]
 use crate::disclosure::SDJWTDisclosure;
 use crate::error::Error;
-use crate::utils::generate_salt_with_rng;
+use crate::utils::{base64url_encode, generate_salt_with_rng};
 use crate::{
     SDJWTCommon, SDJWTSerializationFormat, CNF_KEY, COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
     DEFAULT_DIGEST_ALG, DEFAULT_SIGNING_ALG, DIGEST_ALG_KEY, JWK_KEY,
 };
 
+#[cfg(feature = "issuer-local")]
 pub struct SDJWTIssuer {
     // parameters
     sign_alg: String,
@@ -55,6 +64,41 @@ mod issuance_plan;
 pub mod issuance_benchmark;
 
 use issuance_plan::IssuancePlan;
+
+const DECOY_MIN_ELEMENTS: u32 = 2;
+const DECOY_MAX_ELEMENTS: u32 = 5;
+const PRIVATE_JWK_MEMBERS: [&str; 9] = ["d", "rsa_d", "p", "q", "dp", "dq", "qi", "oth", "k"];
+
+fn validate_public_holder_key(holder_key: Option<&Jwk>) -> Result<()> {
+    if holder_key.is_some_and(|key| matches!(key.algorithm, AlgorithmParameters::OctetKey(_))) {
+        return Err(Error::InvalidInput(
+            "holder_key must be a public asymmetric JWK".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_public_confirmation_claim(user_claims: &Value) -> Result<()> {
+    let Some(jwk) = user_claims
+        .get(CNF_KEY)
+        .and_then(|confirmation| confirmation.get(JWK_KEY))
+    else {
+        return Ok(());
+    };
+    let object = jwk.as_object().ok_or_else(|| {
+        Error::InvalidInput("cnf.jwk must be a public asymmetric JWK object".to_owned())
+    })?;
+    if object.get("kty").and_then(Value::as_str) == Some("oct")
+        || PRIVATE_JWK_MEMBERS
+            .iter()
+            .any(|member| object.contains_key(*member))
+    {
+        return Err(Error::InvalidInput(
+            "cnf.jwk must be a public asymmetric JWK".to_owned(),
+        ));
+    }
+    Ok(())
+}
 
 /// ClaimsForSelectiveDisclosureStrategy is used to determine which claims can be selectively disclosed later by the holder.
 #[derive(PartialEq, Debug)]
@@ -125,6 +169,397 @@ impl<'a> ClaimsForSelectiveDisclosureStrategy<'a> {
     }
 }
 
+/// Issuer that prepares SD-JWT signing input without owning a signing key.
+///
+/// Call [`Self::prepare`], send [`PreparedSDJWT::signing_input`] to a remote
+/// signer, then supply its raw signature bytes to [`PreparedSDJWT::complete`].
+#[derive(Clone, Debug)]
+pub struct SDJWTIssuerPlanner {
+    sign_alg: String,
+}
+
+impl SDJWTIssuerPlanner {
+    /// Create a remote-signing issuer planner.
+    pub fn new(sign_alg: Option<String>) -> Self {
+        Self {
+            sign_alg: sign_alg.unwrap_or(DEFAULT_SIGNING_ALG.to_owned()),
+        }
+    }
+
+    /// Prepare disclosures, the issuer payload, and the exact JWS signing input.
+    pub fn prepare(
+        &self,
+        user_claims: Value,
+        sd_strategy: ClaimsForSelectiveDisclosureStrategy<'_>,
+        holder_key: Option<Jwk>,
+        add_decoy_claims: bool,
+        serialization_format: SDJWTSerializationFormat,
+    ) -> Result<PreparedSDJWT> {
+        #[cfg(all(feature = "mock_salts", test))]
+        let _mock_salt_guard = crate::utils::seed_mock_salts_for_test();
+
+        let mut random_source = LegacyIssuanceRandomSource::default();
+        self.prepare_with_random_source(
+            user_claims,
+            sd_strategy,
+            holder_key,
+            add_decoy_claims,
+            serialization_format,
+            &mut random_source,
+        )
+    }
+
+    fn prepare_with_random_source<R: IssuanceRandomSource>(
+        &self,
+        mut user_claims: Value,
+        mut sd_strategy: ClaimsForSelectiveDisclosureStrategy<'_>,
+        holder_key: Option<Jwk>,
+        add_decoy_claims: bool,
+        serialization_format: SDJWTSerializationFormat,
+        random_source: &mut R,
+    ) -> Result<PreparedSDJWT> {
+        validate_public_holder_key(holder_key.as_ref())?;
+        validate_public_confirmation_claim(&user_claims)?;
+        sd_strategy.finalize_input()?;
+        SDJWTCommon::check_for_sd_claim(&user_claims)?;
+
+        let claims_obj_ref = user_claims
+            .as_object_mut()
+            .ok_or(Error::ConversionError("json object".to_string()))?;
+        if holder_key.is_some() {
+            claims_obj_ref.shift_remove(CNF_KEY);
+        }
+        let mut always_revealed_claims: Map<String, Value> = ["iss", "iat", "exp"]
+            .into_iter()
+            .filter_map(|key| claims_obj_ref.shift_remove_entry(key))
+            .collect();
+
+        let assembly =
+            IssuancePlan::create(user_claims, sd_strategy, add_decoy_claims, random_source)?
+                .execute()?;
+        let disclosures = assembly
+            .disclosures
+            .into_iter()
+            .map(|disclosure| disclosure.raw_b64)
+            .collect();
+        let mut payload = assembly
+            .claims
+            .as_object()
+            .ok_or(Error::ConversionError("json object".to_string()))?
+            .clone();
+        payload.insert(
+            DIGEST_ALG_KEY.to_owned(),
+            Value::String(DEFAULT_DIGEST_ALG.to_owned()),
+        );
+        payload.append(&mut always_revealed_claims);
+        if let Some(holder_key) = holder_key {
+            payload.insert(CNF_KEY.to_owned(), json!({JWK_KEY: holder_key}));
+        }
+
+        let algorithm = Algorithm::from_str(&self.sign_alg)
+            .map_err(|error| Error::DeserializationError(error.to_string()))?;
+        let mut header = Header::new(algorithm);
+        // Preserve the legacy issuer's current protected header exactly.
+        header.typ = None;
+        let protected = base64url_encode(
+            &serde_json::to_vec(&header)
+                .map_err(|error| Error::DeserializationError(error.to_string()))?,
+        );
+        let payload = base64url_encode(
+            &serde_json::to_vec(&payload)
+                .map_err(|error| Error::DeserializationError(error.to_string()))?,
+        );
+        let signing_input = format!("{protected}.{payload}");
+
+        Ok(PreparedSDJWT {
+            algorithm,
+            disclosures,
+            payload,
+            protected,
+            serialization_format,
+            signing_input,
+        })
+    }
+}
+
+#[cfg(test)]
+mod public_holder_key_tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct CountingRandomSource {
+        calls: usize,
+    }
+
+    impl IssuanceRandomSource for CountingRandomSource {
+        fn disclosure_salt(&mut self) -> String {
+            self.calls += 1;
+            "salt".to_owned()
+        }
+
+        fn decoy_count(&mut self, _range: Range<u32>) -> u32 {
+            self.calls += 1;
+            2
+        }
+
+        fn decoy_salt(&mut self) -> String {
+            self.calls += 1;
+            "decoy".to_owned()
+        }
+    }
+
+    #[test]
+    fn planner_rejects_symmetric_holder_key_before_randomness() {
+        let holder_key: Jwk = serde_json::from_value(json!({
+            "kty": "oct",
+            "k": "c3VwZXItc2VjcmV0"
+        }))
+        .expect("valid symmetric JWK fixture");
+        let mut random_source = CountingRandomSource::default();
+
+        let error = SDJWTIssuerPlanner::new(None)
+            .prepare_with_random_source(
+                json!({"given_name":"Alice"}),
+                ClaimsForSelectiveDisclosureStrategy::AllLevels,
+                Some(holder_key),
+                true,
+                SDJWTSerializationFormat::Compact,
+                &mut random_source,
+            )
+            .expect_err("symmetric holder key must be rejected");
+
+        assert!(matches!(error, Error::InvalidInput(_)));
+        assert_eq!(random_source.calls, 0);
+    }
+
+    #[test]
+    fn planner_rejects_private_raw_confirmation_before_randomness() {
+        for member in PRIVATE_JWK_MEMBERS {
+            let mut jwk = json!({"kty":"EC","crv":"P-256","x":"x","y":"y"});
+            jwk.as_object_mut()
+                .unwrap()
+                .insert(member.to_owned(), json!("secret"));
+            let mut random_source = CountingRandomSource::default();
+            let error = SDJWTIssuerPlanner::new(None)
+                .prepare_with_random_source(
+                    json!({"given_name":"Alice","cnf":{"jwk":jwk}}),
+                    ClaimsForSelectiveDisclosureStrategy::AllLevels,
+                    None,
+                    true,
+                    SDJWTSerializationFormat::Compact,
+                    &mut random_source,
+                )
+                .expect_err("private cnf.jwk must be rejected");
+            assert!(matches!(error, Error::InvalidInput(_)));
+            assert_eq!(random_source.calls, 0, "randomness consumed for {member}");
+        }
+    }
+
+    #[test]
+    fn planner_rejects_private_raw_confirmation_even_with_public_holder_key() {
+        let holder_key: Jwk = serde_json::from_value(json!({
+            "kty":"EC","crv":"P-256","x":"holder-x","y":"holder-y"
+        }))
+        .expect("valid public holder JWK fixture");
+
+        for member in PRIVATE_JWK_MEMBERS {
+            let mut jwk = json!({"kty":"EC","crv":"P-256","x":"x","y":"y"});
+            jwk.as_object_mut()
+                .unwrap()
+                .insert(member.to_owned(), json!("secret"));
+            let mut random_source = CountingRandomSource::default();
+            let error = SDJWTIssuerPlanner::new(None)
+                .prepare_with_random_source(
+                    json!({"given_name":"Alice","cnf":{"jwk":jwk}}),
+                    ClaimsForSelectiveDisclosureStrategy::AllLevels,
+                    Some(holder_key.clone()),
+                    true,
+                    SDJWTSerializationFormat::Compact,
+                    &mut random_source,
+                )
+                .expect_err("private caller cnf.jwk must not be silently replaced");
+            assert!(matches!(error, Error::InvalidInput(_)));
+            assert_eq!(random_source.calls, 0, "randomness consumed for {member}");
+        }
+    }
+
+    #[cfg(feature = "issuer-local")]
+    #[test]
+    fn legacy_issuer_rejects_private_raw_confirmation_before_state_or_randomness() {
+        let holder_key: Jwk = serde_json::from_value(json!({
+            "kty":"EC","crv":"P-256","x":"holder-x","y":"holder-y"
+        }))
+        .expect("valid public holder JWK fixture");
+
+        for member in PRIVATE_JWK_MEMBERS {
+            let mut issuer = SDJWTIssuer::new(EncodingKey::from_secret(b"unused"), None);
+            let mut jwk = json!({"kty":"EC","crv":"P-256","x":"x","y":"y"});
+            jwk.as_object_mut()
+                .unwrap()
+                .insert(member.to_owned(), json!("secret"));
+            let mut random_source = CountingRandomSource::default();
+            let error = issuer
+                .issue_sd_jwt_with_random_source(
+                    json!({"given_name":"Alice","cnf":{"jwk":jwk}}),
+                    ClaimsForSelectiveDisclosureStrategy::AllLevels,
+                    Some(holder_key.clone()),
+                    true,
+                    SDJWTSerializationFormat::Compact,
+                    &mut random_source,
+                )
+                .expect_err("private caller cnf.jwk must not be silently replaced");
+            assert!(matches!(error, Error::InvalidInput(_)));
+            assert_eq!(random_source.calls, 0, "randomness consumed for {member}");
+            assert!(issuer.holder_key.is_none(), "state changed for {member}");
+            assert!(
+                issuer.all_disclosures.is_empty(),
+                "state changed for {member}"
+            );
+            assert!(
+                issuer.sd_jwt_payload.is_empty(),
+                "state changed for {member}"
+            );
+        }
+    }
+}
+
+/// Prepared SD-JWT state awaiting one remote signature.
+#[derive(Clone)]
+pub struct PreparedSDJWT {
+    algorithm: Algorithm,
+    disclosures: Vec<String>,
+    payload: String,
+    protected: String,
+    serialization_format: SDJWTSerializationFormat,
+    signing_input: String,
+}
+
+impl fmt::Debug for PreparedSDJWT {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedSDJWT")
+            .field("algorithm", &self.algorithm)
+            .field("disclosure_count", &self.disclosures.len())
+            .field("contents", &"[redacted]")
+            .finish()
+    }
+}
+
+impl PreparedSDJWT {
+    /// Algorithm the remote signer must use.
+    pub fn algorithm(&self) -> Algorithm {
+        self.algorithm
+    }
+
+    /// Exact ASCII JWS signing input (`base64url(header).base64url(payload)`).
+    pub fn signing_input(&self) -> &[u8] {
+        self.signing_input.as_bytes()
+    }
+
+    /// Assemble the requested SD-JWT serialization from raw signature bytes.
+    pub fn complete(self, signature: &[u8]) -> Result<String> {
+        validate_remote_signature(self.algorithm, signature)?;
+        self.complete_encoded_signature(base64url_encode(signature))
+    }
+
+    fn complete_encoded_signature(self, signature: String) -> Result<String> {
+        let signed_sd_jwt = format!("{}.{}", self.signing_input, signature);
+        match self.serialization_format {
+            SDJWTSerializationFormat::Compact => {
+                let mut parts = VecDeque::with_capacity(self.disclosures.len() + 1);
+                parts.push_back(signed_sd_jwt);
+                parts.extend(self.disclosures);
+                Ok(format!(
+                    "{}{}",
+                    parts
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR),
+                    COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
+                ))
+            }
+            SDJWTSerializationFormat::FlattenedJson => serde_json::to_string(&SDJWTFlattenedJson {
+                protected: self.protected,
+                payload: self.payload,
+                signature,
+                header: SDJWTUnprotectedHeader {
+                    disclosures: self.disclosures,
+                    kb_jwt: None,
+                },
+            })
+            .map_err(|error| Error::DeserializationError(error.to_string())),
+            SDJWTSerializationFormat::GeneralJson => serde_json::to_string(&SDJWTGeneralJson {
+                payload: self.payload,
+                signatures: vec![SDJWTGeneralJsonSignature {
+                    protected: self.protected,
+                    signature,
+                    header: SDJWTUnprotectedHeader {
+                        disclosures: self.disclosures,
+                        kb_jwt: None,
+                    },
+                }],
+            })
+            .map_err(|error| Error::DeserializationError(error.to_string())),
+        }
+    }
+}
+
+/// Smallest supported remote RSA signature (2048-bit modulus).
+pub const MIN_REMOTE_RSA_SIGNATURE_BYTES: usize = 256;
+/// Largest supported remote RSA signature (8192-bit modulus).
+pub const MAX_REMOTE_RSA_SIGNATURE_BYTES: usize = 1024;
+
+fn validate_remote_signature(algorithm: Algorithm, signature: &[u8]) -> Result<()> {
+    let valid = match algorithm {
+        Algorithm::ES256 => p256::ecdsa::Signature::from_slice(signature).is_ok(),
+        Algorithm::ES384 => p384::ecdsa::Signature::from_slice(signature).is_ok(),
+        Algorithm::EdDSA => validate_ed25519_encoding(signature),
+        Algorithm::RS256
+        | Algorithm::RS384
+        | Algorithm::RS512
+        | Algorithm::PS256
+        | Algorithm::PS384
+        | Algorithm::PS512 => {
+            (MIN_REMOTE_RSA_SIGNATURE_BYTES..=MAX_REMOTE_RSA_SIGNATURE_BYTES)
+                .contains(&signature.len())
+                && signature.iter().any(|byte| *byte != 0)
+        }
+        _ => {
+            return Err(Error::InvalidInput(format!(
+                "unsupported remote signing algorithm: {algorithm:?}"
+            )))
+        }
+    };
+    if !valid {
+        return Err(Error::InvalidInput(format!(
+            "invalid {algorithm:?} remote signature encoding: got {} bytes",
+            signature.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_ed25519_encoding(signature: &[u8]) -> bool {
+    let Ok(bytes) = <&[u8; 64]>::try_from(signature) else {
+        return false;
+    };
+    let (encoded_r, encoded_s) = bytes.split_at(32);
+    let Ok(encoded_r) = <[u8; 32]>::try_from(encoded_r) else {
+        return false;
+    };
+    let Ok(encoded_s) = <[u8; 32]>::try_from(encoded_s) else {
+        return false;
+    };
+    let Some(point) = curve25519_dalek::edwards::CompressedEdwardsY(encoded_r).decompress() else {
+        return false;
+    };
+    point.compress().to_bytes() == encoded_r
+        && !point.is_small_order()
+        && bool::from(curve25519_dalek::scalar::Scalar::from_canonical_bytes(encoded_s).is_some())
+        && signature.iter().any(|byte| *byte != 0)
+}
+
 trait IssuanceRandomSource {
     fn disclosure_salt(&mut self) -> String;
     fn decoy_count(&mut self, range: Range<u32>) -> u32;
@@ -136,6 +571,7 @@ struct LegacyIssuanceRandomSource<R> {
     initialize: fn() -> R,
 }
 
+#[cfg(feature = "issuer-local")]
 struct IssuanceOptions {
     holder_key: Option<Jwk>,
     add_decoy_claims: bool,
@@ -181,10 +617,8 @@ where
     }
 }
 
+#[cfg(feature = "issuer-local")]
 impl SDJWTIssuer {
-    const DECOY_MIN_ELEMENTS: u32 = 2;
-    const DECOY_MAX_ELEMENTS: u32 = 5;
-
     /// Creates a new SDJWTIssuer instance.
     ///
     /// The instance can be used mutliple times to issue SD-JWTs.
@@ -221,9 +655,13 @@ impl SDJWTIssuer {
     /// Issues a SD-JWT.
     ///
     /// # Arguments
-    /// * `user_claims` - The claims to be included in the SD-JWT.
+    /// * `user_claims` - The claims to be included in the SD-JWT. A top-level
+    ///   `cnf` claim is preserved when `holder_key` is not provided and replaced
+    ///   when it is provided.
     /// * `sd_strategy` - The strategy to be used to determine which claims to be selectively disclosed. See [ClaimsForSelectiveDisclosureStrategy] for more details.
-    /// * `holder_key` - The key used to sign the SD-JWT. If not provided, no key binding is added to the SD-JWT.
+    /// * `holder_key` - The Holder public JWK included in the top-level `cnf`
+    ///   claim for key binding. When provided, it takes precedence over a
+    ///   top-level `cnf` value in `user_claims`.
     /// * `add_decoy_claims` - If true, decoy claims are added to the SD-JWT.
     /// * `serialization_format` - The serialization format to be used for the SD-JWT, see [SDJWTSerializationFormat].
     ///
@@ -286,6 +724,8 @@ impl SDJWTIssuer {
         R: IssuanceRandomSource,
         F: FnOnce(IssuancePlan) -> Result<issuance_plan::IssuanceAssembly>,
     {
+        validate_public_holder_key(options.holder_key.as_ref())?;
+        validate_public_confirmation_claim(&user_claims)?;
         let inner = SDJWTCommon {
             serialization_format: options.serialization_format,
             ..Default::default()
@@ -321,6 +761,9 @@ impl SDJWTIssuer {
         let claims_obj_ref = user_claims
             .as_object_mut()
             .ok_or(Error::ConversionError("json object".to_string()))?;
+        if self.holder_key.is_some() {
+            claims_obj_ref.shift_remove(CNF_KEY);
+        }
         let always_revealed_root_keys = vec!["iss", "iat", "exp"];
         let mut always_revealed_claims: Map<String, Value> = always_revealed_root_keys
             .into_iter()
@@ -349,8 +792,7 @@ impl SDJWTIssuer {
 
         if let Some(holder_key) = &self.holder_key {
             self.sd_jwt_payload
-                .entry(CNF_KEY)
-                .or_insert_with(|| json!({JWK_KEY: holder_key}));
+                .insert(CNF_KEY.to_owned(), json!({JWK_KEY: holder_key}));
         }
 
         Ok(())
@@ -440,14 +882,14 @@ impl SDJWTIssuer {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "issuer-local"))]
 mod tests {
-    use jsonwebtoken::EncodingKey;
+    use jsonwebtoken::{Algorithm, EncodingKey};
     use log::trace;
     use serde_json::json;
 
-    use crate::issuer::ClaimsForSelectiveDisclosureStrategy;
-    use crate::{SDJWTIssuer, SDJWTSerializationFormat};
+    use crate::issuer::{validate_remote_signature, ClaimsForSelectiveDisclosureStrategy};
+    use crate::{SDJWTIssuer, SDJWTIssuerPlanner, SDJWTSerializationFormat};
 
     const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
 
@@ -477,6 +919,136 @@ mod tests {
             )
             .unwrap();
         trace!("{sd_jwt:?}")
+    }
+
+    #[test]
+    fn remote_planner_preserves_all_local_serializations() {
+        let claims = json!({
+            "sub": "6c5c0a49-b589-431d-bae7-219122a9ec2c",
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "exp": 1883000000,
+            "given_name": "Erika"
+        });
+        let issuer_key = EncodingKey::from_ec_pem(PRIVATE_ISSUER_PEM.as_bytes()).unwrap();
+
+        for serialization_format in [
+            SDJWTSerializationFormat::Compact,
+            SDJWTSerializationFormat::FlattenedJson,
+            SDJWTSerializationFormat::GeneralJson,
+        ] {
+            let prepared = SDJWTIssuerPlanner::new(None)
+                .prepare(
+                    claims.clone(),
+                    ClaimsForSelectiveDisclosureStrategy::NoSDClaims,
+                    None,
+                    false,
+                    serialization_format.clone(),
+                )
+                .unwrap();
+            let encoded_signature = jsonwebtoken::crypto::sign(
+                prepared.signing_input(),
+                &issuer_key,
+                prepared.algorithm(),
+            )
+            .unwrap();
+            let signature = crate::utils::base64url_decode(&encoded_signature).unwrap();
+            let remote = prepared.complete(&signature).unwrap();
+
+            let local = SDJWTIssuer::new(issuer_key.clone(), None)
+                .issue_sd_jwt(
+                    claims.clone(),
+                    ClaimsForSelectiveDisclosureStrategy::NoSDClaims,
+                    None,
+                    false,
+                    serialization_format,
+                )
+                .unwrap();
+
+            assert_eq!(remote, local);
+        }
+    }
+
+    #[test]
+    fn remote_planner_rejects_malformed_es256_signatures() {
+        let prepare = || {
+            SDJWTIssuerPlanner::new(Some("ES256".to_string()))
+                .prepare(
+                    json!({"sub": "example"}),
+                    ClaimsForSelectiveDisclosureStrategy::NoSDClaims,
+                    None,
+                    false,
+                    SDJWTSerializationFormat::Compact,
+                )
+                .unwrap()
+        };
+
+        assert!(prepare().complete(&[]).is_err());
+        assert!(prepare().complete(&[0u8; 63]).is_err());
+
+        let mut der_encoded = vec![0u8; 70];
+        der_encoded[0] = 0x30;
+        assert!(prepare().complete(&der_encoded).is_err());
+
+        assert!(prepare().complete(&[0u8; 64]).is_err());
+        assert!(prepare().complete(&[0xffu8; 64]).is_err());
+
+        let mut valid = [0u8; 64];
+        valid[31] = 1;
+        valid[63] = 1;
+        assert!(prepare().complete(&valid).is_ok());
+    }
+
+    #[test]
+    fn remote_signature_validation_covers_supported_algorithms() {
+        let mut es384 = [0u8; 96];
+        es384[47] = 1;
+        es384[95] = 1;
+        assert!(validate_remote_signature(Algorithm::ES384, &es384).is_ok());
+        assert!(validate_remote_signature(Algorithm::ES384, &[0u8; 96]).is_err());
+
+        let mut eddsa = [0u8; 64];
+        eddsa[..32].copy_from_slice(
+            curve25519_dalek::constants::ED25519_BASEPOINT_POINT
+                .compress()
+                .as_bytes(),
+        );
+        eddsa[32] = 1;
+        assert!(validate_remote_signature(Algorithm::EdDSA, &eddsa).is_ok());
+        assert!(validate_remote_signature(Algorithm::EdDSA, &[0u8; 64]).is_err());
+        let mut bad_s = eddsa;
+        bad_s[63] = 0xff;
+        assert!(validate_remote_signature(Algorithm::EdDSA, &bad_s).is_err());
+
+        for algorithm in [
+            Algorithm::RS256,
+            Algorithm::RS384,
+            Algorithm::RS512,
+            Algorithm::PS256,
+            Algorithm::PS384,
+            Algorithm::PS512,
+        ] {
+            assert!(validate_remote_signature(algorithm, &[1u8; 256]).is_ok());
+            assert!(validate_remote_signature(algorithm, &[1u8; 384]).is_ok());
+            assert!(validate_remote_signature(algorithm, &[1u8; 1024]).is_ok());
+            assert!(validate_remote_signature(algorithm, &[1u8; 1025]).is_err());
+            assert!(validate_remote_signature(algorithm, &[0u8; 256]).is_err());
+            assert!(validate_remote_signature(algorithm, &[1u8; 255]).is_err());
+        }
+        let prepare_rsa = || {
+            SDJWTIssuerPlanner::new(Some("RS256".to_string()))
+                .prepare(
+                    json!({"sub": "example"}),
+                    ClaimsForSelectiveDisclosureStrategy::NoSDClaims,
+                    None,
+                    false,
+                    SDJWTSerializationFormat::Compact,
+                )
+                .unwrap()
+        };
+        assert!(prepare_rsa().complete(&[1u8; 1024]).is_ok());
+        assert!(prepare_rsa().complete(&[1u8; 1025]).is_err());
+        assert!(validate_remote_signature(Algorithm::HS256, &[1u8; 256]).is_err());
     }
 
     #[test]
@@ -522,5 +1094,94 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "issuer-planning"))]
+mod issuer_planning_tests {
+    use jsonwebtoken::Algorithm;
+    use serde_json::json;
+
+    use super::{validate_remote_signature, ClaimsForSelectiveDisclosureStrategy};
+    use crate::{SDJWTIssuerPlanner, SDJWTSerializationFormat};
+
+    #[test]
+    fn remote_planner_rejects_malformed_es256_signatures() {
+        let prepare = || {
+            SDJWTIssuerPlanner::new(Some("ES256".to_string()))
+                .prepare(
+                    json!({"sub": "example"}),
+                    ClaimsForSelectiveDisclosureStrategy::NoSDClaims,
+                    None,
+                    false,
+                    SDJWTSerializationFormat::Compact,
+                )
+                .unwrap()
+        };
+
+        assert!(prepare().complete(&[]).is_err());
+        assert!(prepare().complete(&[0u8; 63]).is_err());
+        let mut der_encoded = vec![0u8; 70];
+        der_encoded[0] = 0x30;
+        assert!(prepare().complete(&der_encoded).is_err());
+        assert!(prepare().complete(&[0u8; 64]).is_err());
+        assert!(prepare().complete(&[0xffu8; 64]).is_err());
+
+        let mut valid = [0u8; 64];
+        valid[31] = 1;
+        valid[63] = 1;
+        assert!(prepare().complete(&valid).is_ok());
+    }
+
+    #[test]
+    fn remote_signature_validation_covers_supported_algorithms() {
+        let mut es384 = [0u8; 96];
+        es384[47] = 1;
+        es384[95] = 1;
+        assert!(validate_remote_signature(Algorithm::ES384, &es384).is_ok());
+        assert!(validate_remote_signature(Algorithm::ES384, &[0u8; 96]).is_err());
+
+        let mut eddsa = [0u8; 64];
+        eddsa[..32].copy_from_slice(
+            curve25519_dalek::constants::ED25519_BASEPOINT_POINT
+                .compress()
+                .as_bytes(),
+        );
+        eddsa[32] = 1;
+        assert!(validate_remote_signature(Algorithm::EdDSA, &eddsa).is_ok());
+        assert!(validate_remote_signature(Algorithm::EdDSA, &[0u8; 64]).is_err());
+        let mut bad_s = eddsa;
+        bad_s[63] = 0xff;
+        assert!(validate_remote_signature(Algorithm::EdDSA, &bad_s).is_err());
+
+        for algorithm in [
+            Algorithm::RS256,
+            Algorithm::RS384,
+            Algorithm::RS512,
+            Algorithm::PS256,
+            Algorithm::PS384,
+            Algorithm::PS512,
+        ] {
+            assert!(validate_remote_signature(algorithm, &[1u8; 256]).is_ok());
+            assert!(validate_remote_signature(algorithm, &[1u8; 384]).is_ok());
+            assert!(validate_remote_signature(algorithm, &[1u8; 1024]).is_ok());
+            assert!(validate_remote_signature(algorithm, &[1u8; 1025]).is_err());
+            assert!(validate_remote_signature(algorithm, &[0u8; 256]).is_err());
+            assert!(validate_remote_signature(algorithm, &[1u8; 255]).is_err());
+        }
+        let prepare_rsa = || {
+            SDJWTIssuerPlanner::new(Some("RS256".to_string()))
+                .prepare(
+                    json!({"sub": "example"}),
+                    ClaimsForSelectiveDisclosureStrategy::NoSDClaims,
+                    None,
+                    false,
+                    SDJWTSerializationFormat::Compact,
+                )
+                .unwrap()
+        };
+        assert!(prepare_rsa().complete(&[1u8; 1024]).is_ok());
+        assert!(prepare_rsa().complete(&[1u8; 1025]).is_err());
+        assert!(validate_remote_signature(Algorithm::HS256, &[1u8; 256]).is_err());
+    }
+}
+
+#[cfg(all(test, feature = "issuer-local"))]
 mod issuance_contract_tests;
