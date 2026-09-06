@@ -5,6 +5,7 @@
 #[cfg(not(feature = "mock_salts"))]
 use super::IssuanceRandomSource;
 use super::{ClaimsForSelectiveDisclosureStrategy, LegacyIssuanceRandomSource, SDJWTIssuer};
+#[cfg(not(feature = "mock_salts"))]
 use crate::error::Error;
 use crate::utils::{base64_hash, base64url_decode, base64url_encode};
 #[cfg(feature = "mock_salts")]
@@ -254,6 +255,7 @@ fn caller_cnf() -> Value {
 }
 
 #[test]
+#[cfg(not(feature = "mock_salts"))]
 fn legacy_issuer_rejects_symmetric_holder_key_before_state_or_randomness() {
     let holder_key: Jwk = serde_json::from_value(json!({
         "kty": "oct",
