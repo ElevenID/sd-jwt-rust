@@ -219,9 +219,7 @@ impl SDJWTIssuerPlanner {
         random_source: &mut R,
     ) -> Result<PreparedSDJWT> {
         validate_public_holder_key(holder_key.as_ref())?;
-        if holder_key.is_none() {
-            validate_public_confirmation_claim(&user_claims)?;
-        }
+        validate_public_confirmation_claim(&user_claims)?;
         sd_strategy.finalize_input()?;
         SDJWTCommon::check_for_sd_claim(&user_claims)?;
 
@@ -354,6 +352,73 @@ mod public_holder_key_tests {
                 .expect_err("private cnf.jwk must be rejected");
             assert!(matches!(error, Error::InvalidInput(_)));
             assert_eq!(random_source.calls, 0, "randomness consumed for {member}");
+        }
+    }
+
+    #[test]
+    fn planner_rejects_private_raw_confirmation_even_with_public_holder_key() {
+        let holder_key: Jwk = serde_json::from_value(json!({
+            "kty":"EC","crv":"P-256","x":"holder-x","y":"holder-y"
+        }))
+        .expect("valid public holder JWK fixture");
+
+        for member in PRIVATE_JWK_MEMBERS {
+            let mut jwk = json!({"kty":"EC","crv":"P-256","x":"x","y":"y"});
+            jwk.as_object_mut()
+                .unwrap()
+                .insert(member.to_owned(), json!("secret"));
+            let mut random_source = CountingRandomSource::default();
+            let error = SDJWTIssuerPlanner::new(None)
+                .prepare_with_random_source(
+                    json!({"given_name":"Alice","cnf":{"jwk":jwk}}),
+                    ClaimsForSelectiveDisclosureStrategy::AllLevels,
+                    Some(holder_key.clone()),
+                    true,
+                    SDJWTSerializationFormat::Compact,
+                    &mut random_source,
+                )
+                .expect_err("private caller cnf.jwk must not be silently replaced");
+            assert!(matches!(error, Error::InvalidInput(_)));
+            assert_eq!(random_source.calls, 0, "randomness consumed for {member}");
+        }
+    }
+
+    #[cfg(feature = "issuer-local")]
+    #[test]
+    fn legacy_issuer_rejects_private_raw_confirmation_before_state_or_randomness() {
+        let holder_key: Jwk = serde_json::from_value(json!({
+            "kty":"EC","crv":"P-256","x":"holder-x","y":"holder-y"
+        }))
+        .expect("valid public holder JWK fixture");
+
+        for member in PRIVATE_JWK_MEMBERS {
+            let mut issuer = SDJWTIssuer::new(EncodingKey::from_secret(b"unused"), None);
+            let mut jwk = json!({"kty":"EC","crv":"P-256","x":"x","y":"y"});
+            jwk.as_object_mut()
+                .unwrap()
+                .insert(member.to_owned(), json!("secret"));
+            let mut random_source = CountingRandomSource::default();
+            let error = issuer
+                .issue_sd_jwt_with_random_source(
+                    json!({"given_name":"Alice","cnf":{"jwk":jwk}}),
+                    ClaimsForSelectiveDisclosureStrategy::AllLevels,
+                    Some(holder_key.clone()),
+                    true,
+                    SDJWTSerializationFormat::Compact,
+                    &mut random_source,
+                )
+                .expect_err("private caller cnf.jwk must not be silently replaced");
+            assert!(matches!(error, Error::InvalidInput(_)));
+            assert_eq!(random_source.calls, 0, "randomness consumed for {member}");
+            assert!(issuer.holder_key.is_none(), "state changed for {member}");
+            assert!(
+                issuer.all_disclosures.is_empty(),
+                "state changed for {member}"
+            );
+            assert!(
+                issuer.sd_jwt_payload.is_empty(),
+                "state changed for {member}"
+            );
         }
     }
 }
@@ -651,9 +716,7 @@ impl SDJWTIssuer {
         F: FnOnce(IssuancePlan) -> Result<issuance_plan::IssuanceAssembly>,
     {
         validate_public_holder_key(options.holder_key.as_ref())?;
-        if options.holder_key.is_none() {
-            validate_public_confirmation_claim(&user_claims)?;
-        }
+        validate_public_confirmation_claim(&user_claims)?;
         let inner = SDJWTCommon {
             serialization_format: options.serialization_format,
             ..Default::default()
