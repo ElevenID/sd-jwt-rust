@@ -36,6 +36,14 @@ jobs:
       run: cargo test --locked --verbose
     - name: Test remote issuer-planning boundary
       run: cargo test --locked --no-default-features --features issuer-planning --lib --verbose
+    - name: Guard planning-only crypto feature graph
+      shell: bash
+      run: |
+        planning_tree="$(cargo tree --locked --no-default-features --features issuer-planning -e features,no-dev)"
+        if grep -Eq 'jsonwebtoken feature "(rust_crypto|use_pem)"|p(256|384) feature "(default|ecdsa|pem|pkcs8)"' <<<"$planning_tree"; then
+          printf '%s\n' "$planning_tree"
+          exit 1
+        fi
     - name: Build interop tool
       run: cargo build --manifest-path generate/Cargo.toml --verbose
     - name: Run parallel-feature tests
