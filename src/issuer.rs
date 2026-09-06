@@ -505,6 +505,11 @@ impl PreparedSDJWT {
     }
 }
 
+/// Smallest supported remote RSA signature (2048-bit modulus).
+pub const MIN_REMOTE_RSA_SIGNATURE_BYTES: usize = 256;
+/// Largest supported remote RSA signature (8192-bit modulus).
+pub const MAX_REMOTE_RSA_SIGNATURE_BYTES: usize = 1024;
+
 fn validate_remote_signature(algorithm: Algorithm, signature: &[u8]) -> Result<()> {
     let valid = match algorithm {
         Algorithm::ES256 => p256::ecdsa::Signature::from_slice(signature).is_ok(),
@@ -515,7 +520,11 @@ fn validate_remote_signature(algorithm: Algorithm, signature: &[u8]) -> Result<(
         | Algorithm::RS512
         | Algorithm::PS256
         | Algorithm::PS384
-        | Algorithm::PS512 => signature.len() >= 256 && signature.iter().any(|byte| *byte != 0),
+        | Algorithm::PS512 => {
+            (MIN_REMOTE_RSA_SIGNATURE_BYTES..=MAX_REMOTE_RSA_SIGNATURE_BYTES)
+                .contains(&signature.len())
+                && signature.iter().any(|byte| *byte != 0)
+        }
         _ => {
             return Err(Error::InvalidInput(format!(
                 "unsupported remote signing algorithm: {algorithm:?}"
@@ -1021,9 +1030,24 @@ mod tests {
         ] {
             assert!(validate_remote_signature(algorithm, &[1u8; 256]).is_ok());
             assert!(validate_remote_signature(algorithm, &[1u8; 384]).is_ok());
+            assert!(validate_remote_signature(algorithm, &[1u8; 1024]).is_ok());
+            assert!(validate_remote_signature(algorithm, &[1u8; 1025]).is_err());
             assert!(validate_remote_signature(algorithm, &[0u8; 256]).is_err());
             assert!(validate_remote_signature(algorithm, &[1u8; 255]).is_err());
         }
+        let prepare_rsa = || {
+            SDJWTIssuerPlanner::new(Some("RS256".to_string()))
+                .prepare(
+                    json!({"sub": "example"}),
+                    ClaimsForSelectiveDisclosureStrategy::NoSDClaims,
+                    None,
+                    false,
+                    SDJWTSerializationFormat::Compact,
+                )
+                .unwrap()
+        };
+        assert!(prepare_rsa().complete(&[1u8; 1024]).is_ok());
+        assert!(prepare_rsa().complete(&[1u8; 1025]).is_err());
         assert!(validate_remote_signature(Algorithm::HS256, &[1u8; 256]).is_err());
     }
 
@@ -1137,9 +1161,24 @@ mod issuer_planning_tests {
         ] {
             assert!(validate_remote_signature(algorithm, &[1u8; 256]).is_ok());
             assert!(validate_remote_signature(algorithm, &[1u8; 384]).is_ok());
+            assert!(validate_remote_signature(algorithm, &[1u8; 1024]).is_ok());
+            assert!(validate_remote_signature(algorithm, &[1u8; 1025]).is_err());
             assert!(validate_remote_signature(algorithm, &[0u8; 256]).is_err());
             assert!(validate_remote_signature(algorithm, &[1u8; 255]).is_err());
         }
+        let prepare_rsa = || {
+            SDJWTIssuerPlanner::new(Some("RS256".to_string()))
+                .prepare(
+                    json!({"sub": "example"}),
+                    ClaimsForSelectiveDisclosureStrategy::NoSDClaims,
+                    None,
+                    false,
+                    SDJWTSerializationFormat::Compact,
+                )
+                .unwrap()
+        };
+        assert!(prepare_rsa().complete(&[1u8; 1024]).is_ok());
+        assert!(prepare_rsa().complete(&[1u8; 1025]).is_err());
         assert!(validate_remote_signature(Algorithm::HS256, &[1u8; 256]).is_err());
     }
 }
