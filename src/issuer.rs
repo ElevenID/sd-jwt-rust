@@ -67,8 +67,6 @@ use issuance_plan::IssuancePlan;
 
 const DECOY_MIN_ELEMENTS: u32 = 2;
 const DECOY_MAX_ELEMENTS: u32 = 5;
-const PRIVATE_JWK_MEMBERS: [&str; 9] = ["d", "rsa_d", "p", "q", "dp", "dq", "qi", "oth", "k"];
-
 fn validate_public_holder_key(holder_key: Option<&Jwk>) -> Result<()> {
     if holder_key.is_some_and(|key| matches!(key.algorithm, AlgorithmParameters::OctetKey(_))) {
         return Err(Error::InvalidInput(
@@ -79,25 +77,10 @@ fn validate_public_holder_key(holder_key: Option<&Jwk>) -> Result<()> {
 }
 
 fn validate_public_confirmation_claim(user_claims: &Value) -> Result<()> {
-    let Some(jwk) = user_claims
-        .get(CNF_KEY)
-        .and_then(|confirmation| confirmation.get(JWK_KEY))
-    else {
-        return Ok(());
-    };
-    let object = jwk.as_object().ok_or_else(|| {
-        Error::InvalidInput("cnf.jwk must be a public asymmetric JWK object".to_owned())
+    let claims = user_claims.as_object().ok_or_else(|| {
+        Error::InvalidInput("SD-JWT user claims must be a JSON object".to_owned())
     })?;
-    if object.get("kty").and_then(Value::as_str) == Some("oct")
-        || PRIVATE_JWK_MEMBERS
-            .iter()
-            .any(|member| object.contains_key(*member))
-    {
-        return Err(Error::InvalidInput(
-            "cnf.jwk must be a public asymmetric JWK".to_owned(),
-        ));
-    }
-    Ok(())
+    crate::validate_public_confirmation_claim(claims)
 }
 
 /// ClaimsForSelectiveDisclosureStrategy is used to determine which claims can be selectively disclosed later by the holder.
@@ -285,6 +268,7 @@ impl SDJWTIssuerPlanner {
 #[cfg(test)]
 mod public_holder_key_tests {
     use super::*;
+    use crate::PRIVATE_JWK_MEMBERS;
 
     #[derive(Default)]
     struct CountingRandomSource {

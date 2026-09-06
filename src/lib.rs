@@ -135,6 +135,32 @@ const JWT_SEPARATOR: &str = ".";
 const CNF_KEY: &str = "cnf";
 #[cfg(any(feature = "issuer-planning", feature = "verifier"))]
 const JWK_KEY: &str = "jwk";
+#[cfg(any(feature = "issuer-planning", feature = "verifier"))]
+const PRIVATE_JWK_MEMBERS: [&str; 9] = ["d", "rsa_d", "p", "q", "dp", "dq", "qi", "oth", "k"];
+
+#[cfg(any(feature = "issuer-planning", feature = "verifier"))]
+fn validate_public_confirmation_claim(claims: &Map<String, Value>) -> Result<()> {
+    let Some(jwk) = claims
+        .get(CNF_KEY)
+        .and_then(Value::as_object)
+        .and_then(|confirmation| confirmation.get(JWK_KEY))
+    else {
+        return Ok(());
+    };
+    let object = jwk.as_object().ok_or_else(|| {
+        Error::InvalidInput("cnf.jwk must be a public asymmetric JWK object".to_owned())
+    })?;
+    if object.get("kty").and_then(Value::as_str) == Some("oct")
+        || PRIVATE_JWK_MEMBERS
+            .iter()
+            .any(|member| object.contains_key(*member))
+    {
+        return Err(Error::InvalidInput(
+            "cnf.jwk must be a public asymmetric JWK".to_owned(),
+        ));
+    }
+    Ok(())
+}
 
 #[cfg(all(test, any(feature = "holder", feature = "verifier")))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -15,7 +15,12 @@ use lazy_static::lazy_static;
 #[cfg(feature = "issuer-planning")]
 use rand::RngCore;
 #[cfg(any(feature = "holder", feature = "verifier"))]
-use serde_json::Value;
+use serde::{
+    de::{self, MapAccess, SeqAccess, Visitor},
+    Deserialize, Deserializer,
+};
+#[cfg(any(feature = "holder", feature = "verifier"))]
+use serde_json::{Map, Value};
 use sha2::Digest;
 #[cfg(all(feature = "mock_salts", test))]
 use std::sync::MutexGuard;
@@ -90,13 +95,100 @@ pub(crate) fn seed_mock_salts_for_test() -> MutexGuard<'static, ()> {
 
 #[cfg(any(feature = "holder", feature = "verifier"))]
 pub(crate) fn jwt_payload_decode(b64data: &str) -> Result<serde_json::Map<String, Value>> {
-    serde_json::from_str(
-        &String::from_utf8(
-            base64url_decode(b64data).map_err(|e| DeserializationError(e.to_string()))?,
-        )
-        .map_err(|e| DeserializationError(e.to_string()))?,
-    )
-    .map_err(|e| DeserializationError(e.to_string()))
+    let bytes = base64url_decode(b64data).map_err(|e| DeserializationError(e.to_string()))?;
+    serde_json::from_slice::<UniqueValue>(&bytes)
+        .map_err(|e| DeserializationError(e.to_string()))?
+        .0
+        .as_object()
+        .cloned()
+        .ok_or_else(|| DeserializationError("JWT payload must be a JSON object".to_owned()))
+}
+
+#[cfg(any(feature = "holder", feature = "verifier"))]
+struct UniqueValue(Value);
+
+#[cfg(any(feature = "holder", feature = "verifier"))]
+impl<'de> Deserialize<'de> for UniqueValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueValueVisitor)
+    }
+}
+
+#[cfg(any(feature = "holder", feature = "verifier"))]
+struct UniqueValueVisitor;
+
+#[cfg(any(feature = "holder", feature = "verifier"))]
+impl<'de> Visitor<'de> for UniqueValueVisitor {
+    type Value = UniqueValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("JSON without duplicate object members")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueValue(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueValue(Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueValue(Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .map(UniqueValue)
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueValue(Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueValue(Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueValue(Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueValue(Value::Null))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<UniqueValue>()? {
+            values.push(value.0);
+        }
+        Ok(UniqueValue(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = Map::new();
+        while let Some((key, value)) = object.next_entry::<String, UniqueValue>()? {
+            if values.insert(key, value.0).is_some() {
+                return Err(de::Error::custom("duplicate JSON object member"));
+            }
+        }
+        Ok(UniqueValue(Value::Object(values)))
+    }
 }
 
 #[cfg(all(test, feature = "issuer-planning"))]

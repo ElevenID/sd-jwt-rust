@@ -166,6 +166,7 @@ impl SDJWTVerifier {
         let claims = jsonwebtoken::decode(sd_jwt, &issuer_public_key, &validation)
             .map_err(|e| Error::DeserializationError(format!("Cannot decode jwt: {e}")))?
             .claims;
+        crate::validate_public_confirmation_claim(&claims)?;
 
         self.sd_jwt_payload = claims;
         self._holder_public_key_payload = self
@@ -531,6 +532,7 @@ mod tests {
     };
     use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header};
     use rstest::rstest;
+    use serde::{ser::SerializeMap, Serialize, Serializer};
     use serde_json::{json, Map, Value};
 
     const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
@@ -561,6 +563,79 @@ mod tests {
             parts.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR),
             COMBINED_SERIALIZATION_FORMAT_SEPARATOR
         )
+    }
+
+    fn serialization_from_compact(presentation: &str, format: SDJWTSerializationFormat) -> String {
+        let jwt = presentation.strip_suffix('~').unwrap();
+        let mut segments = jwt.split('.');
+        let protected = segments.next().unwrap();
+        let payload = segments.next().unwrap();
+        let signature = segments.next().unwrap();
+        assert!(segments.next().is_none());
+        match format {
+            SDJWTSerializationFormat::Compact => presentation.to_owned(),
+            SDJWTSerializationFormat::FlattenedJson => json!({
+                "protected": protected,
+                "payload": payload,
+                "signature": signature,
+                "header": {"disclosures": []}
+            })
+            .to_string(),
+            SDJWTSerializationFormat::GeneralJson => json!({
+                "payload": payload,
+                "signatures": [{
+                    "protected": protected,
+                    "signature": signature,
+                    "header": {"disclosures": []}
+                }]
+            })
+            .to_string(),
+        }
+    }
+
+    struct DuplicateCnfClaims;
+
+    impl Serialize for DuplicateCnfClaims {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            let mut claims = serializer.serialize_map(Some(4))?;
+            claims.serialize_entry("iss", "https://example.com/issuer")?;
+            claims.serialize_entry("iat", &1_683_000_000_u64)?;
+            claims.serialize_entry("_sd_alg", "sha-256")?;
+            claims.serialize_entry("cnf", &DuplicateCnf)?;
+            claims.end()
+        }
+    }
+
+    struct DuplicateCnf;
+
+    impl Serialize for DuplicateCnf {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            let mut confirmation = serializer.serialize_map(Some(1))?;
+            confirmation.serialize_entry("jwk", &DuplicateJwk)?;
+            confirmation.end()
+        }
+    }
+
+    struct DuplicateJwk;
+
+    impl Serialize for DuplicateJwk {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            let mut jwk = serializer.serialize_map(Some(4))?;
+            jwk.serialize_entry("kty", "EC")?;
+            jwk.serialize_entry("kty", "oct")?;
+            jwk.serialize_entry("crv", "P-256")?;
+            jwk.serialize_entry("x", "AA")?;
+            jwk.end()
+        }
     }
 
     fn corrupt_compact_signature(presentation: &str) -> String {
@@ -744,6 +819,70 @@ mod tests {
         assert!(error
             .to_string()
             .contains("not allowed by verification policy"));
+    }
+
+    #[test]
+    fn verifier_rejects_signed_private_and_symmetric_confirmation_keys() {
+        for private_member in ["d", "rsa_d", "p", "q", "dp", "dq", "qi", "oth", "k"] {
+            let mut jwk = json!({"kty":"EC", "crv":"P-256", "x":"AA", "y":"AA"});
+            jwk.as_object_mut()
+                .unwrap()
+                .insert(private_member.to_owned(), json!("private-sentinel"));
+            let payload = json!({
+                "iss": "https://example.com/issuer",
+                "iat": 1683000000,
+                "_sd_alg": "sha-256",
+                "cnf": {"jwk": jwk}
+            });
+            let error = compact_verification_error(compact_presentation(&payload, &[]));
+            assert!(matches!(
+                error,
+                Error::InvalidInput(ref message)
+                    if message == "cnf.jwk must be a public asymmetric JWK"
+            ));
+        }
+
+        let payload = json!({
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "_sd_alg": "sha-256",
+            "cnf": {"jwk": {"kty":"oct", "k":"private-sentinel"}}
+        });
+        let compact = compact_presentation(&payload, &[]);
+        for format in [
+            SDJWTSerializationFormat::Compact,
+            SDJWTSerializationFormat::FlattenedJson,
+            SDJWTSerializationFormat::GeneralJson,
+        ] {
+            let presentation = serialization_from_compact(&compact, format.clone());
+            let error = SDJWTVerifier::new(
+                presentation,
+                Box::new(|_, _| DecodingKey::from_ec_pem(PUBLIC_ISSUER_PEM.as_bytes()).unwrap()),
+                None,
+                None,
+                format,
+            )
+            .err()
+            .expect("symmetric cnf.jwk must be rejected");
+            assert!(matches!(error, Error::InvalidInput(_)));
+        }
+    }
+
+    #[test]
+    fn verifier_rejects_signed_duplicate_nested_jwk_members() {
+        let issuer_key = EncodingKey::from_ec_pem(PRIVATE_ISSUER_PEM.as_bytes()).unwrap();
+        let signed = jsonwebtoken::encode(
+            &Header::new(Algorithm::ES256),
+            &DuplicateCnfClaims,
+            &issuer_key,
+        )
+        .unwrap();
+        let error = compact_verification_error(format!("{signed}~"));
+        assert!(matches!(
+            error,
+            Error::DeserializationError(ref message)
+                if message.contains("duplicate JSON object member")
+        ));
     }
 
     #[test]
