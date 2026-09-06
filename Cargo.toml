@@ -12,7 +12,7 @@ homepage = "https://github.com/openwallet-foundation-labs/sd-jwt-rust"
 
 [features]
 default = ["issuer-local", "holder", "verifier"]
-issuer-planning = ["dep:curve25519-dalek", "dep:getrandom", "dep:p256", "dep:p384", "dep:rand"]
+issuer-planning = ["dep:curve25519-dalek", "dep:p256", "dep:p384", "dep:rand"]
 issuer-local = ["issuer-planning", "jsonwebtoken/rust_crypto", "jsonwebtoken/use_pem"]
 holder = ["jsonwebtoken/rust_crypto", "jsonwebtoken/use_pem"]
 verifier = ["jsonwebtoken/rust_crypto", "jsonwebtoken/use_pem"]
@@ -42,7 +42,7 @@ strum = { version = "0.25", default-features = false, features = ["std", "derive
 # `rand` 0.8 delegates browser entropy to `getrandom` 0.2. Let that
 # dependency own the JS bindings so its wasm-bindgen family can unify with the
 # embedding application instead of forcing one exact transitive release.
-getrandom = { version = "0.2", features = ["js"], optional = true }
+getrandom = { version = "0.2", features = ["js"] }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
 # Resolver/compile regression for the JS binding family used by maintained
