@@ -1,4 +1,6 @@
-use jsonwebtoken::{Algorithm, DecodingKey};
+use jsonwebtoken::Algorithm;
+#[cfg(any(feature = "holder", feature = "issuer-completion"))]
+use jsonwebtoken::DecodingKey;
 
 use crate::error::{Error, Result};
 
@@ -37,6 +39,7 @@ pub(crate) fn validate_remote_signature(algorithm: Algorithm, signature: &[u8]) 
     Ok(())
 }
 
+#[cfg(any(feature = "holder", feature = "issuer-completion"))]
 pub(crate) fn verify_remote_signature(
     algorithm: Algorithm,
     signing_input: &[u8],

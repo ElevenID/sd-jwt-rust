@@ -113,13 +113,21 @@ pub mod verifier;
 #[cfg(all(
     target_arch = "wasm32",
     target_os = "unknown",
-    any(feature = "holder", feature = "issuer-planning", feature = "verifier")
+    any(
+        feature = "holder",
+        feature = "issuer-completion",
+        feature = "verifier"
+    )
 ))]
 mod wasm_crypto;
 
 #[cfg(all(
     not(all(target_arch = "wasm32", target_os = "unknown")),
-    any(feature = "holder", feature = "issuer-planning", feature = "verifier")
+    any(
+        feature = "holder",
+        feature = "issuer-completion",
+        feature = "verifier"
+    )
 ))]
 mod native_crypto;
 
@@ -130,7 +138,11 @@ mod native_crypto;
 /// Browser WebAssembly supports ES256, ES384, and EdDSA; RSA is rejected until
 /// a WebCrypto-backed verifier is available. Local signing is unsupported on
 /// both targets.
-#[cfg(any(feature = "holder", feature = "issuer-planning", feature = "verifier"))]
+#[cfg(any(
+    feature = "holder",
+    feature = "issuer-completion",
+    feature = "verifier"
+))]
 pub fn install_crypto_provider() -> Result<()> {
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     {
