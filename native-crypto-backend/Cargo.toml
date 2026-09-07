@@ -1,0 +1,10 @@
+[package]
+name = "sd-jwt-native-crypto-backend"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0 OR MIT"
+description = "Target-gated AWS-LC feature carrier for sd-jwt-rs"
+
+[dependencies]
+jsonwebtoken = { version = "10.4", default-features = false, features = ["aws_lc_rs"] }
