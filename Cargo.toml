@@ -13,8 +13,8 @@ homepage = "https://github.com/openwallet-foundation-labs/sd-jwt-rust"
 [features]
 default = ["issuer-planning", "holder", "verifier"]
 issuer-planning = ["dep:curve25519-dalek", "dep:p256", "dep:p384", "dep:rand"]
-holder = ["dep:curve25519-dalek", "dep:ed25519-dalek", "dep:p256", "dep:p384", "p256/ecdsa", "p384/ecdsa", "jsonwebtoken/use_pem"]
-verifier = ["dep:ed25519-dalek", "dep:p256", "dep:p384", "p256/ecdsa", "p384/ecdsa", "jsonwebtoken/use_pem"]
+holder = ["dep:curve25519-dalek", "dep:ed25519-dalek", "dep:p256", "dep:p384", "p256/ecdsa", "p384/ecdsa", "jsonwebtoken/use_pem", "dep:sd-jwt-native-crypto-backend"]
+verifier = ["dep:ed25519-dalek", "dep:p256", "dep:p384", "p256/ecdsa", "p384/ecdsa", "jsonwebtoken/use_pem", "dep:sd-jwt-native-crypto-backend"]
 mock_salts = ["issuer-planning", "lazy_static"]
 parallel = []
 # Criterion is compiled as a separate crate and cannot reach the private
@@ -27,7 +27,7 @@ issuance_bench = ["issuer-planning", "parallel", "dep:libc", "dep:winapi-util"]
 base64 = "0.21"
 curve25519-dalek = { version = "4.1", optional = true }
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std"], optional = true }
-jsonwebtoken = { version = "10.3", default-features = false }
+jsonwebtoken = { version = "10.4", default-features = false }
 lazy_static = {  version = "1.4", optional = true }
 rand = { version = "0.8", optional = true }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa-core"], optional = true }
@@ -48,7 +48,7 @@ getrandom = { version = "0.2", features = ["js"] }
 # AWS-LC replaces RustCrypto `rsa` on native targets. Besides removing the
 # Marvin timing-side-channel advisory, this retains jsonwebtoken's public API
 # and delegates RSA/ECDSA/Ed25519 verification to a maintained backend.
-jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs"] }
+sd-jwt-native-crypto-backend = { path = "native-crypto-backend", optional = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
 # Resolver/compile regression for the JS binding family used by maintained
@@ -70,7 +70,7 @@ rstest = "0.18.2"
 regex = "1.10"
 
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dev-dependencies]
-jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+jsonwebtoken = { version = "10.4", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 
 [[bench]]
 name = "sd_jwt_verification"
