@@ -302,7 +302,7 @@ fn presentation_metadata() -> (
     Option<Jwk>,
 ) {
     (
-        Some("1234567890".to_owned()),
+        Some(rand::random::<u128>().to_string()),
         Some("https://verifier.example.org".to_owned()),
         holder_key(),
         holder_jwk(),
