@@ -8,7 +8,7 @@ use crate::{
     VerificationPolicy,
 };
 use error::{Error, Result};
-use jsonwebtoken::jwk::Jwk;
+use jsonwebtoken::jwk::{Jwk, KeyOperations, PublicKeyUse};
 #[cfg(test)]
 use jsonwebtoken::EncodingKey;
 use jsonwebtoken::{Algorithm, DecodingKey, Header};
@@ -305,19 +305,21 @@ impl SDJWTHolder {
             .insert("iat".to_owned(), timestamp.into());
         self.set_key_binding_digest_key()?;
 
-        let holder_jwk: Jwk = serde_json::from_value(
-            self.sd_jwt_payload
-                .get("cnf")
-                .and_then(Value::as_object)
-                .and_then(|confirmation| confirmation.get("jwk"))
-                .cloned()
-                .ok_or_else(|| {
-                    Error::InvalidInput(
-                        "key binding requires an issuer-signed public cnf.jwk".to_owned(),
-                    )
-                })?,
-        )
-        .map_err(|_| Error::InvalidInput("cnf.jwk is not a valid public JWK".to_owned()))?;
+        crate::validate_public_confirmation_claim(&self.sd_jwt_payload)?;
+        let raw_holder_jwk = self
+            .sd_jwt_payload
+            .get("cnf")
+            .and_then(Value::as_object)
+            .and_then(|confirmation| confirmation.get("jwk"))
+            .cloned()
+            .ok_or_else(|| {
+                Error::InvalidInput(
+                    "key binding requires an issuer-signed public cnf.jwk".to_owned(),
+                )
+            })?;
+        let holder_jwk: Jwk = serde_json::from_value(raw_holder_jwk)
+            .map_err(|_| Error::InvalidInput("cnf.jwk is not a valid public JWK".to_owned()))?;
+        validate_key_binding_jwk_policy(&holder_jwk, algorithm)?;
         let verification_key = DecodingKey::from_jwk(&holder_jwk)
             .map_err(|_| Error::InvalidInput("cnf.jwk is not a usable public JWK".to_owned()))?;
 
@@ -625,6 +627,45 @@ impl SDJWTHolder {
     }
 }
 
+fn validate_key_binding_jwk_policy(jwk: &Jwk, algorithm: Algorithm) -> Result<()> {
+    if jwk
+        .common
+        .key_algorithm
+        .as_ref()
+        .is_some_and(|declared| declared.to_string() != format!("{algorithm:?}"))
+    {
+        return Err(Error::InvalidInput(
+            "cnf.jwk alg does not match the key-binding algorithm".to_owned(),
+        ));
+    }
+    if jwk.common.public_key_use.is_some()
+        && jwk.common.public_key_use != Some(PublicKeyUse::Signature)
+    {
+        return Err(Error::InvalidInput("cnf.jwk use must be sig".to_owned()));
+    }
+    if jwk.common.public_key_use.is_some() && jwk.common.key_operations.is_some() {
+        return Err(Error::InvalidInput(
+            "cnf.jwk must not combine use and key_ops".to_owned(),
+        ));
+    }
+    if jwk
+        .common
+        .key_operations
+        .as_ref()
+        .is_some_and(|operations| {
+            operations.is_empty()
+                || operations
+                    .iter()
+                    .any(|operation| operation != &KeyOperations::Verify)
+        })
+    {
+        return Err(Error::InvalidInput(
+            "cnf.jwk key_ops must contain only verify".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(all(test, feature = "issuer-planning"))]
 mod tests {
     use crate::issuer::ClaimsForSelectiveDisclosureStrategy;
@@ -656,6 +697,40 @@ mod tests {
             "y": crate::utils::base64url_encode(&point[33..65]),
         }))
         .unwrap()
+    }
+
+    fn signed_sd_jwt_with_confirmation(jwk: Value) -> String {
+        let claims = json!({
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "exp": 1883000000,
+            "_sd_alg": "sha-256",
+            "cnf": { "jwk": jwk },
+        });
+        let key = EncodingKey::from_ec_pem(PRIVATE_ISSUER_PEM.as_bytes()).unwrap();
+        let mut header = Header::new(Algorithm::ES256);
+        header.typ = Some("sd+jwt".to_owned());
+        format!(
+            "{}{}",
+            jsonwebtoken::encode(&header, &claims, &key).unwrap(),
+            COMBINED_SERIALIZATION_FORMAT_SEPARATOR
+        )
+    }
+
+    fn prepare_signed_key_binding(
+        jwk: Value,
+    ) -> crate::Result<crate::PreparedKeyBindingPresentation> {
+        let mut holder = SDJWTHolder::new(
+            signed_sd_jwt_with_confirmation(jwk),
+            SDJWTSerializationFormat::Compact,
+            issuer_key_resolver(),
+        )?;
+        holder.prepare_key_binding_presentation(
+            Map::new(),
+            "nonce".to_owned(),
+            "https://verifier.example".to_owned(),
+            Some("ES256".to_owned()),
+        )
     }
 
     #[test]
@@ -1034,6 +1109,66 @@ mod tests {
         let presentation = prepared.complete(&signature).unwrap();
 
         assert!(presentation.split('~').next_back().unwrap().contains('.'));
+    }
+
+    #[test]
+    fn key_binding_rejects_private_symmetric_and_policy_conflicting_confirmation_keys() {
+        let public = serde_json::to_value(issuer_public_jwk()).unwrap();
+
+        for private_member in ["d", "rsa_d", "p", "q", "dp", "dq", "qi", "oth", "k"] {
+            let mut candidate = public.clone();
+            candidate
+                .as_object_mut()
+                .unwrap()
+                .insert(private_member.to_owned(), json!("private"));
+            assert!(
+                prepare_signed_key_binding(candidate).is_err(),
+                "accepted private cnf.jwk member {private_member}"
+            );
+        }
+
+        assert!(prepare_signed_key_binding(json!({
+            "kty": "oct",
+            "k": crate::utils::base64url_encode(b"symmetric secret")
+        }))
+        .is_err());
+
+        for policy in [
+            json!({"alg": "ES384"}),
+            json!({"use": "enc"}),
+            json!({"key_ops": ["sign"]}),
+            json!({"key_ops": ["encrypt"]}),
+            json!({"key_ops": []}),
+            json!({"use": "sig", "key_ops": ["verify"]}),
+        ] {
+            let mut candidate = public.clone();
+            candidate
+                .as_object_mut()
+                .unwrap()
+                .extend(policy.as_object().unwrap().clone());
+            assert!(
+                prepare_signed_key_binding(candidate).is_err(),
+                "accepted conflicting cnf.jwk policy {policy}"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_public_confirmation_key_prepares_and_completes() {
+        let mut public = serde_json::to_value(issuer_public_jwk()).unwrap();
+        public.as_object_mut().unwrap().extend(
+            json!({"alg": "ES256", "use": "sig"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let prepared = prepare_signed_key_binding(public).unwrap();
+        let key = EncodingKey::from_ec_pem(PRIVATE_ISSUER_PEM.as_bytes()).unwrap();
+        let encoded =
+            jsonwebtoken::crypto::sign(prepared.signing_input(), &key, prepared.algorithm())
+                .unwrap();
+        let signature = crate::utils::base64url_decode(&encoded).unwrap();
+        assert!(prepared.complete(&signature).is_ok());
     }
 
     #[test]
