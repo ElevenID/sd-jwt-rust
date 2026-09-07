@@ -40,6 +40,18 @@ To run tests:
 cargo test
 ```
 
+### Cryptographic backends
+
+Native holder and verifier builds use AWS-LC and support `ES256`, `ES384`,
+`EdDSA`, `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, and `PS512`.
+
+Browser WebAssembly (`wasm32-unknown-unknown`) uses a restricted curve-only
+verification provider. It supports `ES256`, `ES384`, and `EdDSA`, and rejects
+all `RS*` and `PS*` algorithms. Browser builds therefore cannot verify an
+RSA-signed issuer JWT/SD-JWT or RSA-signed holder-binding JWT. If browser RSA is
+required in the future, use a separately reviewed WebCrypto-backed provider;
+do not restore the vulnerable RustCrypto `rsa` dependency.
+
 ### Issuance qualification evidence
 
 The opt-in `issuance_bench` feature exposes a deterministic qualification
