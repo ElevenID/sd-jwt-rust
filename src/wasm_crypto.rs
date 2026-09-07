@@ -212,6 +212,34 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    fn p384_verifier_accepts_valid_and_rejects_changed_messages() {
+        use p384::ecdsa::signature::Signer as _;
+
+        let signing_key = p384::ecdsa::SigningKey::from_slice(&[8u8; 48]).unwrap();
+        let encoded = signing_key.verifying_key().to_encoded_point(false);
+        let key = DecodingKey::from_ec_der(encoded.as_bytes());
+        let verifier = verifier(&Algorithm::ES384, &key).unwrap();
+        let signature: P384Signature = signing_key.sign(b"message");
+        let signature = signature.to_bytes().to_vec();
+
+        assert!(verifier.verify(b"message", &signature).is_ok());
+        assert!(verifier.verify(b"changed", &signature).is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn ed25519_verifier_accepts_valid_and_rejects_changed_messages() {
+        use ed25519_dalek::Signer as _;
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let key = DecodingKey::from_ed_der(signing_key.verifying_key().as_bytes());
+        let verifier = verifier(&Algorithm::EdDSA, &key).unwrap();
+        let signature = signing_key.sign(b"message").to_bytes().to_vec();
+
+        assert!(verifier.verify(b"message", &signature).is_ok());
+        assert!(verifier.verify(b"changed", &signature).is_err());
+    }
+
+    #[wasm_bindgen_test]
     fn foreign_process_provider_is_rejected() {
         let error = validate_install_result(Err(&FOREIGN_PROVIDER)).unwrap_err();
         assert!(error

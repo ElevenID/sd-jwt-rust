@@ -12,9 +12,9 @@ homepage = "https://github.com/openwallet-foundation-labs/sd-jwt-rust"
 
 [features]
 default = ["issuer-planning", "holder", "verifier"]
-issuer-planning = ["dep:curve25519-dalek", "dep:p256", "dep:p384", "dep:rand"]
-holder = ["dep:curve25519-dalek", "dep:ed25519-dalek", "dep:p256", "dep:p384", "p256/ecdsa", "p384/ecdsa", "jsonwebtoken/use_pem", "dep:sd-jwt-native-crypto-backend"]
-verifier = ["dep:ed25519-dalek", "dep:p256", "dep:p384", "p256/ecdsa", "p384/ecdsa", "jsonwebtoken/use_pem", "dep:sd-jwt-native-crypto-backend"]
+issuer-planning = ["dep:curve25519-dalek", "dep:ed25519-dalek", "dep:p256", "dep:p384", "p256/ecdsa", "p384/ecdsa", "dep:rand", "dep:aws-lc-rs"]
+holder = ["dep:curve25519-dalek", "dep:ed25519-dalek", "dep:p256", "dep:p384", "p256/ecdsa", "p384/ecdsa", "jsonwebtoken/use_pem", "dep:aws-lc-rs"]
+verifier = ["dep:ed25519-dalek", "dep:p256", "dep:p384", "p256/ecdsa", "p384/ecdsa", "jsonwebtoken/use_pem", "dep:aws-lc-rs"]
 mock_salts = ["issuer-planning", "lazy_static"]
 parallel = []
 # Criterion is compiled as a separate crate and cannot reach the private
@@ -45,10 +45,10 @@ strum = { version = "0.25", default-features = false, features = ["std", "derive
 getrandom = { version = "0.2", features = ["js"] }
 
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
-# AWS-LC replaces RustCrypto `rsa` on native targets. Besides removing the
-# Marvin timing-side-channel advisory, this retains jsonwebtoken's public API
-# and delegates RSA/ECDSA/Ed25519 verification to a maintained backend.
-sd-jwt-native-crypto-backend = { path = "native-crypto-backend", optional = true }
+# Native verification uses AWS-LC for the RSA family. This direct dependency
+# avoids enabling a process-global jsonwebtoken feature that can conflict with
+# an embedding application. Issuer-planning-only builds do not compile it.
+aws-lc-rs = { version = "1.14", default-features = false, features = ["aws-lc-sys"], optional = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
 # Resolver/compile regression for the JS binding family used by maintained

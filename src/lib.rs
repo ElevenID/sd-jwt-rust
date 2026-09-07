@@ -113,9 +113,34 @@ pub mod verifier;
 #[cfg(all(
     target_arch = "wasm32",
     target_os = "unknown",
-    any(feature = "holder", feature = "verifier")
+    any(feature = "holder", feature = "issuer-planning", feature = "verifier")
 ))]
 mod wasm_crypto;
+
+#[cfg(all(
+    not(all(target_arch = "wasm32", target_os = "unknown")),
+    any(feature = "holder", feature = "issuer-planning", feature = "verifier")
+))]
+mod native_crypto;
+
+/// Install the verification-only cryptography provider required by this
+/// crate and by applications that share its `jsonwebtoken` dependency.
+///
+/// The native provider supports ES256, ES384, EdDSA, and the RS*/PS* families.
+/// Browser WebAssembly supports ES256, ES384, and EdDSA; RSA is rejected until
+/// a WebCrypto-backed verifier is available. Local signing is unsupported on
+/// both targets.
+#[cfg(any(feature = "holder", feature = "issuer-planning", feature = "verifier"))]
+pub fn install_crypto_provider() -> Result<()> {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        wasm_crypto::ensure_installed()
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        native_crypto::ensure_installed()
+    }
+}
 
 pub const DEFAULT_SIGNING_ALG: &str = "ES256";
 #[cfg(any(feature = "issuer-planning", feature = "holder", feature = "verifier"))]
