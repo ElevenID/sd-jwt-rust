@@ -450,7 +450,7 @@ fn batch_contract_error(message: impl Into<String>) -> Error {
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "holder"))]
 mod tests {
     use super::*;
     use crate::disclosure_preprocessing::preprocess_disclosures_serial;

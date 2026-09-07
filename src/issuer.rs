@@ -1140,5 +1140,5 @@ mod issuer_planning_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "holder", feature = "verifier"))]
 mod issuance_contract_tests;
