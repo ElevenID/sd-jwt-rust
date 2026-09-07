@@ -201,7 +201,7 @@ impl SDJWTHolder {
         verification_policy: VerificationPolicy,
     ) -> Result<Self> {
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-        crate::wasm_crypto::ensure_installed();
+        crate::wasm_crypto::ensure_installed()?;
 
         let mut holder = SDJWTHolder {
             sd_jwt_engine: SDJWTCommon {
@@ -1003,7 +1003,7 @@ mod tests {
         let signature = crate::utils::base64url_decode(&encoded_signature).unwrap();
         let presentation = prepared.complete(&signature).unwrap();
 
-        assert!(presentation.split('~').last().unwrap().contains('.'));
+        assert!(presentation.split('~').next_back().unwrap().contains('.'));
     }
     #[test]
     fn create_presentation_empty_object_as_disclosure_value() {
