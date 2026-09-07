@@ -6,13 +6,14 @@ mod error;
 mod types;
 mod utils;
 
+use base64::Engine;
 use jsonwebtoken::jwk::Jwk;
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::utils::funcs::{parse_sdjwt_paylod, load_salts};
 use clap::Parser;
 use jsonwebtoken::{EncodingKey, DecodingKey};
-use sd_jwt_rs::issuer::{ClaimsForSelectiveDisclosureStrategy, SDJWTIssuer};
+use sd_jwt_rs::issuer::{ClaimsForSelectiveDisclosureStrategy, SDJWTIssuerPlanner};
 use sd_jwt_rs::holder::SDJWTHolder;
 use sd_jwt_rs::verifier::SDJWTVerifier;
 use sd_jwt_rs::SDJWTSerializationFormat;
@@ -139,14 +140,19 @@ fn issue_sd_jwt(
         None
     };
 
-    let mut issuer = SDJWTIssuer::new(issuer_key, Some(String::from("ES256")));
-    let sd_jwt = issuer.issue_sd_jwt(
-            user_claims, 
-            strategy,
-            jwk,
-            decoy,
-            serialization_format)
+    let prepared = SDJWTIssuerPlanner::new(Some(String::from("ES256")))
+        .prepare(user_claims, strategy, jwk, decoy, serialization_format)
         .unwrap();
+    let encoded_signature = jsonwebtoken::crypto::sign(
+        prepared.signing_input(),
+        &issuer_key,
+        prepared.algorithm(),
+    )
+    .unwrap();
+    let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded_signature)
+        .unwrap();
+    let sd_jwt = prepared.complete(&signature).unwrap();
 
     Ok(sd_jwt)
 }

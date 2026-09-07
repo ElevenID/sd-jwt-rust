@@ -6,16 +6,11 @@
 use criterion::{black_box, BatchSize, Throughput};
 use criterion::{criterion_group, criterion_main, Criterion};
 #[cfg(not(feature = "mock_salts"))]
-use jsonwebtoken::EncodingKey;
-#[cfg(not(feature = "mock_salts"))]
 use sd_jwt_rs::issuer::ClaimsForSelectiveDisclosureStrategy;
 #[cfg(not(feature = "mock_salts"))]
-use sd_jwt_rs::{SDJWTIssuer, SDJWTSerializationFormat};
+use sd_jwt_rs::{SDJWTIssuerPlanner, SDJWTSerializationFormat};
 #[cfg(not(feature = "mock_salts"))]
 use serde_json::{Map, Value};
-
-#[cfg(not(feature = "mock_salts"))]
-const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
 
 #[cfg(not(feature = "mock_salts"))]
 fn claims(count: usize) -> Value {
@@ -29,9 +24,7 @@ fn claims(count: usize) -> Value {
 #[cfg(not(feature = "mock_salts"))]
 fn benchmark_production_rng(c: &mut Criterion) {
     let claims = claims(512);
-    let issuer_key = EncodingKey::from_ec_pem(PRIVATE_ISSUER_PEM.as_bytes())
-        .expect("benchmark issuer key must be valid");
-    let mut issuer = SDJWTIssuer::new(issuer_key, None);
+    let issuer = SDJWTIssuerPlanner::new(None);
     let mut group = c.benchmark_group("sd_jwt_production_rng");
     group.throughput(Throughput::Elements(1));
     group.bench_function("top_level_512_disclosures_with_decoys", |b| {
@@ -40,14 +33,14 @@ fn benchmark_production_rng(c: &mut Criterion) {
             |claims| {
                 black_box(
                     issuer
-                        .issue_sd_jwt(
+                        .prepare(
                             claims,
                             ClaimsForSelectiveDisclosureStrategy::TopLevel,
                             None,
                             true,
                             SDJWTSerializationFormat::Compact,
                         )
-                        .expect("production-randomness benchmark issuance must succeed"),
+                        .expect("production-randomness benchmark planning must succeed"),
                 )
             },
             BatchSize::LargeInput,

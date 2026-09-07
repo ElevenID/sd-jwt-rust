@@ -2,13 +2,14 @@
 // https://www.dsr-corporation.com
 // SPDX-License-Identifier: Apache-2.0
 
+use base64::Engine;
 use criterion::{
     black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput,
 };
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use sd_jwt_rs::{
-    ClaimsForSelectiveDisclosureStrategy, SDJWTIssuer, SDJWTSerializationFormat, SDJWTVerifier,
-    MAX_SD_JWT_DISCLOSURE_BYTES, MAX_SD_JWT_INPUT_BYTES,
+    ClaimsForSelectiveDisclosureStrategy, SDJWTIssuerPlanner, SDJWTSerializationFormat,
+    SDJWTVerifier, MAX_SD_JWT_DISCLOSURE_BYTES, MAX_SD_JWT_INPUT_BYTES,
 };
 use serde_json::{json, Map, Value};
 
@@ -125,9 +126,8 @@ fn claims(disclosure_count: usize, payload_class: PayloadClass) -> Value {
 fn issue_fixture(disclosure_count: usize, payload_class: PayloadClass) -> String {
     let issuer_key = EncodingKey::from_ec_pem(PRIVATE_ISSUER_PEM.as_bytes())
         .expect("benchmark issuer key must be valid");
-    let mut issuer = SDJWTIssuer::new(issuer_key, Some("ES256".to_string()));
-    let presentation = issuer
-        .issue_sd_jwt(
+    let prepared = SDJWTIssuerPlanner::new(Some("ES256".to_string()))
+        .prepare(
             claims(disclosure_count, payload_class),
             ClaimsForSelectiveDisclosureStrategy::TopLevel,
             None,
@@ -135,6 +135,15 @@ fn issue_fixture(disclosure_count: usize, payload_class: PayloadClass) -> String
             SDJWTSerializationFormat::Compact,
         )
         .expect("benchmark fixture issuance must succeed");
+    let encoded_signature =
+        jsonwebtoken::crypto::sign(prepared.signing_input(), &issuer_key, prepared.algorithm())
+            .expect("benchmark fixture signing must succeed");
+    let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded_signature)
+        .expect("benchmark signature must be base64url");
+    let presentation = prepared
+        .complete(&signature)
+        .expect("benchmark fixture assembly must succeed");
 
     let segments = presentation.split('~').count();
     assert_eq!(segments, disclosure_count + 2);

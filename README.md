@@ -11,8 +11,9 @@ Proposals about API improvements are highly appreciated.
 
 ```rust
 fn demo() {
-    let mut issuer = SDJWTIssuer::new(issuer_key, None);
-    let sd_jwt = issuer.issue_sd_jwt(claims, ClaimsForSelectiveDisclosureStrategy::AllLevels, holder_key, add_decoy, SDJWTSerializationFormat::Compact).unwrap();
+    let prepared = SDJWTIssuerPlanner::new(None).prepare(claims, ClaimsForSelectiveDisclosureStrategy::AllLevels, holder_public_key, add_decoy, SDJWTSerializationFormat::Compact).unwrap();
+    let signature = kms.sign(prepared.algorithm(), prepared.signing_input()).await.unwrap();
+    let sd_jwt = prepared.complete(&signature).unwrap();
 
     let mut holder = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact, Box::new(cb_to_resolve_issuer_key)).unwrap();
     let presentation = holder.create_presentation(claims_to_disclosure).unwrap();

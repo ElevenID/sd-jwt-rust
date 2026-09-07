@@ -11,7 +11,7 @@ use crate::utils::{base64url_decode, jwt_payload_decode};
 use error::Result;
 #[cfg(feature = "holder")]
 pub use holder::{PreparedKeyBindingPresentation, SDJWTHolder};
-#[cfg(any(feature = "issuer-local", test))]
+#[cfg(test)]
 pub use issuer::SDJWTIssuer;
 #[cfg(feature = "issuer-planning")]
 pub use issuer::{ClaimsForSelectiveDisclosureStrategy, PreparedSDJWT, SDJWTIssuerPlanner};
@@ -32,7 +32,6 @@ use strum::Display;
 #[cfg(feature = "verifier")]
 pub use verifier::SDJWTVerifier;
 
-#[cfg(not(feature = "issuer-local"))]
 /// Verification-only builds do not expose an issuer that owns an
 /// [`jsonwebtoken::EncodingKey`].
 ///
@@ -206,14 +205,9 @@ pub enum SDJWTSerializationFormat {
 #[cfg(any(feature = "issuer-planning", feature = "holder", feature = "verifier"))]
 #[derive(Default)]
 pub(crate) struct SDJWTCommon {
-    #[cfg(any(feature = "issuer-local", test))]
+    #[cfg(test)]
     typ: Option<String>,
-    #[cfg(any(
-        test,
-        feature = "issuer-local",
-        feature = "holder",
-        feature = "verifier"
-    ))]
+    #[cfg(any(test, feature = "holder", feature = "verifier"))]
     serialization_format: SDJWTSerializationFormat,
     #[cfg(any(feature = "holder", feature = "verifier"))]
     unverified_input_key_binding_jwt: Option<String>,
@@ -517,7 +511,7 @@ impl SDJWTCommon {
     }
 
     /// Splits a signed JWT (`protected.payload.signature`) into its three parts.
-    #[cfg(any(feature = "holder", feature = "issuer-local"))]
+    #[cfg(any(feature = "holder", test))]
     fn split_jwt(jwt: &str) -> Result<(String, String, String)> {
         let parts: Vec<&str> = jwt.split('.').collect();
         let [protected, payload, signature] = parts.as_slice() else {
