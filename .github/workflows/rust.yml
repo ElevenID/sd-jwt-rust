@@ -45,7 +45,7 @@ jobs:
           exit 1
         fi
     - name: Build interop tool
-      run: cargo build --manifest-path generate/Cargo.toml --verbose
+      run: cargo build --locked --manifest-path generate/Cargo.toml --verbose
     - name: Run parallel-feature tests
       run: cargo test --locked --no-default-features --features parallel --verbose
     - name: Run all-feature interaction tests

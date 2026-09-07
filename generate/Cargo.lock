@@ -782,6 +782,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sd-jwt-native-crypto-backend"
+version = "0.1.0"
+dependencies = [
+ "jsonwebtoken",
+]
+
+[[package]]
 name = "sd-jwt-rs"
 version = "0.7.1"
 dependencies = [
@@ -794,6 +801,7 @@ dependencies = [
  "p256",
  "p384",
  "rand",
+ "sd-jwt-native-crypto-backend",
  "serde",
  "serde_json",
  "sha2",
