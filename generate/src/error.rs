@@ -91,8 +91,8 @@ impl fmt::Display for Error {
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         self.cause
-            .as_ref()
-            .map(|err| unsafe { std::mem::transmute(&**err) })
+            .as_deref()
+            .map(|error| error as &(dyn StdError + 'static))
     }
 }
 
