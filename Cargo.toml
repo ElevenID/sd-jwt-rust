@@ -14,7 +14,7 @@ homepage = "https://github.com/openwallet-foundation-labs/sd-jwt-rust"
 default = ["issuer-completion", "holder", "verifier"]
 # Pure credential planning and signature-shape validation. This feature stays
 # free of cryptographic verification backends for remote planner workers.
-issuer-planning = ["dep:curve25519-dalek", "dep:p256", "dep:p384", "dep:rand"]
+issuer-planning = ["dep:rand"]
 # Exact payload/key binding for signatures returned by an opaque remote signer.
 issuer-completion = ["issuer-planning", "dep:ed25519-dalek", "p256/ecdsa", "p384/ecdsa", "jsonwebtoken/use_pem", "dep:aws-lc-rs"]
 holder = ["dep:curve25519-dalek", "dep:ed25519-dalek", "dep:p256", "dep:p384", "p256/ecdsa", "p384/ecdsa", "jsonwebtoken/use_pem", "dep:aws-lc-rs"]
@@ -25,7 +25,7 @@ parallel = []
 # issuance executor. This opt-in feature exposes only the deterministic
 # benchmark fixture; ordinary builds, including `parallel`-only builds, do not
 # compile the fixture or alter production routing.
-issuance_bench = ["issuer-planning", "parallel", "dep:libc", "dep:winapi-util"]
+issuance_bench = ["issuer-planning", "parallel", "dep:curve25519-dalek", "dep:p256", "dep:p384", "dep:libc", "dep:winapi-util"]
 
 [dependencies]
 base64 = "0.21"

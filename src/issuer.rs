@@ -2,12 +2,15 @@
 // https://www.dsr-corporation.com
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::error;
+#[cfg(any(test, feature = "issuer-completion", feature = "issuance_bench"))]
 use crate::{
-    error, SDJWTFlattenedJson, SDJWTGeneralJson, SDJWTGeneralJsonSignature, SDJWTUnprotectedHeader,
+    SDJWTFlattenedJson, SDJWTGeneralJson, SDJWTGeneralJsonSignature, SDJWTUnprotectedHeader,
 };
 use error::Result;
 #[cfg(test)]
 use std::collections::HashMap;
+#[cfg(any(test, feature = "issuer-completion", feature = "issuance_bench"))]
 use std::collections::VecDeque;
 use std::fmt;
 use std::ops::Range;
@@ -30,9 +33,11 @@ use serde_json::{json, Map};
 use crate::disclosure::SDJWTDisclosure;
 use crate::error::Error;
 use crate::utils::{base64url_encode, generate_salt_with_rng};
+#[cfg(any(test, feature = "issuer-completion", feature = "issuance_bench"))]
+use crate::COMBINED_SERIALIZATION_FORMAT_SEPARATOR;
 use crate::{
-    SDJWTCommon, SDJWTSerializationFormat, CNF_KEY, COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
-    DEFAULT_DIGEST_ALG, DEFAULT_SIGNING_ALG, DIGEST_ALG_KEY, JWK_KEY,
+    SDJWTCommon, SDJWTSerializationFormat, CNF_KEY, DEFAULT_DIGEST_ALG, DEFAULT_SIGNING_ALG,
+    DIGEST_ALG_KEY, JWK_KEY,
 };
 
 #[cfg(test)]
@@ -203,12 +208,15 @@ impl SDJWTIssuerPlanner {
         serialization_format: SDJWTSerializationFormat,
         random_source: &mut R,
     ) -> Result<PreparedSDJWT> {
+        #[cfg(not(any(test, feature = "issuer-completion", feature = "issuance_bench")))]
+        let _ = serialization_format;
         self.prepare_with_random_source_and_plan_executor(
             user_claims,
             sd_strategy,
             IssuanceOptions {
                 holder_key,
                 add_decoy_claims,
+                #[cfg(any(test, feature = "issuer-completion", feature = "issuance_bench"))]
                 serialization_format,
             },
             random_source,
@@ -287,8 +295,11 @@ impl SDJWTIssuerPlanner {
         Ok(PreparedSDJWT {
             algorithm,
             disclosures,
+            #[cfg(any(feature = "issuer-completion", feature = "issuance_bench"))]
             payload,
+            #[cfg(any(feature = "issuer-completion", feature = "issuance_bench"))]
             protected,
+            #[cfg(any(feature = "issuer-completion", feature = "issuance_bench"))]
             serialization_format: options.serialization_format,
             signing_input,
         })
@@ -440,8 +451,11 @@ mod public_holder_key_tests {
 pub struct PreparedSDJWT {
     algorithm: Algorithm,
     disclosures: Vec<String>,
+    #[cfg(any(feature = "issuer-completion", feature = "issuance_bench"))]
     payload: String,
+    #[cfg(any(feature = "issuer-completion", feature = "issuance_bench"))]
     protected: String,
+    #[cfg(any(feature = "issuer-completion", feature = "issuance_bench"))]
     serialization_format: SDJWTSerializationFormat,
     signing_input: String,
 }
@@ -492,6 +506,7 @@ impl PreparedSDJWT {
         self.complete_encoded_signature(base64url_encode(signature))
     }
 
+    #[cfg(any(feature = "issuer-completion", feature = "issuance_bench"))]
     fn complete_encoded_signature(self, signature: String) -> Result<String> {
         let signed_sd_jwt = format!("{}.{}", self.signing_input, signature);
         match self.serialization_format {
@@ -549,6 +564,7 @@ struct LegacyIssuanceRandomSource<R> {
 struct IssuanceOptions {
     holder_key: Option<Jwk>,
     add_decoy_claims: bool,
+    #[cfg(any(test, feature = "issuer-completion", feature = "issuance_bench"))]
     serialization_format: SDJWTSerializationFormat,
 }
 
@@ -679,6 +695,7 @@ impl SDJWTIssuer {
             IssuanceOptions {
                 holder_key,
                 add_decoy_claims,
+                #[cfg(any(test, feature = "issuer-completion", feature = "issuance_bench"))]
                 serialization_format,
             },
             random_source,
@@ -1145,7 +1162,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "issuer-planning"))]
+#[cfg(all(test, any(feature = "issuer-completion", feature = "issuance_bench")))]
 mod issuer_planning_tests {
     use jsonwebtoken::Algorithm;
 
