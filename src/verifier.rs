@@ -554,7 +554,7 @@ mod tests {
         )
     }
 
-    fn compact_key_bound_presentation(holder_jwk: Value) -> String {
+    fn key_bound_presentation(holder_jwk: Value, format: SDJWTSerializationFormat) -> String {
         let sd_jwt = compact_presentation(
             &json!({
                 "iss": "https://example.com/issuer",
@@ -578,16 +578,55 @@ mod tests {
             &EncodingKey::from_ed_pem(HOLDER_KEY_ED25519.as_bytes()).unwrap(),
         )
         .unwrap();
-        format!("{sd_jwt}{key_binding}")
+        if format == SDJWTSerializationFormat::Compact {
+            return format!("{sd_jwt}{key_binding}");
+        }
+
+        let issuer_jwt = sd_jwt.strip_suffix('~').unwrap();
+        let mut segments = issuer_jwt.split('.');
+        let protected = segments.next().unwrap().to_owned();
+        let payload = segments.next().unwrap().to_owned();
+        let signature = segments.next().unwrap().to_owned();
+        assert!(segments.next().is_none());
+        let header = crate::SDJWTUnprotectedHeader {
+            disclosures: vec![],
+            kb_jwt: Some(key_binding),
+        };
+        match format {
+            SDJWTSerializationFormat::FlattenedJson => {
+                serde_json::to_string(&crate::SDJWTFlattenedJson {
+                    protected,
+                    payload,
+                    signature,
+                    header,
+                })
+                .unwrap()
+            }
+            SDJWTSerializationFormat::GeneralJson => {
+                serde_json::to_string(&crate::SDJWTGeneralJson {
+                    payload,
+                    signatures: vec![crate::SDJWTGeneralJsonSignature {
+                        protected,
+                        signature,
+                        header,
+                    }],
+                })
+                .unwrap()
+            }
+            SDJWTSerializationFormat::Compact => unreachable!(),
+        }
     }
 
-    fn verify_compact_key_bound(holder_jwk: Value) -> crate::error::Result<SDJWTVerifier> {
+    fn verify_key_bound(
+        holder_jwk: Value,
+        format: SDJWTSerializationFormat,
+    ) -> crate::error::Result<SDJWTVerifier> {
         SDJWTVerifier::new(
-            compact_key_bound_presentation(holder_jwk),
+            key_bound_presentation(holder_jwk, format.clone()),
             Box::new(|_, _| DecodingKey::from_ec_pem(PUBLIC_ISSUER_PEM.as_bytes()).unwrap()),
             Some("verifier-policy-audience".to_owned()),
             Some("verifier-policy-nonce".to_owned()),
-            SDJWTSerializationFormat::Compact,
+            format,
         )
     }
 
@@ -897,7 +936,28 @@ mod tests {
     #[test]
     fn verifier_enforces_signed_confirmation_key_metadata_for_key_binding() {
         let valid_jwk: Value = serde_json::from_str(HOLDER_JWK_KEY_ED25519).unwrap();
-        assert!(verify_compact_key_bound(valid_jwk.clone()).is_ok());
+        let formats = [
+            SDJWTSerializationFormat::Compact,
+            SDJWTSerializationFormat::FlattenedJson,
+            SDJWTSerializationFormat::GeneralJson,
+        ];
+        for format in &formats {
+            assert!(verify_key_bound(valid_jwk.clone(), format.clone()).is_ok());
+
+            let mut use_sig = valid_jwk.clone();
+            use_sig
+                .as_object_mut()
+                .unwrap()
+                .insert("use".to_owned(), json!("sig"));
+            assert!(verify_key_bound(use_sig, format.clone()).is_ok());
+
+            let mut verify_only = valid_jwk.clone();
+            verify_only
+                .as_object_mut()
+                .unwrap()
+                .insert("key_ops".to_owned(), json!(["verify"]));
+            assert!(verify_key_bound(verify_only, format.clone()).is_ok());
+        }
 
         let cases = [
             (
@@ -912,40 +972,44 @@ mod tests {
                 "cnf.jwk key_ops must contain only verify",
             ),
         ];
-        for (member, value, expected) in cases {
-            let mut jwk = valid_jwk.clone();
-            jwk.as_object_mut()
-                .unwrap()
-                .insert(member.to_owned(), value);
-            let error = verify_compact_key_bound(jwk)
-                .err()
-                .expect("invalid signed cnf.jwk metadata must be rejected");
-            assert!(
-                matches!(
-                    &error,
-                    Error::InvalidInput(ref message) if message == expected
-                ),
-                "unexpected {member} rejection: {error:?}"
-            );
+        for format in &formats {
+            for (member, value, expected) in &cases {
+                let mut jwk = valid_jwk.clone();
+                jwk.as_object_mut()
+                    .unwrap()
+                    .insert((*member).to_owned(), value.clone());
+                let error = verify_key_bound(jwk, format.clone())
+                    .err()
+                    .expect("invalid signed cnf.jwk metadata must be rejected");
+                assert!(
+                    matches!(
+                        &error,
+                        Error::InvalidInput(ref message) if message == expected
+                    ),
+                    "unexpected {format:?} {member} rejection: {error:?}"
+                );
+            }
         }
 
-        let mut combined = valid_jwk;
-        combined
-            .as_object_mut()
-            .unwrap()
-            .insert("use".to_owned(), json!("sig"));
-        combined
-            .as_object_mut()
-            .unwrap()
-            .insert("key_ops".to_owned(), json!(["verify"]));
-        let error = verify_compact_key_bound(combined)
-            .err()
-            .expect("combining signed cnf.jwk use and key_ops must be rejected");
-        assert!(matches!(
-            error,
-            Error::InvalidInput(ref message)
-                if message == "cnf.jwk must not combine use and key_ops"
-        ));
+        for format in formats {
+            let mut combined = valid_jwk.clone();
+            combined
+                .as_object_mut()
+                .unwrap()
+                .insert("use".to_owned(), json!("sig"));
+            combined
+                .as_object_mut()
+                .unwrap()
+                .insert("key_ops".to_owned(), json!(["verify"]));
+            let error = verify_key_bound(combined, format.clone())
+                .err()
+                .expect("combining signed cnf.jwk use and key_ops must be rejected");
+            assert!(matches!(
+                error,
+                Error::InvalidInput(ref message)
+                    if message == "cnf.jwk must not combine use and key_ops"
+            ));
+        }
     }
 
     #[test]
