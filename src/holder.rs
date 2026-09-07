@@ -8,9 +8,10 @@ use crate::{
     VerificationPolicy,
 };
 use error::{Error, Result};
+use jsonwebtoken::jwk::Jwk;
 #[cfg(test)]
 use jsonwebtoken::EncodingKey;
-use jsonwebtoken::{Algorithm, Header};
+use jsonwebtoken::{Algorithm, DecodingKey, Header};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::ops::Add;
@@ -39,16 +40,13 @@ pub struct SDJWTHolder {
 /// The value owns only public credential material and the exact JWS signing
 /// input. Send [`Self::signing_input`] to a KMS, secure enclave, or platform
 /// keystore, then provide the returned raw signature to [`Self::complete`].
-/// This generic crate validates the signature encoding, but does not receive
-/// the holder public key and therefore cannot prove which key signed it.
-/// Integrations must verify the detached signature against the public key bound
-/// to the credential before accepting or transmitting the assembled result.
 pub struct PreparedKeyBindingPresentation {
     algorithm: Algorithm,
     disclosures: Vec<String>,
     serialization_format: SDJWTSerializationFormat,
     serialized_sd_jwt: String,
     signing_input: String,
+    verification_key: DecodingKey,
 }
 
 impl std::fmt::Debug for PreparedKeyBindingPresentation {
@@ -73,13 +71,16 @@ impl PreparedKeyBindingPresentation {
         self.signing_input.as_bytes()
     }
 
-    /// Assemble the presentation from a raw signature returned by the signer.
-    ///
-    /// This validates algorithm-specific encoding only. The caller is
-    /// responsible for verifying that the signature matches the intended
-    /// holder public key before the result leaves its trust boundary.
+    /// Verify and assemble the presentation from an opaque signer's raw
+    /// signature. Verification uses the public `cnf.jwk` bound into the
+    /// issuer-signed credential and this instance's exact signing input.
     pub fn complete(self, signature: &[u8]) -> Result<String> {
-        crate::signature_validation::validate_remote_signature(self.algorithm, signature)?;
+        crate::signature_validation::verify_remote_signature(
+            self.algorithm,
+            self.signing_input.as_bytes(),
+            signature,
+            &self.verification_key,
+        )?;
         let key_binding_jwt = format!("{}.{}", self.signing_input, base64url_encode(signature));
 
         match self.serialization_format {
@@ -200,8 +201,7 @@ impl SDJWTHolder {
         cb_get_issuer_key: Option<Box<FallibleKeyResolver>>,
         verification_policy: VerificationPolicy,
     ) -> Result<Self> {
-        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-        crate::wasm_crypto::ensure_installed()?;
+        crate::install_crypto_provider()?;
 
         let mut holder = SDJWTHolder {
             sd_jwt_engine: SDJWTCommon {
@@ -305,6 +305,22 @@ impl SDJWTHolder {
             .insert("iat".to_owned(), timestamp.into());
         self.set_key_binding_digest_key()?;
 
+        let holder_jwk: Jwk = serde_json::from_value(
+            self.sd_jwt_payload
+                .get("cnf")
+                .and_then(Value::as_object)
+                .and_then(|confirmation| confirmation.get("jwk"))
+                .cloned()
+                .ok_or_else(|| {
+                    Error::InvalidInput(
+                        "key binding requires an issuer-signed public cnf.jwk".to_owned(),
+                    )
+                })?,
+        )
+        .map_err(|_| Error::InvalidInput("cnf.jwk is not a valid public JWK".to_owned()))?;
+        let verification_key = DecodingKey::from_jwk(&holder_jwk)
+            .map_err(|_| Error::InvalidInput("cnf.jwk is not a usable public JWK".to_owned()))?;
+
         let protected = base64url_encode(
             &serde_json::to_vec(&header)
                 .map_err(|error| Error::DeserializationError(error.to_string()))?,
@@ -320,6 +336,7 @@ impl SDJWTHolder {
             serialization_format: self.sd_jwt_engine.serialization_format.clone(),
             serialized_sd_jwt: self.serialized_sd_jwt.clone(),
             signing_input: format!("{protected}.{payload}"),
+            verification_key,
         })
     }
 
@@ -626,6 +643,19 @@ mod tests {
         Box::new(|_iss: &str, _hdr: &jsonwebtoken::Header| {
             DecodingKey::from_ec_pem(PUBLIC_ISSUER_PEM.as_bytes()).unwrap()
         })
+    }
+
+    fn issuer_public_jwk() -> jsonwebtoken::jwk::Jwk {
+        let key = DecodingKey::from_ec_pem(PUBLIC_ISSUER_PEM.as_bytes()).unwrap();
+        let point = key.as_bytes();
+        assert_eq!(point.len(), 65);
+        serde_json::from_value(json!({
+            "kty": "EC",
+            "crv": "P-256",
+            "x": crate::utils::base64url_encode(&point[1..33]),
+            "y": crate::utils::base64url_encode(&point[33..65]),
+        }))
+        .unwrap()
     }
 
     #[test]
@@ -981,7 +1011,7 @@ mod tests {
             .issue_sd_jwt(
                 user_claims,
                 ClaimsForSelectiveDisclosureStrategy::AllLevels,
-                None,
+                Some(issuer_public_jwk()),
                 false,
                 SDJWTSerializationFormat::Compact,
             )
@@ -1004,6 +1034,57 @@ mod tests {
         let presentation = prepared.complete(&signature).unwrap();
 
         assert!(presentation.split('~').next_back().unwrap().contains('.'));
+    }
+
+    #[test]
+    fn key_binding_completion_rejects_wrong_payload_and_wrong_key() {
+        use p256::ecdsa::signature::Signer as _;
+        use p256::pkcs8::DecodePrivateKey as _;
+
+        let make_holder = || {
+            let issuer_key = EncodingKey::from_ec_pem(PRIVATE_ISSUER_PEM.as_bytes()).unwrap();
+            let sd_jwt = SDJWTIssuer::new(issuer_key, None)
+                .issue_sd_jwt(
+                    json!({
+                        "iss": "https://example.com/issuer",
+                        "iat": 1683000000,
+                        "exp": 1883000000,
+                        "given_name": "Alice"
+                    }),
+                    ClaimsForSelectiveDisclosureStrategy::AllLevels,
+                    Some(issuer_public_jwk()),
+                    false,
+                    SDJWTSerializationFormat::Compact,
+                )
+                .unwrap();
+            SDJWTHolder::new_unverified(sd_jwt, SDJWTSerializationFormat::Compact).unwrap()
+        };
+        let prepare = |holder: &mut SDJWTHolder| {
+            holder
+                .prepare_key_binding_presentation(
+                    json!({"given_name": true}).as_object().unwrap().clone(),
+                    "nonce".to_owned(),
+                    "https://verifier.example".to_owned(),
+                    Some("ES256".to_owned()),
+                )
+                .unwrap()
+        };
+        let private_key = EncodingKey::from_ec_pem(PRIVATE_ISSUER_PEM.as_bytes()).unwrap();
+        let signing_key = p256::ecdsa::SigningKey::from_pkcs8_der(private_key.inner()).unwrap();
+
+        let mut holder = make_holder();
+        let prepared = prepare(&mut holder);
+        let wrong_payload_signature: p256::ecdsa::Signature = signing_key.sign(b"different input");
+        assert!(prepared
+            .complete(&wrong_payload_signature.to_bytes())
+            .is_err());
+
+        let mut holder = make_holder();
+        let prepared = prepare(&mut holder);
+        let wrong_signer = p256::ecdsa::SigningKey::from_slice(&[42u8; 32]).unwrap();
+        let wrong_key_signature: p256::ecdsa::Signature =
+            wrong_signer.sign(prepared.signing_input());
+        assert!(prepared.complete(&wrong_key_signature.to_bytes()).is_err());
     }
     #[test]
     fn create_presentation_empty_object_as_disclosure_value() {

@@ -1491,7 +1491,7 @@ impl PreparedFullIssuanceBenchmark {
             execute_plan,
         )?;
         self.random_tape.finish()?;
-        prepared.complete(&BENCHMARK_REMOTE_ES256_SIGNATURE)
+        prepared.complete_for_benchmark(&BENCHMARK_REMOTE_ES256_SIGNATURE)
     }
 
     fn execute_candidate_with_trace(mut self) -> Result<(String, IssuanceBenchmarkRouteRecord)> {
@@ -1512,7 +1512,7 @@ impl PreparedFullIssuanceBenchmark {
             },
         )?;
         self.random_tape.finish()?;
-        let credential = prepared.complete(&BENCHMARK_REMOTE_ES256_SIGNATURE)?;
+        let credential = prepared.complete_for_benchmark(&BENCHMARK_REMOTE_ES256_SIGNATURE)?;
         let summary = trace_summary.ok_or_else(|| {
             Error::InvalidState("full issuance benchmark route was not recorded".to_owned())
         })?;
@@ -1542,7 +1542,7 @@ impl PreparedFullIssuanceBenchmark {
             },
         )?;
         self.random_tape.finish()?;
-        let credential = prepared.complete(&BENCHMARK_REMOTE_ES256_SIGNATURE)?;
+        let credential = prepared.complete_for_benchmark(&BENCHMARK_REMOTE_ES256_SIGNATURE)?;
         let summary = trace_summary.ok_or_else(|| {
             Error::InvalidState("full issuance benchmark route was not recorded".to_owned())
         })?;

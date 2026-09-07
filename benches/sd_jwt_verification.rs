@@ -142,7 +142,10 @@ fn issue_fixture(disclosure_count: usize, payload_class: PayloadClass) -> String
         .decode(encoded_signature)
         .expect("benchmark signature must be base64url");
     let presentation = prepared
-        .complete(&signature)
+        .complete(
+            &signature,
+            &DecodingKey::from_ec_pem(PUBLIC_ISSUER_PEM.as_bytes()).unwrap(),
+        )
         .expect("benchmark fixture assembly must succeed");
 
     let segments = presentation.split('~').count();

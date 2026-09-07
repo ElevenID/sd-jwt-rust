@@ -13,7 +13,7 @@ Proposals about API improvements are highly appreciated.
 fn demo() {
     let prepared = SDJWTIssuerPlanner::new(None).prepare(claims, ClaimsForSelectiveDisclosureStrategy::AllLevels, holder_public_key, add_decoy, SDJWTSerializationFormat::Compact).unwrap();
     let signature = kms.sign(prepared.algorithm(), prepared.signing_input()).await.unwrap();
-    let sd_jwt = prepared.complete(&signature).unwrap();
+    let sd_jwt = prepared.complete(&signature, &issuer_public_key).unwrap();
 
     let mut holder = SDJWTHolder::new(sd_jwt, SDJWTSerializationFormat::Compact, Box::new(cb_to_resolve_issuer_key)).unwrap();
     let presentation = holder.create_presentation(claims_to_disclosure).unwrap();
@@ -42,8 +42,11 @@ cargo test
 
 ### Cryptographic backends
 
-Native holder and verifier builds use AWS-LC and support `ES256`, `ES384`,
+Native verification uses AWS-LC for RSA and supports `ES256`, `ES384`,
 `EdDSA`, `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, and `PS512`.
+The provider is verification-only in production; signing input is intended for
+an opaque KMS, enclave, or platform keystore. Completion verifies the returned
+signature against the exact prepared input and supplied/bound public key.
 
 Browser WebAssembly (`wasm32-unknown-unknown`) uses a restricted curve-only
 verification provider. It supports `ES256`, `ES384`, and `EdDSA`, and rejects
