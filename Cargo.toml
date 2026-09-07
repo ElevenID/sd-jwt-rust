@@ -11,8 +11,12 @@ documentation = "https://docs.rs/sd-jwt-rs"
 homepage = "https://github.com/openwallet-foundation-labs/sd-jwt-rust"
 
 [features]
-default = ["issuer-planning", "holder", "verifier"]
-issuer-planning = ["dep:curve25519-dalek", "dep:ed25519-dalek", "dep:p256", "dep:p384", "p256/ecdsa", "p384/ecdsa", "dep:rand", "dep:aws-lc-rs"]
+default = ["issuer-completion", "holder", "verifier"]
+# Pure credential planning and signature-shape validation. This feature stays
+# free of cryptographic verification backends for remote planner workers.
+issuer-planning = ["dep:curve25519-dalek", "dep:p256", "dep:p384", "dep:rand"]
+# Exact payload/key binding for signatures returned by an opaque remote signer.
+issuer-completion = ["issuer-planning", "dep:ed25519-dalek", "p256/ecdsa", "p384/ecdsa", "jsonwebtoken/use_pem", "dep:aws-lc-rs"]
 holder = ["dep:curve25519-dalek", "dep:ed25519-dalek", "dep:p256", "dep:p384", "p256/ecdsa", "p384/ecdsa", "jsonwebtoken/use_pem", "dep:aws-lc-rs"]
 verifier = ["dep:ed25519-dalek", "dep:p256", "dep:p384", "p256/ecdsa", "p384/ecdsa", "jsonwebtoken/use_pem", "dep:aws-lc-rs"]
 mock_salts = ["issuer-planning", "lazy_static"]

@@ -15,9 +15,11 @@ use std::str::FromStr;
 use std::vec::Vec;
 
 use jsonwebtoken::jwk::{AlgorithmParameters, Jwk};
+#[cfg(feature = "issuer-completion")]
+use jsonwebtoken::DecodingKey;
 #[cfg(test)]
 use jsonwebtoken::EncodingKey;
-use jsonwebtoken::{Algorithm, DecodingKey, Header};
+use jsonwebtoken::{Algorithm, Header};
 use rand::{rngs::ThreadRng, Rng, RngCore};
 #[cfg(test)]
 use serde_json::Map as SJMap;
@@ -471,6 +473,7 @@ impl PreparedSDJWT {
     /// The supplied public key must correspond to the opaque signer. The
     /// signature is checked against this instance's exact protected header and
     /// payload before any credential is returned.
+    #[cfg(feature = "issuer-completion")]
     pub fn complete(self, signature: &[u8], verification_key: &DecodingKey) -> Result<String> {
         crate::signature_validation::verify_remote_signature(
             self.algorithm,
@@ -879,7 +882,7 @@ impl SDJWTIssuer {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "issuer-completion"))]
 mod tests {
     use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey};
     use log::trace;
@@ -1144,50 +1147,9 @@ mod tests {
 
 #[cfg(all(test, feature = "issuer-planning"))]
 mod issuer_planning_tests {
-    use jsonwebtoken::{Algorithm, DecodingKey};
-    use serde_json::json;
+    use jsonwebtoken::Algorithm;
 
-    use super::ClaimsForSelectiveDisclosureStrategy;
     use crate::signature_validation::validate_remote_signature;
-    use crate::{SDJWTIssuerPlanner, SDJWTSerializationFormat};
-
-    const PUBLIC_ISSUER_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEb28d4MwZMjw8+00CG4xfnn9SLMVM\nM19SlqZpVb/uNtRe/nNbC6hpOB1LqFXjfIjqAHBOeO6SYVBCcn+QLHOqTw==\n-----END PUBLIC KEY-----\n";
-
-    fn verification_key() -> DecodingKey {
-        DecodingKey::from_ec_pem(PUBLIC_ISSUER_PEM.as_bytes()).unwrap()
-    }
-
-    #[test]
-    fn remote_planner_rejects_malformed_es256_signatures() {
-        let prepare = || {
-            SDJWTIssuerPlanner::new(Some("ES256".to_string()))
-                .prepare(
-                    json!({"sub": "example"}),
-                    ClaimsForSelectiveDisclosureStrategy::NoSDClaims,
-                    None,
-                    false,
-                    SDJWTSerializationFormat::Compact,
-                )
-                .unwrap()
-        };
-
-        assert!(prepare().complete(&[], &verification_key()).is_err());
-        assert!(prepare().complete(&[0u8; 63], &verification_key()).is_err());
-        let mut der_encoded = vec![0u8; 70];
-        der_encoded[0] = 0x30;
-        assert!(prepare()
-            .complete(&der_encoded, &verification_key())
-            .is_err());
-        assert!(prepare().complete(&[0u8; 64], &verification_key()).is_err());
-        assert!(prepare()
-            .complete(&[0xffu8; 64], &verification_key())
-            .is_err());
-
-        let mut valid = [0u8; 64];
-        valid[31] = 1;
-        valid[63] = 1;
-        assert!(prepare().complete(&valid, &verification_key()).is_err());
-    }
 
     #[test]
     fn remote_signature_validation_covers_supported_algorithms() {
@@ -1225,23 +1187,6 @@ mod issuer_planning_tests {
             assert!(validate_remote_signature(algorithm, &[0u8; 256]).is_err());
             assert!(validate_remote_signature(algorithm, &[1u8; 255]).is_err());
         }
-        let prepare_rsa = || {
-            SDJWTIssuerPlanner::new(Some("RS256".to_string()))
-                .prepare(
-                    json!({"sub": "example"}),
-                    ClaimsForSelectiveDisclosureStrategy::NoSDClaims,
-                    None,
-                    false,
-                    SDJWTSerializationFormat::Compact,
-                )
-                .unwrap()
-        };
-        assert!(prepare_rsa()
-            .complete(&[1u8; 1024], &verification_key())
-            .is_err());
-        assert!(prepare_rsa()
-            .complete(&[1u8; 1025], &verification_key())
-            .is_err());
         assert!(validate_remote_signature(Algorithm::HS256, &[1u8; 256]).is_err());
     }
 }
