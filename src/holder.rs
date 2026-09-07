@@ -8,7 +8,7 @@ use crate::{
     VerificationPolicy,
 };
 use error::{Error, Result};
-#[cfg(any(test, feature = "issuer-local"))]
+#[cfg(test)]
 use jsonwebtoken::EncodingKey;
 use jsonwebtoken::{Algorithm, Header};
 use serde_json::{Map, Value};
@@ -325,8 +325,8 @@ impl SDJWTHolder {
     }
 
     /// Test-only compatibility path for exercising local signing fixtures.
-    #[cfg(any(test, feature = "issuer-local"))]
-    pub fn create_presentation_with_local_key(
+    #[cfg(test)]
+    pub(crate) fn create_presentation_with_local_key(
         &mut self,
         claims_to_disclose: Map<String, Value>,
         nonce: Option<String>,
@@ -545,7 +545,7 @@ impl SDJWTHolder {
 
         Ok(hash_to_disclosure)
     }
-    #[cfg(any(test, feature = "issuer-local"))]
+    #[cfg(test)]
     fn create_key_binding_jwt(
         &mut self,
         nonce: String,

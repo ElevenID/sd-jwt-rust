@@ -8,13 +8,14 @@ use crate::utils::fixtures::{
     HOLDER_JWK_KEY, HOLDER_KEY, ISSUER_KEY, ISSUER_PUBLIC_KEY, NESTED_ARRAY_CLAIMS,
     NESTED_ARRAY_JSONPATH, W3C_VC_CLAIMS, W3C_VC_JSONPATH,
 };
+use base64::Engine;
 use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::{DecodingKey, EncodingKey};
 use rstest::{fixture, rstest};
 use sd_jwt_rs::issuer::ClaimsForSelectiveDisclosureStrategy;
 use sd_jwt_rs::{
-    SDJWTFlattenedJson, SDJWTGeneralJson, SDJWTHolder, SDJWTIssuer, SDJWTSerializationFormat,
-    SDJWTVerifier,
+    SDJWTFlattenedJson, SDJWTGeneralJson, SDJWTHolder, SDJWTIssuerPlanner,
+    SDJWTSerializationFormat, SDJWTVerifier,
 };
 use sd_jwt_rs::{COMBINED_SERIALIZATION_FORMAT_SEPARATOR, DEFAULT_SIGNING_ALG};
 use serde_json::{json, Map, Value};
@@ -346,8 +347,8 @@ fn demo_positive_cases(
     let (user_claims, strategy, holder_disclosed_claims, number_of_revealed_sds) = data;
     let (nonce, aud, holder_key, holder_jwk) = presentation_metadata;
     // Issuer issues SD-JWT
-    let sd_jwt = SDJWTIssuer::new(issuer_key, sign_algo.clone())
-        .issue_sd_jwt(
+    let prepared = SDJWTIssuerPlanner::new(sign_algo.clone())
+        .prepare(
             user_claims.clone(),
             strategy,
             holder_jwk.clone(),
@@ -355,6 +356,13 @@ fn demo_positive_cases(
             format.clone(),
         )
         .unwrap();
+    let encoded_signature =
+        jsonwebtoken::crypto::sign(prepared.signing_input(), &issuer_key, prepared.algorithm())
+            .unwrap();
+    let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded_signature)
+        .unwrap();
+    let sd_jwt = prepared.complete(&signature).unwrap();
     let issued = sd_jwt.clone();
     let mut holder = SDJWTHolder::new(
         sd_jwt.clone(),
@@ -363,15 +371,25 @@ fn demo_positive_cases(
     )
     .unwrap();
     // Holder creates presentation.
-    let presentation = holder
-        .create_presentation_with_local_key(
-            holder_disclosed_claims,
-            nonce.clone(),
-            aud.clone(),
-            holder_key,
-            sign_algo,
-        )
-        .unwrap();
+    let presentation = match (nonce.clone(), aud.clone(), holder_key) {
+        (Some(nonce), Some(aud), Some(holder_key)) => {
+            let prepared = holder
+                .prepare_key_binding_presentation(holder_disclosed_claims, nonce, aud, sign_algo)
+                .unwrap();
+            let encoded_signature = jsonwebtoken::crypto::sign(
+                prepared.signing_input(),
+                &holder_key,
+                prepared.algorithm(),
+            )
+            .unwrap();
+            let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(encoded_signature)
+                .unwrap();
+            prepared.complete(&signature).unwrap()
+        }
+        (None, None, None) => holder.create_presentation(holder_disclosed_claims).unwrap(),
+        _ => panic!("inconsistent holder-binding metadata"),
+    };
 
     match format {
         SDJWTSerializationFormat::Compact => {

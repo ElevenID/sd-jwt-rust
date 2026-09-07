@@ -7,6 +7,7 @@ authors = ["Abdulbois Tursunov <abdulbois.tursunov@dsr-corporation.com>", "Alexa
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+base64 = "0.21"
 clap = { version = "4.4.10", features = ["derive"] }
 serde = { version = "1.0.193", features = ["derive"] }
 serde_yaml = "0.9.27"

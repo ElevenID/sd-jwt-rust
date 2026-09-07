@@ -13,7 +13,6 @@ homepage = "https://github.com/openwallet-foundation-labs/sd-jwt-rust"
 [features]
 default = ["issuer-planning", "holder", "verifier"]
 issuer-planning = ["dep:curve25519-dalek", "dep:p256", "dep:p384", "dep:rand"]
-issuer-local = ["issuer-planning", "jsonwebtoken/rust_crypto", "jsonwebtoken/use_pem"]
 holder = ["issuer-planning", "jsonwebtoken/rust_crypto", "jsonwebtoken/use_pem"]
 verifier = ["jsonwebtoken/rust_crypto", "jsonwebtoken/use_pem"]
 mock_salts = ["issuer-planning", "lazy_static"]
@@ -65,7 +64,7 @@ regex = "1.10"
 [[bench]]
 name = "sd_jwt_verification"
 harness = false
-required-features = ["issuer-local", "holder", "verifier"]
+required-features = ["holder", "verifier"]
 
 [[bench]]
 name = "sd_jwt_issuance"
@@ -75,7 +74,7 @@ required-features = ["issuance_bench"]
 [[bench]]
 name = "sd_jwt_production_rng"
 harness = false
-required-features = ["issuer-local"]
+required-features = ["issuer-planning"]
 
 [[test]]
 name = "issuance_launch_barrier_fixed_binary"
@@ -91,7 +90,7 @@ required-features = ["verifier"]
 
 [[test]]
 name = "demos"
-required-features = ["issuer-local", "holder", "verifier"]
+required-features = ["holder", "verifier"]
 
 [[example]]
 name = "issuance_qualification_manifest"
