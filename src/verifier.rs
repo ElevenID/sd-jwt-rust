@@ -520,7 +520,7 @@ impl SDJWTVerifier {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "holder", feature = "issuer-planning"))]
 mod tests {
     use crate::error::Error;
     use crate::issuer::ClaimsForSelectiveDisclosureStrategy;
