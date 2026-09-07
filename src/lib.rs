@@ -10,7 +10,7 @@ use crate::utils::{base64url_decode, jwt_payload_decode};
 #[cfg(any(feature = "holder", feature = "issuer-planning", feature = "verifier"))]
 use error::Result;
 #[cfg(feature = "holder")]
-pub use holder::SDJWTHolder;
+pub use holder::{PreparedKeyBindingPresentation, SDJWTHolder};
 #[cfg(any(feature = "issuer-local", test))]
 pub use issuer::SDJWTIssuer;
 #[cfg(feature = "issuer-planning")]
