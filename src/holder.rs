@@ -8,7 +8,7 @@ use crate::{
     VerificationPolicy,
 };
 use error::{Error, Result};
-use jsonwebtoken::jwk::{Jwk, KeyOperations, PublicKeyUse};
+use jsonwebtoken::jwk::Jwk;
 #[cfg(test)]
 use jsonwebtoken::EncodingKey;
 use jsonwebtoken::{Algorithm, DecodingKey, Header};
@@ -319,7 +319,7 @@ impl SDJWTHolder {
             })?;
         let holder_jwk: Jwk = serde_json::from_value(raw_holder_jwk)
             .map_err(|_| Error::InvalidInput("cnf.jwk is not a valid public JWK".to_owned()))?;
-        validate_key_binding_jwk_policy(&holder_jwk, algorithm)?;
+        crate::validate_key_binding_jwk_policy(&holder_jwk, algorithm)?;
         let verification_key = DecodingKey::from_jwk(&holder_jwk)
             .map_err(|_| Error::InvalidInput("cnf.jwk is not a usable public JWK".to_owned()))?;
 
@@ -625,45 +625,6 @@ impl SDJWTHolder {
 
         Ok(())
     }
-}
-
-fn validate_key_binding_jwk_policy(jwk: &Jwk, algorithm: Algorithm) -> Result<()> {
-    if jwk
-        .common
-        .key_algorithm
-        .as_ref()
-        .is_some_and(|declared| declared.to_string() != format!("{algorithm:?}"))
-    {
-        return Err(Error::InvalidInput(
-            "cnf.jwk alg does not match the key-binding algorithm".to_owned(),
-        ));
-    }
-    if jwk.common.public_key_use.is_some()
-        && jwk.common.public_key_use != Some(PublicKeyUse::Signature)
-    {
-        return Err(Error::InvalidInput("cnf.jwk use must be sig".to_owned()));
-    }
-    if jwk.common.public_key_use.is_some() && jwk.common.key_operations.is_some() {
-        return Err(Error::InvalidInput(
-            "cnf.jwk must not combine use and key_ops".to_owned(),
-        ));
-    }
-    if jwk
-        .common
-        .key_operations
-        .as_ref()
-        .is_some_and(|operations| {
-            operations.is_empty()
-                || operations
-                    .iter()
-                    .any(|operation| operation != &KeyOperations::Verify)
-        })
-    {
-        return Err(Error::InvalidInput(
-            "cnf.jwk key_ops must contain only verify".to_owned(),
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(all(test, feature = "issuer-planning"))]

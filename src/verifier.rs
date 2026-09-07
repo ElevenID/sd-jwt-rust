@@ -199,46 +199,33 @@ impl SDJWTVerifier {
                 }
             }
         };
-        let pubkey: DecodingKey = match serde_json::from_value::<Jwk>(holder_public_key_payload_jwk)
-        {
-            Ok(jwk) => {
-                if let Ok(pubkey) = DecodingKey::from_jwk(&jwk) {
-                    pubkey
-                } else {
-                    return Err(Error::DeserializationError(
-                        "Cannot parse DecodingKey from json".to_string(),
-                    ));
-                }
-            }
-            Err(_) => {
-                return Err(Error::DeserializationError(
-                    "Cannot parse JWK from json".to_string(),
-                ));
-            }
-        };
-        let key_binding_jwt = match &self.sd_jwt_engine.unverified_input_key_binding_jwt {
-            Some(payload) => {
-                let header = jsonwebtoken::decode_header(payload)
-                    .map_err(|e| Error::DeserializationError(e.to_string()))?;
-                if !self.verification_policy.allows(header.alg) {
-                    return Err(Error::InvalidInput(format!(
-                        "Key Binding JWT algorithm {:?} is not allowed by verification policy",
-                        header.alg
-                    )));
-                }
-                let mut validation = Validation::new(header.alg);
-                validation.set_audience(&[&expected_aud]);
-                validation.set_required_spec_claims(&["aud"]);
-
-                jsonwebtoken::decode::<Map<String, Value>>(&payload, &pubkey, &validation)
-                    .map_err(|e| Error::DeserializationError(e.to_string()))?
-            }
-            None => {
-                return Err(Error::InvalidState(
-                    "Cannot take Key Binding JWK from String".to_string(),
-                ));
-            }
-        };
+        let key_binding_payload = self
+            .sd_jwt_engine
+            .unverified_input_key_binding_jwt
+            .as_ref()
+            .ok_or_else(|| {
+                Error::InvalidState("Cannot take Key Binding JWK from String".to_string())
+            })?;
+        let header = jsonwebtoken::decode_header(key_binding_payload)
+            .map_err(|e| Error::DeserializationError(e.to_string()))?;
+        if !self.verification_policy.allows(header.alg) {
+            return Err(Error::InvalidInput(format!(
+                "Key Binding JWT algorithm {:?} is not allowed by verification policy",
+                header.alg
+            )));
+        }
+        let holder_jwk: Jwk = serde_json::from_value(holder_public_key_payload_jwk)
+            .map_err(|_| Error::DeserializationError("Cannot parse JWK from json".to_string()))?;
+        crate::validate_key_binding_jwk_policy(&holder_jwk, header.alg)?;
+        let pubkey = DecodingKey::from_jwk(&holder_jwk).map_err(|_| {
+            Error::DeserializationError("Cannot parse DecodingKey from json".to_string())
+        })?;
+        let mut validation = Validation::new(header.alg);
+        validation.set_audience(&[&expected_aud]);
+        validation.set_required_spec_claims(&["aud"]);
+        let key_binding_jwt =
+            jsonwebtoken::decode::<Map<String, Value>>(key_binding_payload, &pubkey, &validation)
+                .map_err(|e| Error::DeserializationError(e.to_string()))?;
         if key_binding_jwt.header.typ != Some(KB_JWT_TYP_HEADER.to_string()) {
             return Err(Error::InvalidInput("Invalid header type".to_string()));
         }
@@ -567,6 +554,43 @@ mod tests {
         )
     }
 
+    fn compact_key_bound_presentation(holder_jwk: Value) -> String {
+        let sd_jwt = compact_presentation(
+            &json!({
+                "iss": "https://example.com/issuer",
+                "iat": 1683000000,
+                "exp": 1883000000,
+                "_sd_alg": "sha-256",
+                "cnf": {"jwk": holder_jwk},
+            }),
+            &[],
+        );
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.typ = Some("kb+jwt".to_owned());
+        let key_binding = jsonwebtoken::encode(
+            &header,
+            &json!({
+                "aud": "verifier-policy-audience",
+                "nonce": "verifier-policy-nonce",
+                "iat": 1683000000,
+                "sd_hash": base64_hash(sd_jwt.as_bytes()),
+            }),
+            &EncodingKey::from_ed_pem(HOLDER_KEY_ED25519.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        format!("{sd_jwt}{key_binding}")
+    }
+
+    fn verify_compact_key_bound(holder_jwk: Value) -> crate::error::Result<SDJWTVerifier> {
+        SDJWTVerifier::new(
+            compact_key_bound_presentation(holder_jwk),
+            Box::new(|_, _| DecodingKey::from_ec_pem(PUBLIC_ISSUER_PEM.as_bytes()).unwrap()),
+            Some("verifier-policy-audience".to_owned()),
+            Some("verifier-policy-nonce".to_owned()),
+            SDJWTSerializationFormat::Compact,
+        )
+    }
+
     fn serialization_from_compact(presentation: &str, format: SDJWTSerializationFormat) -> String {
         let jwt = presentation.strip_suffix('~').unwrap();
         let mut segments = jwt.split('.');
@@ -868,6 +892,60 @@ mod tests {
             .expect("symmetric cnf.jwk must be rejected");
             assert!(matches!(error, Error::InvalidInput(_)));
         }
+    }
+
+    #[test]
+    fn verifier_enforces_signed_confirmation_key_metadata_for_key_binding() {
+        let valid_jwk: Value = serde_json::from_str(HOLDER_JWK_KEY_ED25519).unwrap();
+        assert!(verify_compact_key_bound(valid_jwk.clone()).is_ok());
+
+        let cases = [
+            (
+                "alg",
+                json!("ES256"),
+                "cnf.jwk alg does not match the key-binding algorithm",
+            ),
+            ("use", json!("enc"), "cnf.jwk use must be sig"),
+            (
+                "key_ops",
+                json!(["sign"]),
+                "cnf.jwk key_ops must contain only verify",
+            ),
+        ];
+        for (member, value, expected) in cases {
+            let mut jwk = valid_jwk.clone();
+            jwk.as_object_mut()
+                .unwrap()
+                .insert(member.to_owned(), value);
+            let error = verify_compact_key_bound(jwk)
+                .err()
+                .expect("invalid signed cnf.jwk metadata must be rejected");
+            assert!(
+                matches!(
+                    &error,
+                    Error::InvalidInput(ref message) if message == expected
+                ),
+                "unexpected {member} rejection: {error:?}"
+            );
+        }
+
+        let mut combined = valid_jwk;
+        combined
+            .as_object_mut()
+            .unwrap()
+            .insert("use".to_owned(), json!("sig"));
+        combined
+            .as_object_mut()
+            .unwrap()
+            .insert("key_ops".to_owned(), json!(["verify"]));
+        let error = verify_compact_key_bound(combined)
+            .err()
+            .expect("combining signed cnf.jwk use and key_ops must be rejected");
+        assert!(matches!(
+            error,
+            Error::InvalidInput(ref message)
+                if message == "cnf.jwk must not combine use and key_ops"
+        ));
     }
 
     #[test]
