@@ -6,7 +6,7 @@ use crate::{
     error, SDJWTFlattenedJson, SDJWTGeneralJson, SDJWTGeneralJsonSignature, SDJWTUnprotectedHeader,
 };
 use error::Result;
-#[cfg(feature = "issuer-local")]
+#[cfg(any(feature = "issuer-local", test))]
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt;
@@ -15,16 +15,16 @@ use std::str::FromStr;
 use std::vec::Vec;
 
 use jsonwebtoken::jwk::{AlgorithmParameters, Jwk};
-#[cfg(feature = "issuer-local")]
+#[cfg(any(feature = "issuer-local", test))]
 use jsonwebtoken::EncodingKey;
 use jsonwebtoken::{Algorithm, Header};
 use rand::{rngs::ThreadRng, Rng, RngCore};
-#[cfg(feature = "issuer-local")]
+#[cfg(any(feature = "issuer-local", test))]
 use serde_json::Map as SJMap;
 use serde_json::Value;
 use serde_json::{json, Map};
 
-#[cfg(feature = "issuer-local")]
+#[cfg(any(feature = "issuer-local", test))]
 use crate::disclosure::SDJWTDisclosure;
 use crate::error::Error;
 use crate::utils::{base64url_encode, generate_salt_with_rng};
@@ -33,7 +33,7 @@ use crate::{
     DEFAULT_DIGEST_ALG, DEFAULT_SIGNING_ALG, DIGEST_ALG_KEY, JWK_KEY,
 };
 
-#[cfg(feature = "issuer-local")]
+#[cfg(any(feature = "issuer-local", test))]
 pub struct SDJWTIssuer {
     // parameters
     sign_alg: String,
@@ -395,7 +395,7 @@ mod public_holder_key_tests {
         }
     }
 
-    #[cfg(feature = "issuer-local")]
+    #[cfg(any(feature = "issuer-local", test))]
     #[test]
     fn legacy_issuer_rejects_private_raw_confirmation_before_state_or_randomness() {
         let holder_key: Jwk = serde_json::from_value(json!({
@@ -628,7 +628,7 @@ where
     }
 }
 
-#[cfg(feature = "issuer-local")]
+#[cfg(any(feature = "issuer-local", test))]
 impl SDJWTIssuer {
     /// Creates a new SDJWTIssuer instance.
     ///
@@ -893,7 +893,7 @@ impl SDJWTIssuer {
     }
 }
 
-#[cfg(all(test, feature = "issuer-local"))]
+#[cfg(test)]
 mod tests {
     use jsonwebtoken::{Algorithm, EncodingKey};
     use log::trace;
@@ -1194,5 +1194,5 @@ mod issuer_planning_tests {
     }
 }
 
-#[cfg(all(test, feature = "issuer-local"))]
+#[cfg(test)]
 mod issuance_contract_tests;

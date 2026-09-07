@@ -11,7 +11,7 @@ documentation = "https://docs.rs/sd-jwt-rs"
 homepage = "https://github.com/openwallet-foundation-labs/sd-jwt-rust"
 
 [features]
-default = ["issuer-local", "holder", "verifier"]
+default = ["issuer-planning", "holder", "verifier"]
 issuer-planning = ["dep:curve25519-dalek", "dep:p256", "dep:p384", "dep:rand"]
 issuer-local = ["issuer-planning", "jsonwebtoken/rust_crypto", "jsonwebtoken/use_pem"]
 holder = ["jsonwebtoken/rust_crypto", "jsonwebtoken/use_pem"]

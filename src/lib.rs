@@ -11,7 +11,7 @@ use crate::utils::{base64url_decode, jwt_payload_decode};
 use error::Result;
 #[cfg(feature = "holder")]
 pub use holder::SDJWTHolder;
-#[cfg(feature = "issuer-local")]
+#[cfg(any(feature = "issuer-local", test))]
 pub use issuer::SDJWTIssuer;
 #[cfg(feature = "issuer-planning")]
 pub use issuer::{ClaimsForSelectiveDisclosureStrategy, PreparedSDJWT, SDJWTIssuerPlanner};
@@ -206,9 +206,14 @@ pub enum SDJWTSerializationFormat {
 #[cfg(any(feature = "issuer-planning", feature = "holder", feature = "verifier"))]
 #[derive(Default)]
 pub(crate) struct SDJWTCommon {
-    #[cfg(feature = "issuer-local")]
+    #[cfg(any(feature = "issuer-local", test))]
     typ: Option<String>,
-    #[cfg(any(feature = "issuer-local", feature = "holder", feature = "verifier"))]
+    #[cfg(any(
+        test,
+        feature = "issuer-local",
+        feature = "holder",
+        feature = "verifier"
+    ))]
     serialization_format: SDJWTSerializationFormat,
     #[cfg(any(feature = "holder", feature = "verifier"))]
     unverified_input_key_binding_jwt: Option<String>,
