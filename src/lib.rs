@@ -11,7 +11,7 @@ use crate::utils::{base64url_decode, jwt_payload_decode};
 use error::Result;
 #[cfg(feature = "holder")]
 pub use holder::{PreparedKeyBindingPresentation, SDJWTHolder};
-#[cfg(test)]
+#[cfg(all(test, feature = "issuer-planning"))]
 pub use issuer::SDJWTIssuer;
 #[cfg(feature = "issuer-planning")]
 pub use issuer::{ClaimsForSelectiveDisclosureStrategy, PreparedSDJWT, SDJWTIssuerPlanner};
@@ -104,6 +104,8 @@ pub mod error;
 pub mod holder;
 #[cfg(feature = "issuer-planning")]
 pub mod issuer;
+#[cfg(any(feature = "holder", feature = "issuer-planning"))]
+mod signature_validation;
 pub mod utils;
 #[cfg(feature = "verifier")]
 pub mod verifier;
@@ -527,7 +529,7 @@ impl SDJWTCommon {
     }
 }
 
-#[cfg(all(test, any(feature = "holder", feature = "verifier")))]
+#[cfg(all(test, feature = "issuer-planning"))]
 mod tests {
     use crate::{error::Error, utils, SDJWTCommon};
     use serde_json::json;

@@ -13,7 +13,7 @@ homepage = "https://github.com/openwallet-foundation-labs/sd-jwt-rust"
 [features]
 default = ["issuer-planning", "holder", "verifier"]
 issuer-planning = ["dep:curve25519-dalek", "dep:p256", "dep:p384", "dep:rand"]
-holder = ["issuer-planning", "jsonwebtoken/rust_crypto", "jsonwebtoken/use_pem"]
+holder = ["dep:curve25519-dalek", "dep:p256", "dep:p384", "jsonwebtoken/rust_crypto", "jsonwebtoken/use_pem"]
 verifier = ["jsonwebtoken/rust_crypto", "jsonwebtoken/use_pem"]
 mock_salts = ["issuer-planning", "lazy_static"]
 parallel = []

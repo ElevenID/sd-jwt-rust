@@ -469,7 +469,7 @@ impl PreparedSDJWT {
 
     /// Assemble the requested SD-JWT serialization from raw signature bytes.
     pub fn complete(self, signature: &[u8]) -> Result<String> {
-        validate_remote_signature(self.algorithm, signature)?;
+        crate::signature_validation::validate_remote_signature(self.algorithm, signature)?;
         self.complete_encoded_signature(base64url_encode(signature))
     }
 
@@ -514,61 +514,6 @@ impl PreparedSDJWT {
             .map_err(|error| Error::DeserializationError(error.to_string())),
         }
     }
-}
-
-/// Smallest supported remote RSA signature (2048-bit modulus).
-pub const MIN_REMOTE_RSA_SIGNATURE_BYTES: usize = 256;
-/// Largest supported remote RSA signature (8192-bit modulus).
-pub const MAX_REMOTE_RSA_SIGNATURE_BYTES: usize = 1024;
-
-pub(crate) fn validate_remote_signature(algorithm: Algorithm, signature: &[u8]) -> Result<()> {
-    let valid = match algorithm {
-        Algorithm::ES256 => p256::ecdsa::Signature::from_slice(signature).is_ok(),
-        Algorithm::ES384 => p384::ecdsa::Signature::from_slice(signature).is_ok(),
-        Algorithm::EdDSA => validate_ed25519_encoding(signature),
-        Algorithm::RS256
-        | Algorithm::RS384
-        | Algorithm::RS512
-        | Algorithm::PS256
-        | Algorithm::PS384
-        | Algorithm::PS512 => {
-            (MIN_REMOTE_RSA_SIGNATURE_BYTES..=MAX_REMOTE_RSA_SIGNATURE_BYTES)
-                .contains(&signature.len())
-                && signature.iter().any(|byte| *byte != 0)
-        }
-        _ => {
-            return Err(Error::InvalidInput(format!(
-                "unsupported remote signing algorithm: {algorithm:?}"
-            )))
-        }
-    };
-    if !valid {
-        return Err(Error::InvalidInput(format!(
-            "invalid {algorithm:?} remote signature encoding: got {} bytes",
-            signature.len()
-        )));
-    }
-    Ok(())
-}
-
-fn validate_ed25519_encoding(signature: &[u8]) -> bool {
-    let Ok(bytes) = <&[u8; 64]>::try_from(signature) else {
-        return false;
-    };
-    let (encoded_r, encoded_s) = bytes.split_at(32);
-    let Ok(encoded_r) = <[u8; 32]>::try_from(encoded_r) else {
-        return false;
-    };
-    let Ok(encoded_s) = <[u8; 32]>::try_from(encoded_s) else {
-        return false;
-    };
-    let Some(point) = curve25519_dalek::edwards::CompressedEdwardsY(encoded_r).decompress() else {
-        return false;
-    };
-    point.compress().to_bytes() == encoded_r
-        && !point.is_small_order()
-        && bool::from(curve25519_dalek::scalar::Scalar::from_canonical_bytes(encoded_s).is_some())
-        && signature.iter().any(|byte| *byte != 0)
 }
 
 trait IssuanceRandomSource {
@@ -898,7 +843,8 @@ mod tests {
     use log::trace;
     use serde_json::json;
 
-    use crate::issuer::{validate_remote_signature, ClaimsForSelectiveDisclosureStrategy};
+    use crate::issuer::ClaimsForSelectiveDisclosureStrategy;
+    use crate::signature_validation::validate_remote_signature;
     use crate::{SDJWTIssuer, SDJWTIssuerPlanner, SDJWTSerializationFormat};
 
     const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
@@ -1109,7 +1055,8 @@ mod issuer_planning_tests {
     use jsonwebtoken::Algorithm;
     use serde_json::json;
 
-    use super::{validate_remote_signature, ClaimsForSelectiveDisclosureStrategy};
+    use super::ClaimsForSelectiveDisclosureStrategy;
+    use crate::signature_validation::validate_remote_signature;
     use crate::{SDJWTIssuerPlanner, SDJWTSerializationFormat};
 
     #[test]

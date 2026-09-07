@@ -44,7 +44,7 @@ pub fn base64_hash(data: &[u8]) -> String {
     general_purpose::URL_SAFE_NO_PAD.encode(hash)
 }
 
-#[cfg(feature = "issuer-planning")]
+#[cfg(any(feature = "holder", feature = "issuer-planning"))]
 pub(crate) fn base64url_encode(data: &[u8]) -> String {
     general_purpose::URL_SAFE_NO_PAD.encode(data)
 }
