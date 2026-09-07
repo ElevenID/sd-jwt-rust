@@ -200,6 +200,9 @@ impl SDJWTHolder {
         cb_get_issuer_key: Option<Box<FallibleKeyResolver>>,
         verification_policy: VerificationPolicy,
     ) -> Result<Self> {
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        crate::wasm_crypto::ensure_installed();
+
         let mut holder = SDJWTHolder {
             sd_jwt_engine: SDJWTCommon {
                 serialization_format,

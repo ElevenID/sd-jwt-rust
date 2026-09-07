@@ -767,8 +767,34 @@ impl SDJWTIssuer {
                 .map_err(|e| Error::DeserializationError(e.to_string()))?,
         );
         header.typ = self.inner.typ.clone();
-        self.signed_sd_jwt = jsonwebtoken::encode(&header, &self.sd_jwt_payload, &self.issuer_key)
-            .map_err(|e| Error::DeserializationError(e.to_string()))?;
+        // The legacy issuer exists only as a deterministic behavioral oracle
+        // for tests. AWS-LC intentionally randomizes ECDSA nonces, while the
+        // remote-signing production path and the previous RustCrypto backend
+        // use deterministic RFC 6979 signatures. Preserve the exact oracle
+        // bytes without restoring the vulnerable RustCrypto RSA dependency.
+        if header.alg == Algorithm::ES256 {
+            use p256::ecdsa::signature::Signer as _;
+            use p256::pkcs8::DecodePrivateKey as _;
+
+            let signing_key = p256::ecdsa::SigningKey::from_pkcs8_der(self.issuer_key.inner())
+                .map_err(|_| Error::DeserializationError("invalid test ES256 key".to_owned()))?;
+            let encoded_header = base64url_encode(
+                &serde_json::to_vec(&header)
+                    .map_err(|error| Error::DeserializationError(error.to_string()))?,
+            );
+            let encoded_payload = base64url_encode(
+                &serde_json::to_vec(&self.sd_jwt_payload)
+                    .map_err(|error| Error::DeserializationError(error.to_string()))?,
+            );
+            let signing_input = format!("{encoded_header}.{encoded_payload}");
+            let signature: p256::ecdsa::Signature = signing_key.sign(signing_input.as_bytes());
+            let signature_bytes = signature.to_bytes();
+            self.signed_sd_jwt = format!("{signing_input}.{}", base64url_encode(&signature_bytes));
+        } else {
+            self.signed_sd_jwt =
+                jsonwebtoken::encode(&header, &self.sd_jwt_payload, &self.issuer_key)
+                    .map_err(|e| Error::DeserializationError(e.to_string()))?;
+        }
 
         Ok(())
     }
@@ -879,6 +905,9 @@ mod tests {
 
     #[test]
     fn remote_planner_preserves_all_local_serializations() {
+        use p256::ecdsa::signature::Signer as _;
+        use p256::pkcs8::DecodePrivateKey as _;
+
         let claims = json!({
             "sub": "6c5c0a49-b589-431d-bae7-219122a9ec2c",
             "iss": "https://example.com/issuer",
@@ -887,6 +916,8 @@ mod tests {
             "given_name": "Erika"
         });
         let issuer_key = EncodingKey::from_ec_pem(PRIVATE_ISSUER_PEM.as_bytes()).unwrap();
+        let deterministic_signing_key =
+            p256::ecdsa::SigningKey::from_pkcs8_der(issuer_key.inner()).unwrap();
 
         for serialization_format in [
             SDJWTSerializationFormat::Compact,
@@ -902,14 +933,9 @@ mod tests {
                     serialization_format.clone(),
                 )
                 .unwrap();
-            let encoded_signature = jsonwebtoken::crypto::sign(
-                prepared.signing_input(),
-                &issuer_key,
-                prepared.algorithm(),
-            )
-            .unwrap();
-            let signature = crate::utils::base64url_decode(&encoded_signature).unwrap();
-            let remote = prepared.complete(&signature).unwrap();
+            let signature: p256::ecdsa::Signature =
+                deterministic_signing_key.sign(prepared.signing_input());
+            let remote = prepared.complete(&signature.to_bytes()).unwrap();
 
             let local = SDJWTIssuer::new(issuer_key.clone(), None)
                 .issue_sd_jwt(
