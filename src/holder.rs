@@ -39,6 +39,10 @@ pub struct SDJWTHolder {
 /// The value owns only public credential material and the exact JWS signing
 /// input. Send [`Self::signing_input`] to a KMS, secure enclave, or platform
 /// keystore, then provide the returned raw signature to [`Self::complete`].
+/// This generic crate validates the signature encoding, but does not receive
+/// the holder public key and therefore cannot prove which key signed it.
+/// Integrations must verify the detached signature against the public key bound
+/// to the credential before accepting or transmitting the assembled result.
 pub struct PreparedKeyBindingPresentation {
     algorithm: Algorithm,
     disclosures: Vec<String>,
@@ -70,8 +74,12 @@ impl PreparedKeyBindingPresentation {
     }
 
     /// Assemble the presentation from a raw signature returned by the signer.
+    ///
+    /// This validates algorithm-specific encoding only. The caller is
+    /// responsible for verifying that the signature matches the intended
+    /// holder public key before the result leaves its trust boundary.
     pub fn complete(self, signature: &[u8]) -> Result<String> {
-        crate::issuer::validate_remote_signature(self.algorithm, signature)?;
+        crate::signature_validation::validate_remote_signature(self.algorithm, signature)?;
         let key_binding_jwt = format!("{}.{}", self.signing_input, base64url_encode(signature));
 
         match self.serialization_format {
@@ -597,7 +605,7 @@ impl SDJWTHolder {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "issuer-planning"))]
 mod tests {
     use crate::issuer::ClaimsForSelectiveDisclosureStrategy;
     use crate::{
