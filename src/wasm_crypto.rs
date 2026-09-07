@@ -178,13 +178,22 @@ mod tests {
         ensure_installed().unwrap();
 
         let key = DecodingKey::from_rsa_components("AQ", "AQAB").unwrap();
-        let error = match verifier(&Algorithm::RS256, &key) {
-            Err(error) => error,
-            Ok(_) => panic!("browser provider unexpectedly constructed an RSA verifier"),
-        };
-        assert!(error
-            .to_string()
-            .contains("RSA verification is unavailable"));
+        for algorithm in [
+            Algorithm::RS256,
+            Algorithm::RS384,
+            Algorithm::RS512,
+            Algorithm::PS256,
+            Algorithm::PS384,
+            Algorithm::PS512,
+        ] {
+            let error = match verifier(&algorithm, &key) {
+                Err(error) => error,
+                Ok(_) => panic!("browser provider unexpectedly constructed an RSA verifier"),
+            };
+            assert!(error
+                .to_string()
+                .contains("RSA verification is unavailable"));
+        }
     }
 
     #[wasm_bindgen_test]
