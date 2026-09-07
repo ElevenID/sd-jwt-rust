@@ -1586,7 +1586,7 @@ mod tests {
             Box::new(|_, _| DecodingKey::from_ec_pem(PUBLIC_ISSUER_PEM.as_bytes()).unwrap()),
         )
         .unwrap()
-        .create_presentation(
+        .create_presentation_with_local_key(
             user_claims.as_object().unwrap().clone(),
             None,
             None,
@@ -1639,7 +1639,7 @@ mod tests {
         let presentation =
             SDJWTHolder::new_unverified(sd_jwt.clone(), SDJWTSerializationFormat::Compact)
                 .unwrap()
-                .create_presentation(
+                .create_presentation_with_local_key(
                     user_claims.as_object().unwrap().clone(),
                     None,
                     None,
@@ -1716,7 +1716,7 @@ mod tests {
             Value::Array(vec![Value::Bool(true), Value::Bool(true)]);
         let presentation = SDJWTHolder::new_unverified(sd_jwt, SDJWTSerializationFormat::Compact)
             .unwrap()
-            .create_presentation(
+            .create_presentation_with_local_key(
                 claims_to_disclose.as_object().unwrap().clone(),
                 None,
                 None,
@@ -1812,7 +1812,7 @@ mod tests {
 
         let presentation = SDJWTHolder::new_unverified(sd_jwt, SDJWTSerializationFormat::Compact)
             .unwrap()
-            .create_presentation(
+            .create_presentation_with_local_key(
                 claims_to_disclose.as_object().unwrap().clone(),
                 None,
                 None,
@@ -1884,7 +1884,7 @@ mod tests {
             }),
         )
         .unwrap()
-        .create_presentation(
+        .create_presentation_with_local_key(
             user_claims.as_object().unwrap().clone(),
             None,
             None,
@@ -1948,7 +1948,7 @@ mod tests {
             SDJWTHolder::new_unverified(sd_jwt.clone(), SDJWTSerializationFormat::FlattenedJson)
                 .unwrap(); // Changed to Flattened Json format
         let presentation = holder
-            .create_presentation(
+            .create_presentation_with_local_key(
                 user_claims.as_object().unwrap().clone(),
                 nonce.clone(),
                 aud.clone(),
@@ -2023,7 +2023,7 @@ mod tests {
 
         let presentation = SDJWTHolder::new_unverified(sd_jwt, format.clone())
             .unwrap()
-            .create_presentation(
+            .create_presentation_with_local_key(
                 user_claims.as_object().unwrap().clone(),
                 nonce.clone(),
                 aud.clone(),
@@ -2160,7 +2160,7 @@ mod tests {
         let presentation =
             SDJWTHolder::new_unverified(sd_jwt, SDJWTSerializationFormat::FlattenedJson)
                 .unwrap()
-                .create_presentation(
+                .create_presentation_with_local_key(
                     user_claims.as_object().unwrap().clone(),
                     nonce.clone(),
                     aud.clone(),
@@ -2290,7 +2290,7 @@ mod tests {
             .unwrap();
         let presentation = SDJWTHolder::new_unverified(sd_jwt, SDJWTSerializationFormat::Compact)
             .unwrap()
-            .create_presentation(
+            .create_presentation_with_local_key(
                 user_claims.as_object().unwrap().clone(),
                 None,
                 None,
@@ -2347,7 +2347,7 @@ mod tests {
 
         let presentation = SDJWTHolder::new_unverified(sd_jwt, SDJWTSerializationFormat::Compact)
             .unwrap()
-            .create_presentation(
+            .create_presentation_with_local_key(
                 user_claims.as_object().unwrap().clone(),
                 None,
                 None,
