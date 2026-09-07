@@ -176,14 +176,14 @@ pub const MAX_SD_JWT_DISCLOSURES: usize = 8192;
 pub const MAX_SD_JWT_DISCLOSURE_BYTES: usize = 64 * 1024;
 #[cfg(any(feature = "holder", feature = "verifier"))]
 const JWT_SEPARATOR: &str = ".";
-#[cfg(any(feature = "issuer-planning", feature = "verifier"))]
+#[cfg(any(feature = "holder", feature = "issuer-planning", feature = "verifier"))]
 const CNF_KEY: &str = "cnf";
-#[cfg(any(feature = "issuer-planning", feature = "verifier"))]
+#[cfg(any(feature = "holder", feature = "issuer-planning", feature = "verifier"))]
 const JWK_KEY: &str = "jwk";
-#[cfg(any(feature = "issuer-planning", feature = "verifier"))]
+#[cfg(any(feature = "holder", feature = "issuer-planning", feature = "verifier"))]
 const PRIVATE_JWK_MEMBERS: [&str; 9] = ["d", "rsa_d", "p", "q", "dp", "dq", "qi", "oth", "k"];
 
-#[cfg(any(feature = "issuer-planning", feature = "verifier"))]
+#[cfg(any(feature = "holder", feature = "issuer-planning", feature = "verifier"))]
 fn validate_public_confirmation_claim(claims: &Map<String, Value>) -> Result<()> {
     let Some(jwk) = claims
         .get(CNF_KEY)
