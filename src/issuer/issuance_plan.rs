@@ -28,9 +28,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 #[cfg(test)]
-#[cfg(feature = "issuer-local")]
 use super::IssuanceOptions;
-#[cfg(all(test, feature = "issuer-local"))]
+#[cfg(test)]
 use super::SDJWTIssuer;
 use super::{
     ClaimsForSelectiveDisclosureStrategy, IssuanceRandomSource, DECOY_MAX_ELEMENTS,
@@ -1937,7 +1936,7 @@ fn invalid_plan(message: &str) -> Error {
     Error::InvalidState(format!("invalid issuance plan: {message}"))
 }
 
-#[cfg(all(test, feature = "issuer-local"))]
+#[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::collections::VecDeque;
