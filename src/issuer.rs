@@ -17,7 +17,7 @@ use std::vec::Vec;
 use jsonwebtoken::jwk::{AlgorithmParameters, Jwk};
 #[cfg(test)]
 use jsonwebtoken::EncodingKey;
-use jsonwebtoken::{Algorithm, Header};
+use jsonwebtoken::{Algorithm, DecodingKey, Header};
 use rand::{rngs::ThreadRng, Rng, RngCore};
 #[cfg(test)]
 use serde_json::Map as SJMap;
@@ -435,7 +435,6 @@ mod public_holder_key_tests {
 }
 
 /// Prepared SD-JWT state awaiting one remote signature.
-#[derive(Clone)]
 pub struct PreparedSDJWT {
     algorithm: Algorithm,
     disclosures: Vec<String>,
@@ -467,8 +466,25 @@ impl PreparedSDJWT {
         self.signing_input.as_bytes()
     }
 
-    /// Assemble the requested SD-JWT serialization from raw signature bytes.
-    pub fn complete(self, signature: &[u8]) -> Result<String> {
+    /// Verify and assemble the requested SD-JWT serialization.
+    ///
+    /// The supplied public key must correspond to the opaque signer. The
+    /// signature is checked against this instance's exact protected header and
+    /// payload before any credential is returned.
+    pub fn complete(self, signature: &[u8], verification_key: &DecodingKey) -> Result<String> {
+        crate::signature_validation::verify_remote_signature(
+            self.algorithm,
+            self.signing_input.as_bytes(),
+            signature,
+            verification_key,
+        )?;
+        self.complete_encoded_signature(base64url_encode(signature))
+    }
+
+    /// Deterministic benchmark-only assembly that intentionally excludes the
+    /// opaque signer's network and cryptographic latency from planner timing.
+    #[cfg(feature = "issuance_bench")]
+    pub(crate) fn complete_for_benchmark(self, signature: &[u8]) -> Result<String> {
         crate::signature_validation::validate_remote_signature(self.algorithm, signature)?;
         self.complete_encoded_signature(base64url_encode(signature))
     }
@@ -865,7 +881,7 @@ impl SDJWTIssuer {
 
 #[cfg(test)]
 mod tests {
-    use jsonwebtoken::{Algorithm, EncodingKey};
+    use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey};
     use log::trace;
     use serde_json::json;
 
@@ -874,6 +890,11 @@ mod tests {
     use crate::{SDJWTIssuer, SDJWTIssuerPlanner, SDJWTSerializationFormat};
 
     const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
+    const PUBLIC_ISSUER_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEb28d4MwZMjw8+00CG4xfnn9SLMVM\nM19SlqZpVb/uNtRe/nNbC6hpOB1LqFXjfIjqAHBOeO6SYVBCcn+QLHOqTw==\n-----END PUBLIC KEY-----\n";
+
+    fn verification_key() -> DecodingKey {
+        DecodingKey::from_ec_pem(PUBLIC_ISSUER_PEM.as_bytes()).unwrap()
+    }
 
     #[test]
     fn test_assembly_sd_full_recursive() {
@@ -935,7 +956,9 @@ mod tests {
                 .unwrap();
             let signature: p256::ecdsa::Signature =
                 deterministic_signing_key.sign(prepared.signing_input());
-            let remote = prepared.complete(&signature.to_bytes()).unwrap();
+            let remote = prepared
+                .complete(&signature.to_bytes(), &verification_key())
+                .unwrap();
 
             let local = SDJWTIssuer::new(issuer_key.clone(), None)
                 .issue_sd_jwt(
@@ -952,6 +975,41 @@ mod tests {
     }
 
     #[test]
+    fn remote_completion_rejects_wrong_payload_and_wrong_key() {
+        use p256::ecdsa::signature::Signer as _;
+        use p256::pkcs8::DecodePrivateKey as _;
+
+        let prepare = || {
+            SDJWTIssuerPlanner::new(None)
+                .prepare(
+                    json!({"sub": "example", "iss": "https://issuer.example"}),
+                    ClaimsForSelectiveDisclosureStrategy::NoSDClaims,
+                    None,
+                    false,
+                    SDJWTSerializationFormat::Compact,
+                )
+                .unwrap()
+        };
+        let issuer_key = EncodingKey::from_ec_pem(PRIVATE_ISSUER_PEM.as_bytes()).unwrap();
+        let signing_key = p256::ecdsa::SigningKey::from_pkcs8_der(issuer_key.inner()).unwrap();
+
+        let prepared = prepare();
+        let wrong_payload_signature: p256::ecdsa::Signature = signing_key.sign(b"different input");
+        assert!(prepared
+            .complete(&wrong_payload_signature.to_bytes(), &verification_key())
+            .is_err());
+
+        let prepared = prepare();
+        let signature: p256::ecdsa::Signature = signing_key.sign(prepared.signing_input());
+        let wrong_key = p256::ecdsa::SigningKey::from_slice(&[42u8; 32]).unwrap();
+        let wrong_point = wrong_key.verifying_key().to_encoded_point(false);
+        let wrong_key = DecodingKey::from_ec_der(wrong_point.as_bytes());
+        assert!(prepared
+            .complete(&signature.to_bytes(), &wrong_key)
+            .is_err());
+    }
+
+    #[test]
     fn remote_planner_rejects_malformed_es256_signatures() {
         let prepare = || {
             SDJWTIssuerPlanner::new(Some("ES256".to_string()))
@@ -965,20 +1023,24 @@ mod tests {
                 .unwrap()
         };
 
-        assert!(prepare().complete(&[]).is_err());
-        assert!(prepare().complete(&[0u8; 63]).is_err());
+        assert!(prepare().complete(&[], &verification_key()).is_err());
+        assert!(prepare().complete(&[0u8; 63], &verification_key()).is_err());
 
         let mut der_encoded = vec![0u8; 70];
         der_encoded[0] = 0x30;
-        assert!(prepare().complete(&der_encoded).is_err());
+        assert!(prepare()
+            .complete(&der_encoded, &verification_key())
+            .is_err());
 
-        assert!(prepare().complete(&[0u8; 64]).is_err());
-        assert!(prepare().complete(&[0xffu8; 64]).is_err());
+        assert!(prepare().complete(&[0u8; 64], &verification_key()).is_err());
+        assert!(prepare()
+            .complete(&[0xffu8; 64], &verification_key())
+            .is_err());
 
         let mut valid = [0u8; 64];
         valid[31] = 1;
         valid[63] = 1;
-        assert!(prepare().complete(&valid).is_ok());
+        assert!(prepare().complete(&valid, &verification_key()).is_err());
     }
 
     #[test]
@@ -1028,8 +1090,12 @@ mod tests {
                 )
                 .unwrap()
         };
-        assert!(prepare_rsa().complete(&[1u8; 1024]).is_ok());
-        assert!(prepare_rsa().complete(&[1u8; 1025]).is_err());
+        assert!(prepare_rsa()
+            .complete(&[1u8; 1024], &verification_key())
+            .is_err());
+        assert!(prepare_rsa()
+            .complete(&[1u8; 1025], &verification_key())
+            .is_err());
         assert!(validate_remote_signature(Algorithm::HS256, &[1u8; 256]).is_err());
     }
 
@@ -1078,12 +1144,18 @@ mod tests {
 
 #[cfg(all(test, feature = "issuer-planning"))]
 mod issuer_planning_tests {
-    use jsonwebtoken::Algorithm;
+    use jsonwebtoken::{Algorithm, DecodingKey};
     use serde_json::json;
 
     use super::ClaimsForSelectiveDisclosureStrategy;
     use crate::signature_validation::validate_remote_signature;
     use crate::{SDJWTIssuerPlanner, SDJWTSerializationFormat};
+
+    const PUBLIC_ISSUER_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEb28d4MwZMjw8+00CG4xfnn9SLMVM\nM19SlqZpVb/uNtRe/nNbC6hpOB1LqFXjfIjqAHBOeO6SYVBCcn+QLHOqTw==\n-----END PUBLIC KEY-----\n";
+
+    fn verification_key() -> DecodingKey {
+        DecodingKey::from_ec_pem(PUBLIC_ISSUER_PEM.as_bytes()).unwrap()
+    }
 
     #[test]
     fn remote_planner_rejects_malformed_es256_signatures() {
@@ -1099,18 +1171,22 @@ mod issuer_planning_tests {
                 .unwrap()
         };
 
-        assert!(prepare().complete(&[]).is_err());
-        assert!(prepare().complete(&[0u8; 63]).is_err());
+        assert!(prepare().complete(&[], &verification_key()).is_err());
+        assert!(prepare().complete(&[0u8; 63], &verification_key()).is_err());
         let mut der_encoded = vec![0u8; 70];
         der_encoded[0] = 0x30;
-        assert!(prepare().complete(&der_encoded).is_err());
-        assert!(prepare().complete(&[0u8; 64]).is_err());
-        assert!(prepare().complete(&[0xffu8; 64]).is_err());
+        assert!(prepare()
+            .complete(&der_encoded, &verification_key())
+            .is_err());
+        assert!(prepare().complete(&[0u8; 64], &verification_key()).is_err());
+        assert!(prepare()
+            .complete(&[0xffu8; 64], &verification_key())
+            .is_err());
 
         let mut valid = [0u8; 64];
         valid[31] = 1;
         valid[63] = 1;
-        assert!(prepare().complete(&valid).is_ok());
+        assert!(prepare().complete(&valid, &verification_key()).is_err());
     }
 
     #[test]
@@ -1160,8 +1236,12 @@ mod issuer_planning_tests {
                 )
                 .unwrap()
         };
-        assert!(prepare_rsa().complete(&[1u8; 1024]).is_ok());
-        assert!(prepare_rsa().complete(&[1u8; 1025]).is_err());
+        assert!(prepare_rsa()
+            .complete(&[1u8; 1024], &verification_key())
+            .is_err());
+        assert!(prepare_rsa()
+            .complete(&[1u8; 1025], &verification_key())
+            .is_err());
         assert!(validate_remote_signature(Algorithm::HS256, &[1u8; 256]).is_err());
     }
 }

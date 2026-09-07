@@ -362,7 +362,12 @@ fn demo_positive_cases(
     let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded_signature)
         .unwrap();
-    let sd_jwt = prepared.complete(&signature).unwrap();
+    let sd_jwt = prepared
+        .complete(
+            &signature,
+            &DecodingKey::from_ec_pem(ISSUER_PUBLIC_KEY.as_bytes()).unwrap(),
+        )
+        .unwrap();
     let issued = sd_jwt.clone();
     let mut holder = SDJWTHolder::new(
         sd_jwt.clone(),

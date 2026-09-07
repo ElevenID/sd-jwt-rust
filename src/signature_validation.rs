@@ -1,4 +1,4 @@
-use jsonwebtoken::Algorithm;
+use jsonwebtoken::{Algorithm, DecodingKey};
 
 use crate::error::{Error, Result};
 
@@ -35,6 +35,28 @@ pub(crate) fn validate_remote_signature(algorithm: Algorithm, signature: &[u8]) 
         )));
     }
     Ok(())
+}
+
+pub(crate) fn verify_remote_signature(
+    algorithm: Algorithm,
+    signing_input: &[u8],
+    signature: &[u8],
+    verification_key: &DecodingKey,
+) -> Result<()> {
+    validate_remote_signature(algorithm, signature)?;
+    crate::install_crypto_provider()?;
+    let encoded_signature = crate::utils::base64url_encode(signature);
+    match jsonwebtoken::crypto::verify(
+        &encoded_signature,
+        signing_input,
+        verification_key,
+        algorithm,
+    ) {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(_) => Err(Error::InvalidInput(
+            "remote signature does not match the prepared signing input and public key".to_owned(),
+        )),
+    }
 }
 
 fn validate_ed25519_encoding(signature: &[u8]) -> bool {

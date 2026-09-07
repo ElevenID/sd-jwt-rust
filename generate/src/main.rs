@@ -152,7 +152,9 @@ fn issue_sd_jwt(
     let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded_signature)
         .unwrap();
-    let sd_jwt = prepared.complete(&signature).unwrap();
+    let issuer_public_key = std::fs::read(directory.join(ISSUER_PUBLIC_KEY_PEM_FILE_NAME))?;
+    let issuer_public_key = DecodingKey::from_ec_pem(&issuer_public_key).unwrap();
+    let sd_jwt = prepared.complete(&signature, &issuer_public_key).unwrap();
 
     Ok(sd_jwt)
 }
