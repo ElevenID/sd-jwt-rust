@@ -988,7 +988,7 @@ mod tests {
         let prepared = holder
             .prepare_key_binding_presentation(
                 json!({"given_name": true}).as_object().unwrap().clone(),
-                "nonce".to_owned(),
+                rand::random::<u128>().to_string(),
                 "https://verifier.example".to_owned(),
                 Some("ES256".to_owned()),
             )
