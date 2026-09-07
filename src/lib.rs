@@ -104,7 +104,11 @@ pub mod error;
 pub mod holder;
 #[cfg(feature = "issuer-planning")]
 pub mod issuer;
-#[cfg(any(feature = "holder", feature = "issuer-planning"))]
+#[cfg(any(
+    feature = "holder",
+    feature = "issuer-completion",
+    feature = "issuance_bench"
+))]
 mod signature_validation;
 pub mod utils;
 #[cfg(feature = "verifier")]

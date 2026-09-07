@@ -36,11 +36,13 @@ jobs:
       run: cargo test --locked --verbose
     - name: Test remote issuer-planning boundary
       run: cargo test --locked --no-default-features --features issuer-planning --lib --verbose
+    - name: Lint remote issuer-planning boundary
+      run: cargo clippy --locked --no-default-features --features issuer-planning -- -D warnings
     - name: Guard planning-only crypto feature graph
       shell: bash
       run: |
         planning_tree="$(cargo tree --locked --no-default-features --features issuer-planning -e features,no-dev)"
-        if grep -Eq 'jsonwebtoken feature "(aws_lc_rs|rust_crypto|use_pem)"|aws-lc-(rs|sys)|p(256|384) feature "(default|ecdsa|pem|pkcs8)"' <<<"$planning_tree"; then
+        if grep -Eq 'jsonwebtoken feature "(aws_lc_rs|rust_crypto|use_pem)"|aws-lc-(rs|sys)|curve25519-dalek|ed25519-dalek|p256|p384' <<<"$planning_tree"; then
           printf '%s\n' "$planning_tree"
           exit 1
         fi
