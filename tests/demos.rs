@@ -364,7 +364,7 @@ fn demo_positive_cases(
     .unwrap();
     // Holder creates presentation.
     let presentation = holder
-        .create_presentation(
+        .create_presentation_with_local_key(
             holder_disclosed_claims,
             nonce.clone(),
             aud.clone(),

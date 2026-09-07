@@ -8,7 +8,9 @@ use crate::{
     VerificationPolicy,
 };
 use error::{Error, Result};
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
+#[cfg(any(test, feature = "issuer-local"))]
+use jsonwebtoken::EncodingKey;
+use jsonwebtoken::{Algorithm, Header};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::ops::Add;
@@ -310,18 +312,21 @@ impl SDJWTHolder {
         })
     }
 
-    /// Create a presentation based on the SD JWT provided by issuer.
-    ///
-    /// # Arguments
-    /// * `claims_to_disclose` - Claims to disclose in the presentation
-    /// * `nonce` - Nonce to be used in the key-binding JWT
-    /// * `aud` - Audience to be used in the key-binding JWT
-    /// * `holder_key` - Key to sign the key-binding JWT
-    /// * `sign_alg` - Signing algorithm to be used in the key-binding JWT
-    ///
-    /// # Returns
-    /// * `String` - Presentation in the format specified by `serialization_format` in the constructor. It can be either compact or json.
+    /// Create a presentation without a Key Binding JWT.
     pub fn create_presentation(
+        &mut self,
+        claims_to_disclose: Map<String, Value>,
+    ) -> Result<String> {
+        self.key_binding_jwt_header = Default::default();
+        self.key_binding_jwt_payload = Default::default();
+        self.serialized_key_binding_jwt = Default::default();
+        self.hs_disclosures = self.select_disclosures(&self.sd_jwt_payload, claims_to_disclose)?;
+        self.render_presentation()
+    }
+
+    /// Test-only compatibility path for exercising local signing fixtures.
+    #[cfg(any(test, feature = "issuer-local"))]
+    pub fn create_presentation_with_local_key(
         &mut self,
         claims_to_disclose: Map<String, Value>,
         nonce: Option<String>,
@@ -346,51 +351,51 @@ impl SDJWTHolder {
             }
         }
 
-        let sd_jwt_presentation = match self.sd_jwt_engine.serialization_format {
+        self.render_presentation()
+    }
+
+    fn render_presentation(&self) -> Result<String> {
+        match self.sd_jwt_engine.serialization_format {
             SDJWTSerializationFormat::Compact => {
                 let mut combined: Vec<&str> = Vec::with_capacity(self.hs_disclosures.len() + 2);
                 combined.push(&self.serialized_sd_jwt);
-                combined.extend(self.hs_disclosures.iter().map(|s| s.as_str()));
+                combined.extend(self.hs_disclosures.iter().map(|value| value.as_str()));
                 combined.push(&self.serialized_key_binding_jwt);
-                combined.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR)
+                Ok(combined.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR))
             }
             SDJWTSerializationFormat::FlattenedJson => {
                 let (protected, payload, signature) =
                     SDJWTCommon::split_jwt(&self.serialized_sd_jwt)?;
-                let header = SDJWTUnprotectedHeader {
-                    disclosures: self.hs_disclosures.clone(),
-                    kb_jwt: (!self.serialized_key_binding_jwt.is_empty())
-                        .then(|| self.serialized_key_binding_jwt.clone()),
-                };
                 serde_json::to_string(&SDJWTFlattenedJson {
                     protected,
                     payload,
                     signature,
-                    header,
+                    header: SDJWTUnprotectedHeader {
+                        disclosures: self.hs_disclosures.clone(),
+                        kb_jwt: (!self.serialized_key_binding_jwt.is_empty())
+                            .then(|| self.serialized_key_binding_jwt.clone()),
+                    },
                 })
-                .map_err(|e| Error::DeserializationError(e.to_string()))?
+                .map_err(|error| Error::DeserializationError(error.to_string()))
             }
             SDJWTSerializationFormat::GeneralJson => {
                 let (protected, payload, signature) =
                     SDJWTCommon::split_jwt(&self.serialized_sd_jwt)?;
-                let header = SDJWTUnprotectedHeader {
-                    disclosures: self.hs_disclosures.clone(),
-                    kb_jwt: (!self.serialized_key_binding_jwt.is_empty())
-                        .then(|| self.serialized_key_binding_jwt.clone()),
-                };
                 serde_json::to_string(&SDJWTGeneralJson {
                     payload,
                     signatures: vec![SDJWTGeneralJsonSignature {
                         protected,
                         signature,
-                        header,
+                        header: SDJWTUnprotectedHeader {
+                            disclosures: self.hs_disclosures.clone(),
+                            kb_jwt: (!self.serialized_key_binding_jwt.is_empty())
+                                .then(|| self.serialized_key_binding_jwt.clone()),
+                        },
                     }],
                 })
-                .map_err(|e| Error::DeserializationError(e.to_string()))?
+                .map_err(|error| Error::DeserializationError(error.to_string()))
             }
-        };
-
-        Ok(sd_jwt_presentation)
+        }
     }
 
     fn select_disclosures(
@@ -540,6 +545,7 @@ impl SDJWTHolder {
 
         Ok(hash_to_disclosure)
     }
+    #[cfg(any(test, feature = "issuer-local"))]
     fn create_key_binding_jwt(
         &mut self,
         nonce: String,
@@ -940,7 +946,7 @@ mod tests {
             issuer_key_resolver(),
         )
         .unwrap()
-        .create_presentation(
+        .create_presentation_with_local_key(
             user_claims.as_object().unwrap().clone(),
             None,
             None,
@@ -1022,7 +1028,7 @@ mod tests {
             issuer_key_resolver(),
         )
         .unwrap()
-        .create_presentation(
+        .create_presentation_with_local_key(
             user_claims.as_object().unwrap().clone(),
             None,
             None,
@@ -1094,7 +1100,7 @@ mod tests {
         println!("{issued}");
         let presentation = SDJWTHolder::new_unverified(sd_jwt, SDJWTSerializationFormat::Compact)
             .unwrap()
-            .create_presentation(
+            .create_presentation_with_local_key(
                 user_claims.as_object().unwrap().clone(),
                 None,
                 None,
@@ -1214,7 +1220,7 @@ mod tests {
 
         let presentation = SDJWTHolder::new_unverified(sd_jwt, SDJWTSerializationFormat::Compact)
             .unwrap()
-            .create_presentation(
+            .create_presentation_with_local_key(
                 revealed.as_object().unwrap().clone(),
                 None,
                 None,

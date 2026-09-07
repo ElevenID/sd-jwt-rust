@@ -169,13 +169,7 @@ fn create_presentation(
     .unwrap();
 
     let presentation = holder
-        .create_presentation(
-            disclosed_claims.clone(),
-            None,
-            None,
-            None,
-            None
-        ).unwrap();
+        .create_presentation(disclosed_claims.clone()).unwrap();
 
     Ok(presentation)
 }
