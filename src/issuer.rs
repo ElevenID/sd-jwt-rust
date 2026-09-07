@@ -522,7 +522,7 @@ pub const MIN_REMOTE_RSA_SIGNATURE_BYTES: usize = 256;
 /// Largest supported remote RSA signature (8192-bit modulus).
 pub const MAX_REMOTE_RSA_SIGNATURE_BYTES: usize = 1024;
 
-fn validate_remote_signature(algorithm: Algorithm, signature: &[u8]) -> Result<()> {
+pub(crate) fn validate_remote_signature(algorithm: Algorithm, signature: &[u8]) -> Result<()> {
     let valid = match algorithm {
         Algorithm::ES256 => p256::ecdsa::Signature::from_slice(signature).is_ok(),
         Algorithm::ES384 => p384::ecdsa::Signature::from_slice(signature).is_ok(),

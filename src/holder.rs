@@ -15,7 +15,7 @@ use std::ops::Add;
 use std::str::FromStr;
 use std::time;
 
-use crate::utils::base64_hash;
+use crate::utils::{base64_hash, base64url_encode};
 use crate::SDJWTCommon;
 use crate::{
     COMBINED_SERIALIZATION_FORMAT_SEPARATOR, DEFAULT_SIGNING_ALG, KB_DIGEST_KEY, KB_JWT_TYP_HEADER,
@@ -30,6 +30,88 @@ pub struct SDJWTHolder {
     serialized_key_binding_jwt: String,
     sd_jwt_payload: Map<String, Value>,
     serialized_sd_jwt: String,
+}
+
+/// Holder presentation awaiting a signature from an opaque key service.
+///
+/// The value owns only public credential material and the exact JWS signing
+/// input. Send [`Self::signing_input`] to a KMS, secure enclave, or platform
+/// keystore, then provide the returned raw signature to [`Self::complete`].
+pub struct PreparedKeyBindingPresentation {
+    algorithm: Algorithm,
+    disclosures: Vec<String>,
+    serialization_format: SDJWTSerializationFormat,
+    serialized_sd_jwt: String,
+    signing_input: String,
+}
+
+impl std::fmt::Debug for PreparedKeyBindingPresentation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedKeyBindingPresentation")
+            .field("algorithm", &self.algorithm)
+            .field("disclosure_count", &self.disclosures.len())
+            .field("contents", &"[redacted]")
+            .finish()
+    }
+}
+
+impl PreparedKeyBindingPresentation {
+    /// Algorithm the opaque signer must use.
+    pub fn algorithm(&self) -> Algorithm {
+        self.algorithm
+    }
+
+    /// Exact ASCII JWS signing input (`base64url(header).base64url(payload)`).
+    pub fn signing_input(&self) -> &[u8] {
+        self.signing_input.as_bytes()
+    }
+
+    /// Assemble the presentation from a raw signature returned by the signer.
+    pub fn complete(self, signature: &[u8]) -> Result<String> {
+        crate::issuer::validate_remote_signature(self.algorithm, signature)?;
+        let key_binding_jwt = format!("{}.{}", self.signing_input, base64url_encode(signature));
+
+        match self.serialization_format {
+            SDJWTSerializationFormat::Compact => {
+                let mut combined = Vec::with_capacity(self.disclosures.len() + 2);
+                combined.push(self.serialized_sd_jwt);
+                combined.extend(self.disclosures);
+                combined.push(key_binding_jwt);
+                Ok(combined.join(COMBINED_SERIALIZATION_FORMAT_SEPARATOR))
+            }
+            SDJWTSerializationFormat::FlattenedJson => {
+                let (protected, payload, signature) =
+                    SDJWTCommon::split_jwt(&self.serialized_sd_jwt)?;
+                serde_json::to_string(&SDJWTFlattenedJson {
+                    protected,
+                    payload,
+                    signature,
+                    header: SDJWTUnprotectedHeader {
+                        disclosures: self.disclosures,
+                        kb_jwt: Some(key_binding_jwt),
+                    },
+                })
+                .map_err(|error| Error::DeserializationError(error.to_string()))
+            }
+            SDJWTSerializationFormat::GeneralJson => {
+                let (protected, payload, signature) =
+                    SDJWTCommon::split_jwt(&self.serialized_sd_jwt)?;
+                serde_json::to_string(&SDJWTGeneralJson {
+                    payload,
+                    signatures: vec![SDJWTGeneralJsonSignature {
+                        protected,
+                        signature,
+                        header: SDJWTUnprotectedHeader {
+                            disclosures: self.disclosures,
+                            kb_jwt: Some(key_binding_jwt),
+                        },
+                    }],
+                })
+                .map_err(|error| Error::DeserializationError(error.to_string()))
+            }
+        }
+    }
 }
 
 impl SDJWTHolder {
@@ -176,6 +258,56 @@ impl SDJWTHolder {
         holder.sd_jwt_engine.create_hash_mappings()?;
 
         Ok(holder)
+    }
+
+    /// Prepare a holder-bound presentation without importing or retaining a
+    /// private key.
+    pub fn prepare_key_binding_presentation(
+        &mut self,
+        claims_to_disclose: Map<String, Value>,
+        nonce: String,
+        aud: String,
+        sign_alg: Option<String>,
+    ) -> Result<PreparedKeyBindingPresentation> {
+        self.key_binding_jwt_header = Default::default();
+        self.key_binding_jwt_payload = Default::default();
+        self.serialized_key_binding_jwt = Default::default();
+        self.hs_disclosures = self.select_disclosures(&self.sd_jwt_payload, claims_to_disclose)?;
+
+        let algorithm_name = sign_alg.unwrap_or_else(|| DEFAULT_SIGNING_ALG.to_owned());
+        let algorithm = Algorithm::from_str(&algorithm_name)
+            .map_err(|error| Error::DeserializationError(error.to_string()))?;
+        let mut header = Header::new(algorithm);
+        header.typ = Some(KB_JWT_TYP_HEADER.into());
+
+        self.key_binding_jwt_payload
+            .insert("nonce".to_owned(), nonce.into());
+        self.key_binding_jwt_payload
+            .insert("aud".to_owned(), aud.into());
+        let timestamp = time::SystemTime::now()
+            .duration_since(time::UNIX_EPOCH)
+            .map_err(|error| Error::ConversionError(format!("timestamp: {error}")))?
+            .as_secs();
+        self.key_binding_jwt_payload
+            .insert("iat".to_owned(), timestamp.into());
+        self.set_key_binding_digest_key()?;
+
+        let protected = base64url_encode(
+            &serde_json::to_vec(&header)
+                .map_err(|error| Error::DeserializationError(error.to_string()))?,
+        );
+        let payload = base64url_encode(
+            &serde_json::to_vec(&self.key_binding_jwt_payload)
+                .map_err(|error| Error::DeserializationError(error.to_string()))?,
+        );
+
+        Ok(PreparedKeyBindingPresentation {
+            algorithm,
+            disclosures: self.hs_disclosures.clone(),
+            serialization_format: self.sd_jwt_engine.serialization_format.clone(),
+            serialized_sd_jwt: self.serialized_sd_jwt.clone(),
+            signing_input: format!("{protected}.{payload}"),
+        })
     }
 
     /// Create a presentation based on the SD JWT provided by issuer.
@@ -817,6 +949,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sd_jwt, presentation);
+    }
+
+    #[test]
+    fn key_binding_is_prepared_without_transferring_the_private_key() {
+        let user_claims = json!({
+            "iss": "https://example.com/issuer",
+            "iat": 1683000000,
+            "exp": 1883000000,
+            "given_name": "Alice"
+        });
+        let issuer_key = EncodingKey::from_ec_pem(PRIVATE_ISSUER_PEM.as_bytes()).unwrap();
+        let sd_jwt = SDJWTIssuer::new(issuer_key, None)
+            .issue_sd_jwt(
+                user_claims,
+                ClaimsForSelectiveDisclosureStrategy::AllLevels,
+                None,
+                false,
+                SDJWTSerializationFormat::Compact,
+            )
+            .unwrap();
+        let mut holder =
+            SDJWTHolder::new_unverified(sd_jwt, SDJWTSerializationFormat::Compact).unwrap();
+        let prepared = holder
+            .prepare_key_binding_presentation(
+                json!({"given_name": true}).as_object().unwrap().clone(),
+                "nonce".to_owned(),
+                "https://verifier.example".to_owned(),
+                Some("ES256".to_owned()),
+            )
+            .unwrap();
+        let holder_key = EncodingKey::from_ec_pem(PRIVATE_ISSUER_PEM.as_bytes()).unwrap();
+        let encoded_signature =
+            jsonwebtoken::crypto::sign(prepared.signing_input(), &holder_key, prepared.algorithm())
+                .unwrap();
+        let signature = crate::utils::base64url_decode(&encoded_signature).unwrap();
+        let presentation = prepared.complete(&signature).unwrap();
+
+        assert!(presentation.split('~').last().unwrap().contains('.'));
     }
     #[test]
     fn create_presentation_empty_object_as_disclosure_value() {
