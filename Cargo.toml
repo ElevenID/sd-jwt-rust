@@ -54,6 +54,7 @@ sd-jwt-native-crypto-backend = { path = "native-crypto-backend", optional = true
 # Resolver/compile regression for the JS binding family used by maintained
 # consumers. Dev-dependencies do not constrain downstream applications.
 wasm-bindgen-futures = "=0.4.76"
+wasm-bindgen-test = "=0.3.76"
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }

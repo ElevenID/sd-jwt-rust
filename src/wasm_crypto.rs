@@ -141,9 +141,72 @@ static PROVIDER: CryptoProvider = CryptoProvider {
     },
 };
 
-pub(crate) fn ensure_installed() {
-    // A host application may deliberately install its own provider first. In
-    // that case jsonwebtoken returns the installed provider and we leave the
-    // process-wide choice intact.
-    let _ = PROVIDER.install_default();
+pub(crate) fn ensure_installed() -> crate::error::Result<()> {
+    validate_install_result(PROVIDER.install_default())
+}
+
+fn validate_install_result(
+    result: std::result::Result<(), &'static CryptoProvider>,
+) -> crate::error::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(installed) if std::ptr::eq(installed, &PROVIDER) => Ok(()),
+        Err(_) => Err(crate::error::Error::InvalidState(
+            "the required browser cryptography provider is not active".to_owned(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    static FOREIGN_PROVIDER: CryptoProvider = CryptoProvider {
+        signer_factory: signer,
+        verifier_factory: verifier,
+        jwk_utils: JwkUtils {
+            extract_rsa_public_key_components: |_| unreachable!(),
+            extract_ec_public_key_coordinates: |_, _| unreachable!(),
+            compute_digest: digest,
+        },
+    };
+
+    #[wasm_bindgen_test]
+    fn installs_idempotently_and_rejects_rsa() {
+        ensure_installed().unwrap();
+        ensure_installed().unwrap();
+
+        let key = DecodingKey::from_rsa_components("AQ", "AQAB").unwrap();
+        let error = match verifier(&Algorithm::RS256, &key) {
+            Err(error) => error,
+            Ok(_) => panic!("browser provider unexpectedly constructed an RSA verifier"),
+        };
+        assert!(error
+            .to_string()
+            .contains("RSA verification is unavailable"));
+    }
+
+    #[wasm_bindgen_test]
+    fn p256_verifier_accepts_valid_and_rejects_changed_messages() {
+        use p256::ecdsa::signature::Signer as _;
+
+        let signing_key = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let encoded = signing_key.verifying_key().to_encoded_point(false);
+        let key = DecodingKey::from_ec_der(encoded.as_bytes());
+        let verifier = verifier(&Algorithm::ES256, &key).unwrap();
+        let signature: P256Signature = signing_key.sign(b"message");
+        let signature = signature.to_bytes().to_vec();
+
+        assert!(verifier.verify(b"message", &signature).is_ok());
+        assert!(verifier.verify(b"changed", &signature).is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn foreign_process_provider_is_rejected() {
+        let error = validate_install_result(Err(&FOREIGN_PROVIDER)).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("required browser cryptography provider is not active"));
+    }
 }

@@ -90,7 +90,7 @@ impl SDJWTVerifier {
         verification_policy: VerificationPolicy,
     ) -> Result<Self> {
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-        crate::wasm_crypto::ensure_installed();
+        crate::wasm_crypto::ensure_installed()?;
 
         let mut verifier = SDJWTVerifier {
             sd_jwt_payload: serde_json::Map::new(),
