@@ -211,6 +211,51 @@ fn validate_public_confirmation_claim(claims: &Map<String, Value>) -> Result<()>
     Ok(())
 }
 
+#[cfg(any(feature = "holder", feature = "verifier"))]
+fn validate_key_binding_jwk_policy(
+    jwk: &jsonwebtoken::jwk::Jwk,
+    algorithm: Algorithm,
+) -> Result<()> {
+    use jsonwebtoken::jwk::{KeyOperations, PublicKeyUse};
+
+    if jwk
+        .common
+        .key_algorithm
+        .as_ref()
+        .is_some_and(|declared| declared.to_string() != format!("{algorithm:?}"))
+    {
+        return Err(Error::InvalidInput(
+            "cnf.jwk alg does not match the key-binding algorithm".to_owned(),
+        ));
+    }
+    if jwk.common.public_key_use.is_some()
+        && jwk.common.public_key_use != Some(PublicKeyUse::Signature)
+    {
+        return Err(Error::InvalidInput("cnf.jwk use must be sig".to_owned()));
+    }
+    if jwk.common.public_key_use.is_some() && jwk.common.key_operations.is_some() {
+        return Err(Error::InvalidInput(
+            "cnf.jwk must not combine use and key_ops".to_owned(),
+        ));
+    }
+    if jwk
+        .common
+        .key_operations
+        .as_ref()
+        .is_some_and(|operations| {
+            operations.is_empty()
+                || operations
+                    .iter()
+                    .any(|operation| operation != &KeyOperations::Verify)
+        })
+    {
+        return Err(Error::InvalidInput(
+            "cnf.jwk key_ops must contain only verify".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(all(test, any(feature = "holder", feature = "verifier")))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DisclosurePreprocessingRoute {
