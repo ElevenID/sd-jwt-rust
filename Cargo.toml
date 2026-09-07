@@ -13,8 +13,8 @@ homepage = "https://github.com/openwallet-foundation-labs/sd-jwt-rust"
 [features]
 default = ["issuer-planning", "holder", "verifier"]
 issuer-planning = ["dep:curve25519-dalek", "dep:p256", "dep:p384", "dep:rand"]
-holder = ["dep:curve25519-dalek", "dep:p256", "dep:p384", "jsonwebtoken/rust_crypto", "jsonwebtoken/use_pem"]
-verifier = ["jsonwebtoken/rust_crypto", "jsonwebtoken/use_pem"]
+holder = ["dep:curve25519-dalek", "dep:ed25519-dalek", "dep:p256", "dep:p384", "p256/ecdsa", "p384/ecdsa", "jsonwebtoken/use_pem"]
+verifier = ["dep:ed25519-dalek", "dep:p256", "dep:p384", "p256/ecdsa", "p384/ecdsa", "jsonwebtoken/use_pem"]
 mock_salts = ["issuer-planning", "lazy_static"]
 parallel = []
 # Criterion is compiled as a separate crate and cannot reach the private
@@ -26,6 +26,7 @@ issuance_bench = ["issuer-planning", "parallel", "dep:libc", "dep:winapi-util"]
 [dependencies]
 base64 = "0.21"
 curve25519-dalek = { version = "4.1", optional = true }
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std"], optional = true }
 jsonwebtoken = { version = "10.3", default-features = false }
 lazy_static = {  version = "1.4", optional = true }
 rand = { version = "0.8", optional = true }
@@ -43,6 +44,12 @@ strum = { version = "0.25", default-features = false, features = ["std", "derive
 # embedding application instead of forcing one exact transitive release.
 getrandom = { version = "0.2", features = ["js"] }
 
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+# AWS-LC replaces RustCrypto `rsa` on native targets. Besides removing the
+# Marvin timing-side-channel advisory, this retains jsonwebtoken's public API
+# and delegates RSA/ECDSA/Ed25519 verification to a maintained backend.
+jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs"] }
+
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
 # Resolver/compile regression for the JS binding family used by maintained
 # consumers. Dev-dependencies do not constrain downstream applications.
@@ -56,11 +63,14 @@ winapi-util = { version = "0.1.6", optional = true }
 
 [dev-dependencies]
 criterion = { version = "=0.5.1", default-features = false }
-jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
 log = "0.4"
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8"] }
 rand = "0.8"
 rstest = "0.18.2"
 regex = "1.10"
+
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dev-dependencies]
+jsonwebtoken = { version = "10.3", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 
 [[bench]]
 name = "sd_jwt_verification"

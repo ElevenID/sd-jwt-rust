@@ -110,6 +110,13 @@ pub mod utils;
 #[cfg(feature = "verifier")]
 pub mod verifier;
 
+#[cfg(all(
+    target_arch = "wasm32",
+    target_os = "unknown",
+    any(feature = "holder", feature = "verifier")
+))]
+mod wasm_crypto;
+
 pub const DEFAULT_SIGNING_ALG: &str = "ES256";
 #[cfg(any(feature = "issuer-planning", feature = "holder", feature = "verifier"))]
 const SD_DIGESTS_KEY: &str = "_sd";
