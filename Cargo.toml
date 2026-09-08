@@ -16,9 +16,9 @@ default = ["issuer-completion", "holder", "verifier"]
 # free of cryptographic verification backends for remote planner workers.
 issuer-planning = ["dep:rand"]
 # Exact payload/key binding for signatures returned by an opaque remote signer.
-issuer-completion = ["issuer-planning", "dep:curve25519-dalek", "dep:ed25519-dalek", "p256/ecdsa", "p384/ecdsa", "jsonwebtoken/use_pem", "dep:aws-lc-rs"]
-holder = ["dep:curve25519-dalek", "dep:ed25519-dalek", "dep:p256", "dep:p384", "p256/ecdsa", "p384/ecdsa", "jsonwebtoken/use_pem", "dep:aws-lc-rs"]
-verifier = ["dep:ed25519-dalek", "dep:p256", "dep:p384", "p256/ecdsa", "p384/ecdsa", "jsonwebtoken/use_pem", "dep:aws-lc-rs"]
+issuer-completion = ["issuer-planning", "dep:curve25519-dalek", "dep:ecdsa", "ecdsa/verifying", "dep:ed25519-dalek", "p256/arithmetic", "p256/ecdsa-core", "p256/sha256", "p384/arithmetic", "p384/ecdsa-core", "p384/sha384", "jsonwebtoken/use_pem", "dep:aws-lc-rs"]
+holder = ["dep:curve25519-dalek", "dep:ecdsa", "ecdsa/verifying", "dep:ed25519-dalek", "dep:p256", "dep:p384", "p256/arithmetic", "p256/ecdsa-core", "p256/sha256", "p384/arithmetic", "p384/ecdsa-core", "p384/sha384", "jsonwebtoken/use_pem", "dep:aws-lc-rs"]
+verifier = ["dep:ecdsa", "ecdsa/verifying", "dep:ed25519-dalek", "dep:p256", "dep:p384", "p256/arithmetic", "p256/ecdsa-core", "p256/sha256", "p384/arithmetic", "p384/ecdsa-core", "p384/sha384", "jsonwebtoken/use_pem", "dep:aws-lc-rs"]
 mock_salts = ["issuer-planning", "lazy_static"]
 parallel = []
 # Criterion is compiled as a separate crate and cannot reach the private
@@ -30,6 +30,7 @@ issuance_bench = ["issuer-planning", "parallel", "dep:curve25519-dalek", "dep:p2
 [dependencies]
 base64 = "0.21"
 curve25519-dalek = { version = "4.1", optional = true }
+ecdsa = { version = "0.16", default-features = false, optional = true }
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std"], optional = true }
 jsonwebtoken = { version = "10.4", default-features = false }
 lazy_static = {  version = "1.4", optional = true }
@@ -70,6 +71,7 @@ winapi-util = { version = "0.1.6", optional = true }
 criterion = { version = "=0.5.1", default-features = false }
 log = "0.4"
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 rand = "0.8"
 rstest = "0.18.2"
 regex = "1.10"

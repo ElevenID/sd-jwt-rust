@@ -11,8 +11,10 @@ use jsonwebtoken::errors::{new_error, ErrorKind, Result};
 use jsonwebtoken::jwk::ThumbprintHash;
 use jsonwebtoken::signature::{Error as SignatureError, Verifier};
 use jsonwebtoken::{Algorithm, AlgorithmFamily, DecodingKey, DecodingKeyKind, EncodingKey};
-use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
-use p384::ecdsa::{Signature as P384Signature, VerifyingKey as P384VerifyingKey};
+type P256Signature = ecdsa::Signature<p256::NistP256>;
+type P256VerifyingKey = p256::PublicKey;
+type P384Signature = ecdsa::Signature<p384::NistP384>;
+type P384VerifyingKey = p384::PublicKey;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
 struct P256Verifier(P256VerifyingKey);
@@ -24,7 +26,7 @@ struct RsaVerifier {
 }
 
 macro_rules! impl_curve_verifier {
-    ($name:ident, $signature:ty, $algorithm:expr) => {
+    ($name:ident, $signature:ty, $curve:ty, $projective:ty, $digest:ty, $algorithm:expr) => {
         impl Verifier<Vec<u8>> for $name {
             fn verify(
                 &self,
@@ -33,8 +35,11 @@ macro_rules! impl_curve_verifier {
             ) -> std::result::Result<(), SignatureError> {
                 let signature =
                     <$signature>::from_slice(signature).map_err(SignatureError::from_source)?;
-                self.0
-                    .verify(message, &signature)
+                let digest = <$digest>::digest(message);
+                let prehash = ecdsa::hazmat::bits2field::<$curve>(&digest)
+                    .map_err(SignatureError::from_source)?;
+                let public_point = <$projective>::from(*self.0.as_affine());
+                ecdsa::hazmat::verify_prehashed::<$curve>(&public_point, &prehash, &signature)
                     .map_err(SignatureError::from_source)
             }
         }
@@ -47,8 +52,22 @@ macro_rules! impl_curve_verifier {
     };
 }
 
-impl_curve_verifier!(P256Verifier, P256Signature, Algorithm::ES256);
-impl_curve_verifier!(P384Verifier, P384Signature, Algorithm::ES384);
+impl_curve_verifier!(
+    P256Verifier,
+    P256Signature,
+    p256::NistP256,
+    p256::ProjectivePoint,
+    Sha256,
+    Algorithm::ES256
+);
+impl_curve_verifier!(
+    P384Verifier,
+    P384Signature,
+    p384::NistP384,
+    p384::ProjectivePoint,
+    Sha384,
+    Algorithm::ES384
+);
 
 impl Verifier<Vec<u8>> for Ed25519Verifier {
     fn verify(
@@ -205,6 +224,29 @@ mod tests {
     fn installs_idempotently() {
         ensure_installed().unwrap();
         ensure_installed().unwrap();
+    }
+
+    #[test]
+    fn native_curve_verifiers_accept_valid_and_reject_changed_messages() {
+        use p256::ecdsa::signature::Signer as _;
+
+        let p256_signing_key = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let p256_encoded = p256_signing_key.verifying_key().to_encoded_point(false);
+        let p256_key = DecodingKey::from_ec_der(p256_encoded.as_bytes());
+        let p256_verifier = verifier(&Algorithm::ES256, &p256_key).unwrap();
+        let p256_signature: p256::ecdsa::Signature = p256_signing_key.sign(b"message");
+        let p256_signature = p256_signature.to_bytes().to_vec();
+        assert!(p256_verifier.verify(b"message", &p256_signature).is_ok());
+        assert!(p256_verifier.verify(b"changed", &p256_signature).is_err());
+
+        let p384_signing_key = p384::ecdsa::SigningKey::from_slice(&[8u8; 48]).unwrap();
+        let p384_encoded = p384_signing_key.verifying_key().to_encoded_point(false);
+        let p384_key = DecodingKey::from_ec_der(p384_encoded.as_bytes());
+        let p384_verifier = verifier(&Algorithm::ES384, &p384_key).unwrap();
+        let p384_signature: p384::ecdsa::Signature = p384_signing_key.sign(b"message");
+        let p384_signature = p384_signature.to_bytes().to_vec();
+        assert!(p384_verifier.verify(b"message", &p384_signature).is_ok());
+        assert!(p384_verifier.verify(b"changed", &p384_signature).is_err());
     }
 
     #[test]
