@@ -106,7 +106,7 @@ required-features = ["verifier"]
 
 [[test]]
 name = "demos"
-required-features = ["holder", "verifier"]
+required-features = ["issuer-completion", "holder", "verifier"]
 
 [[example]]
 name = "issuance_qualification_manifest"
