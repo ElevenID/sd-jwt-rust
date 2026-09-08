@@ -7,7 +7,12 @@ use crate::error::Error;
 #[cfg(any(feature = "holder", feature = "verifier"))]
 use crate::utils::{base64url_decode, jwt_payload_decode};
 
-#[cfg(any(feature = "holder", feature = "issuer-planning", feature = "verifier"))]
+#[cfg(any(
+    feature = "crypto-provider",
+    feature = "holder",
+    feature = "issuer-planning",
+    feature = "verifier"
+))]
 use error::Result;
 #[cfg(feature = "holder")]
 pub use holder::{PreparedKeyBindingPresentation, SDJWTHolder};
@@ -117,21 +122,13 @@ pub mod verifier;
 #[cfg(all(
     target_arch = "wasm32",
     target_os = "unknown",
-    any(
-        feature = "holder",
-        feature = "issuer-completion",
-        feature = "verifier"
-    )
+    feature = "crypto-provider"
 ))]
 mod wasm_crypto;
 
 #[cfg(all(
     not(all(target_arch = "wasm32", target_os = "unknown")),
-    any(
-        feature = "holder",
-        feature = "issuer-completion",
-        feature = "verifier"
-    )
+    feature = "crypto-provider"
 ))]
 mod native_crypto;
 
@@ -142,11 +139,7 @@ mod native_crypto;
 /// Browser WebAssembly supports ES256, ES384, and EdDSA; RSA is rejected until
 /// a WebCrypto-backed verifier is available. Local signing is unsupported on
 /// both targets.
-#[cfg(any(
-    feature = "holder",
-    feature = "issuer-completion",
-    feature = "verifier"
-))]
+#[cfg(feature = "crypto-provider")]
 pub fn install_crypto_provider() -> Result<()> {
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     {
