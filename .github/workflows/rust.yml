@@ -30,6 +30,8 @@ jobs:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v6
     - name: Install serial-fallback targets
       run: rustup target add aarch64-unknown-linux-gnu wasm32-unknown-unknown
+    - name: Install ARM64 cross compiler
+      run: sudo apt-get update && sudo apt-get install --yes gcc-aarch64-linux-gnu
     - name: Build
       run: cargo build --locked --verbose
     - name: Run tests
