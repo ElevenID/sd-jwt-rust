@@ -762,7 +762,7 @@ dependencies = [
 
 [[package]]
 name = "sd-jwt-rs"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.21.7",
