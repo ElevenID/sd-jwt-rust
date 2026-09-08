@@ -1946,11 +1946,21 @@ mod tests {
     #[cfg(all(feature = "parallel", target_arch = "x86_64"))]
     use std::time::Duration;
 
+    use base64::Engine as _;
     use jsonwebtoken::EncodingKey;
     use serde_json::json;
 
     use super::*;
     use crate::utils::base64url_decode;
+
+    const PRIVATE_ISSUER_DER_BASE64: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsRnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwzX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP";
+
+    fn private_issuer_encoding_key() -> EncodingKey {
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(PRIVATE_ISSUER_DER_BASE64)
+            .expect("the fixed PKCS#8 fixture must decode");
+        EncodingKey::from_ec_der(&der)
+    }
 
     #[derive(Debug, Eq, PartialEq)]
     enum RandomEvent {
@@ -2605,7 +2615,6 @@ mod tests {
 
     #[test]
     fn fixed_tape_full_credential_is_identical_after_shuffled_job_completion() {
-        const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
         let claims = || {
             json!({
                 "iss": "https://issuer.example",
@@ -2615,12 +2624,7 @@ mod tests {
                 "roles": ["admin", "reader"]
             })
         };
-        let issuer = || {
-            SDJWTIssuer::new(
-                EncodingKey::from_ec_pem(PRIVATE_ISSUER_PEM.as_bytes()).unwrap(),
-                None,
-            )
-        };
+        let issuer = || SDJWTIssuer::new(private_issuer_encoding_key(), None);
 
         for serialization_format in [
             crate::SDJWTSerializationFormat::Compact,
@@ -2678,11 +2682,7 @@ mod tests {
             }
         }
 
-        const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
-        let mut issuer = SDJWTIssuer::new(
-            EncodingKey::from_ec_pem(PRIVATE_ISSUER_PEM.as_bytes()).unwrap(),
-            None,
-        );
+        let mut issuer = SDJWTIssuer::new(private_issuer_encoding_key(), None);
         let mut random_source = RecordingRandomSource::with_decoy_counts([]);
 
         let error = issuer
