@@ -50,6 +50,16 @@ jobs:
           printf '%s\n' "$planning_tree"
           exit 1
         fi
+    - name: Enforce verification-only role graphs
+      shell: bash
+      run: |
+        for role in issuer-completion holder verifier; do
+          role_tree="$(cargo tree --locked --no-default-features --features "$role" -e features,no-dev)"
+          if grep -Eq 'ecdsa feature "signing"|(p256|p384) feature "(ecdsa|pkcs8|pem)"|ed25519-dalek feature "(pkcs8|pem|rand_core)"' <<<"$role_tree"; then
+            printf 'forbidden private-key capability in %s graph\n%s\n' "$role" "$role_tree"
+            exit 1
+          fi
+        done
     - name: Build interop tool
       run: cargo build --locked --manifest-path generate/Cargo.toml --verbose
     - name: Run parallel-feature tests

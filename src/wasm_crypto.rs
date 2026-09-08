@@ -12,8 +12,10 @@ use jsonwebtoken::errors::{new_error, ErrorKind, Result};
 use jsonwebtoken::jwk::ThumbprintHash;
 use jsonwebtoken::signature::{Error as SignatureError, Verifier};
 use jsonwebtoken::{Algorithm, AlgorithmFamily, DecodingKey, EncodingKey};
-use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
-use p384::ecdsa::{Signature as P384Signature, VerifyingKey as P384VerifyingKey};
+type P256Signature = ecdsa::Signature<p256::NistP256>;
+type P256VerifyingKey = p256::PublicKey;
+type P384Signature = ecdsa::Signature<p384::NistP384>;
+type P384VerifyingKey = p384::PublicKey;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
 struct P256Verifier(P256VerifyingKey);
@@ -28,8 +30,11 @@ impl Verifier<Vec<u8>> for P256Verifier {
     ) -> std::result::Result<(), SignatureError> {
         let signature =
             P256Signature::from_slice(signature).map_err(SignatureError::from_source)?;
-        self.0
-            .verify(message, &signature)
+        let digest = Sha256::digest(message);
+        let prehash = ecdsa::hazmat::bits2field::<p256::NistP256>(&digest)
+            .map_err(SignatureError::from_source)?;
+        let public_point = p256::ProjectivePoint::from(*self.0.as_affine());
+        ecdsa::hazmat::verify_prehashed::<p256::NistP256>(&public_point, &prehash, &signature)
             .map_err(SignatureError::from_source)
     }
 }
@@ -48,8 +53,11 @@ impl Verifier<Vec<u8>> for P384Verifier {
     ) -> std::result::Result<(), SignatureError> {
         let signature =
             P384Signature::from_slice(signature).map_err(SignatureError::from_source)?;
-        self.0
-            .verify(message, &signature)
+        let digest = Sha384::digest(message);
+        let prehash = ecdsa::hazmat::bits2field::<p384::NistP384>(&digest)
+            .map_err(SignatureError::from_source)?;
+        let public_point = p384::ProjectivePoint::from(*self.0.as_affine());
+        ecdsa::hazmat::verify_prehashed::<p384::NistP384>(&public_point, &prehash, &signature)
             .map_err(SignatureError::from_source)
     }
 }

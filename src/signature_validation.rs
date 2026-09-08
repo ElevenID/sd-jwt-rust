@@ -11,8 +11,8 @@ pub(crate) const MAX_REMOTE_RSA_SIGNATURE_BYTES: usize = 1024;
 
 pub(crate) fn validate_remote_signature(algorithm: Algorithm, signature: &[u8]) -> Result<()> {
     let valid = match algorithm {
-        Algorithm::ES256 => p256::ecdsa::Signature::from_slice(signature).is_ok(),
-        Algorithm::ES384 => p384::ecdsa::Signature::from_slice(signature).is_ok(),
+        Algorithm::ES256 => ecdsa::Signature::<p256::NistP256>::from_slice(signature).is_ok(),
+        Algorithm::ES384 => ecdsa::Signature::<p384::NistP384>::from_slice(signature).is_ok(),
         Algorithm::EdDSA => validate_ed25519_encoding(signature),
         Algorithm::RS256
         | Algorithm::RS384
