@@ -78,7 +78,7 @@ impl Verifier<Vec<u8>> for Ed25519Verifier {
         let signature =
             Ed25519Signature::from_slice(signature).map_err(SignatureError::from_source)?;
         self.0
-            .verify(message, &signature)
+            .verify_strict(message, &signature)
             .map_err(SignatureError::from_source)
     }
 }
@@ -247,6 +247,24 @@ mod tests {
         let p384_signature = p384_signature.to_bytes().to_vec();
         assert!(p384_verifier.verify(b"message", &p384_signature).is_ok());
         assert!(p384_verifier.verify(b"changed", &p384_signature).is_err());
+    }
+
+    #[test]
+    fn native_ed25519_verifier_rejects_identity_key_forgery() {
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let key = DecodingKey::from_ed_der(&identity);
+        let verifier = verifier(&Algorithm::EdDSA, &key).unwrap();
+
+        let mut forged_signature = vec![0x66; 64];
+        forged_signature[0] = 0x58;
+        forged_signature[32..].fill(0);
+        forged_signature[32] = 1;
+
+        assert!(verifier.verify(b"any message", &forged_signature).is_err());
+        assert!(verifier
+            .verify(b"a different message", &forged_signature)
+            .is_err());
     }
 
     #[test]
