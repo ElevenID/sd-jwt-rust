@@ -635,11 +635,18 @@ mod tests {
         SDJWTIssuer, SDJWTSerializationFormat, COMBINED_SERIALIZATION_FORMAT_SEPARATOR,
     };
     use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header};
+    use rand::{rngs::OsRng, RngCore};
     use serde_json::{json, Map, Value};
     use std::collections::HashSet;
 
     const PRIVATE_ISSUER_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUr2bNKuBPOrAaxsR\nnbSH6hIhmNTxSGXshDSUD1a1y7ihRANCAARvbx3gzBkyPDz7TQIbjF+ef1IsxUwz\nX1KWpmlVv+421F7+c1sLqGk4HUuoVeN8iOoAcE547pJhUEJyf5Asc6pP\n-----END PRIVATE KEY-----\n";
     const PUBLIC_ISSUER_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEb28d4MwZMjw8+00CG4xfnn9SLMVM\nM19SlqZpVb/uNtRe/nNbC6hpOB1LqFXjfIjqAHBOeO6SYVBCcn+QLHOqTw==\n-----END PUBLIC KEY-----\n";
+
+    fn fresh_test_nonce() -> String {
+        let mut nonce = [0u8; 16];
+        OsRng.fill_bytes(&mut nonce);
+        crate::utils::base64url_encode(&nonce)
+    }
 
     fn issuer_key_resolver() -> Box<crate::KeyResolver> {
         Box::new(|_iss: &str, _hdr: &jsonwebtoken::Header| {
@@ -688,7 +695,7 @@ mod tests {
         )?;
         holder.prepare_key_binding_presentation(
             Map::new(),
-            "nonce".to_owned(),
+            fresh_test_nonce(),
             "https://verifier.example".to_owned(),
             Some("ES256".to_owned()),
         )
@@ -1159,7 +1166,7 @@ mod tests {
             holder
                 .prepare_key_binding_presentation(
                     json!({"given_name": true}).as_object().unwrap().clone(),
-                    "nonce".to_owned(),
+                    fresh_test_nonce(),
                     "https://verifier.example".to_owned(),
                     Some("ES256".to_owned()),
                 )
