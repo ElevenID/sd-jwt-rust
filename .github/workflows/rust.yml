@@ -36,6 +36,8 @@ jobs:
       run: cargo test --locked --verbose
     - name: Test remote issuer-planning boundary
       run: cargo test --locked --no-default-features --features issuer-planning --lib --verbose
+    - name: Test remote issuer-completion boundary
+      run: cargo test --locked --no-default-features --features issuer-completion --lib --verbose
     - name: Lint remote issuer-planning boundary
       run: cargo clippy --locked --no-default-features --features issuer-planning -- -D warnings
     - name: Guard planning-only crypto feature graph
