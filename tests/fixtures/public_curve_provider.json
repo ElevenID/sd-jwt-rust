@@ -1,0 +1,17 @@
+{
+  "_source": "Unchanged public-only core verifier vectors; ES256 is RFC6979 sample, ES384 is marty-core@77a6ae0 marty-crypto/tests/fixtures/verification_only_public.json p384_boundary. Adapter regression inputs only, not conformance or demo qualification. No private material.",
+  "cases": [
+    {
+      "algorithm": "ES256",
+      "message": "sample",
+      "public_sec1": "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299",
+      "signature": "efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8"
+    },
+    {
+      "algorithm": "ES384",
+      "message": "P-384 verifier-only boundary",
+      "public_sec1": "04316140c268c8841cddd1dcbb51a11d516d285cdda6979f1db9230b9a9436f07ea3bacb8f4200e382634338484d19cdf494a1a457df42b3e7e22a255300495305b5d6f0208f2aada1741af1a9baaa73c39db971ef06d180d9524e1a2a4d33dfa0",
+      "signature": "3608fa4ead91bd0e2b333f4f2f69e130dfaf6e25e2de4f87fa37067edd0e859b07928f4da61fdbadf45b1638e2fbbd5c2647c5602130d138d1c9194c0612f969374a7b319ff6b4cf2ccdd6734ec521748c7ce9a8fd614ae1f4cfc5f0deffaf11"
+    }
+  ]
+}

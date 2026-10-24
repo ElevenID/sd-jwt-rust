@@ -1022,7 +1022,7 @@ mod tests {
         let prepared = prepare();
         let signature: p256::ecdsa::Signature = signing_key.sign(prepared.signing_input());
         let wrong_key = p256::ecdsa::SigningKey::from_slice(&[42u8; 32]).unwrap();
-        let wrong_point = wrong_key.verifying_key().to_encoded_point(false);
+        let wrong_point = wrong_key.verifying_key().to_sec1_point(false);
         let wrong_key = DecodingKey::from_ec_der(wrong_point.as_bytes());
         assert!(prepared
             .complete(&signature.to_bytes(), &wrong_key)

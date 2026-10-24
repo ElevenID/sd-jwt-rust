@@ -5,88 +5,20 @@
 //! of jsonwebtoken's process-global backend features.
 
 use aws_lc_rs::signature as aws_signature;
-use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519VerifyingKey};
+use ed25519_dalek::VerifyingKey as Ed25519VerifyingKey;
 use jsonwebtoken::crypto::{CryptoProvider, JwkUtils, JwtSigner, JwtVerifier};
 use jsonwebtoken::errors::{new_error, ErrorKind, Result};
 use jsonwebtoken::jwk::ThumbprintHash;
 use jsonwebtoken::signature::{Error as SignatureError, Verifier};
 use jsonwebtoken::{Algorithm, AlgorithmFamily, DecodingKey, DecodingKeyKind, EncodingKey};
-type P256Signature = ecdsa::Signature<p256::NistP256>;
 type P256VerifyingKey = p256::PublicKey;
-type P384Signature = ecdsa::Signature<p384::NistP384>;
 type P384VerifyingKey = p384::PublicKey;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
-struct P256Verifier(P256VerifyingKey);
-struct P384Verifier(P384VerifyingKey);
-struct Ed25519Verifier(Ed25519VerifyingKey);
+use crate::public_curve_verifiers::{Ed25519Verifier, P256Verifier, P384Verifier};
 struct RsaVerifier {
     algorithm: Algorithm,
     key: DecodingKey,
-}
-
-macro_rules! impl_curve_verifier {
-    ($name:ident, $signature:ty, $curve:ty, $projective:ty, $digest:ty, $algorithm:expr) => {
-        impl Verifier<Vec<u8>> for $name {
-            fn verify(
-                &self,
-                message: &[u8],
-                signature: &Vec<u8>,
-            ) -> std::result::Result<(), SignatureError> {
-                let signature =
-                    <$signature>::from_slice(signature).map_err(SignatureError::from_source)?;
-                let digest = <$digest>::digest(message);
-                let prehash = ecdsa::hazmat::bits2field::<$curve>(&digest)
-                    .map_err(SignatureError::from_source)?;
-                let public_point = <$projective>::from(*self.0.as_affine());
-                ecdsa::hazmat::verify_prehashed::<$curve>(&public_point, &prehash, &signature)
-                    .map_err(SignatureError::from_source)
-            }
-        }
-
-        impl JwtVerifier for $name {
-            fn algorithm(&self) -> Algorithm {
-                $algorithm
-            }
-        }
-    };
-}
-
-impl_curve_verifier!(
-    P256Verifier,
-    P256Signature,
-    p256::NistP256,
-    p256::ProjectivePoint,
-    Sha256,
-    Algorithm::ES256
-);
-impl_curve_verifier!(
-    P384Verifier,
-    P384Signature,
-    p384::NistP384,
-    p384::ProjectivePoint,
-    Sha384,
-    Algorithm::ES384
-);
-
-impl Verifier<Vec<u8>> for Ed25519Verifier {
-    fn verify(
-        &self,
-        message: &[u8],
-        signature: &Vec<u8>,
-    ) -> std::result::Result<(), SignatureError> {
-        let signature =
-            Ed25519Signature::from_slice(signature).map_err(SignatureError::from_source)?;
-        self.0
-            .verify_strict(message, &signature)
-            .map_err(SignatureError::from_source)
-    }
-}
-
-impl JwtVerifier for Ed25519Verifier {
-    fn algorithm(&self) -> Algorithm {
-        Algorithm::EdDSA
-    }
 }
 
 fn rsa_parameters(algorithm: Algorithm) -> &'static aws_signature::RsaParameters {
@@ -231,7 +163,7 @@ mod tests {
         use p256::ecdsa::signature::Signer as _;
 
         let p256_signing_key = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
-        let p256_encoded = p256_signing_key.verifying_key().to_encoded_point(false);
+        let p256_encoded = p256_signing_key.verifying_key().to_sec1_point(false);
         let p256_key = DecodingKey::from_ec_der(p256_encoded.as_bytes());
         let p256_verifier = verifier(&Algorithm::ES256, &p256_key).unwrap();
         let p256_signature: p256::ecdsa::Signature = p256_signing_key.sign(b"message");
@@ -240,7 +172,7 @@ mod tests {
         assert!(p256_verifier.verify(b"changed", &p256_signature).is_err());
 
         let p384_signing_key = p384::ecdsa::SigningKey::from_slice(&[8u8; 48]).unwrap();
-        let p384_encoded = p384_signing_key.verifying_key().to_encoded_point(false);
+        let p384_encoded = p384_signing_key.verifying_key().to_sec1_point(false);
         let p384_key = DecodingKey::from_ec_der(p384_encoded.as_bytes());
         let p384_verifier = verifier(&Algorithm::ES384, &p384_key).unwrap();
         let p384_signature: p384::ecdsa::Signature = p384_signing_key.sign(b"message");

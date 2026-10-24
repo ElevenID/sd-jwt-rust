@@ -15,3 +15,6 @@ serde_yaml = "0.9.27"
 serde_json = { version = "1.0.113", features = ["preserve_order"] }
 jsonwebtoken = { version = "10.4", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 sd-jwt-rs = {path = "./..", features = ["mock_salts"]}
+
+[patch.crates-io]
+ecdsa = { git = "https://github.com/ElevenID/ssi-elevenid", rev = "234723638447c30f90cf499bce1d6b092f865e9d" }
