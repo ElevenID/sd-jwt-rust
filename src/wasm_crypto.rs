@@ -6,87 +6,22 @@
 //! dependencies. RSA is deliberately unavailable on this target instead of
 //! reintroducing the vulnerable RustCrypto `rsa` crate.
 
-use ed25519_dalek::{Signature as Ed25519Signature, VerifyingKey as Ed25519VerifyingKey};
+use ed25519_dalek::VerifyingKey as Ed25519VerifyingKey;
 use jsonwebtoken::crypto::{CryptoProvider, JwkUtils, JwtSigner, JwtVerifier};
 use jsonwebtoken::errors::{new_error, ErrorKind, Result};
 use jsonwebtoken::jwk::ThumbprintHash;
-use jsonwebtoken::signature::{Error as SignatureError, Verifier};
+#[cfg(test)]
+use jsonwebtoken::signature::Verifier;
 use jsonwebtoken::{Algorithm, AlgorithmFamily, DecodingKey, EncodingKey};
+#[cfg(test)]
 type P256Signature = ecdsa::Signature<p256::NistP256>;
 type P256VerifyingKey = p256::PublicKey;
+#[cfg(test)]
 type P384Signature = ecdsa::Signature<p384::NistP384>;
 type P384VerifyingKey = p384::PublicKey;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
-struct P256Verifier(P256VerifyingKey);
-struct P384Verifier(P384VerifyingKey);
-struct Ed25519Verifier(Ed25519VerifyingKey);
-
-impl Verifier<Vec<u8>> for P256Verifier {
-    fn verify(
-        &self,
-        message: &[u8],
-        signature: &Vec<u8>,
-    ) -> std::result::Result<(), SignatureError> {
-        let signature =
-            P256Signature::from_slice(signature).map_err(SignatureError::from_source)?;
-        let digest = Sha256::digest(message);
-        let prehash = ecdsa::hazmat::bits2field::<p256::NistP256>(&digest)
-            .map_err(SignatureError::from_source)?;
-        let public_point = p256::ProjectivePoint::from(*self.0.as_affine());
-        ecdsa::hazmat::verify_prehashed::<p256::NistP256>(&public_point, &prehash, &signature)
-            .map_err(SignatureError::from_source)
-    }
-}
-
-impl JwtVerifier for P256Verifier {
-    fn algorithm(&self) -> Algorithm {
-        Algorithm::ES256
-    }
-}
-
-impl Verifier<Vec<u8>> for P384Verifier {
-    fn verify(
-        &self,
-        message: &[u8],
-        signature: &Vec<u8>,
-    ) -> std::result::Result<(), SignatureError> {
-        let signature =
-            P384Signature::from_slice(signature).map_err(SignatureError::from_source)?;
-        let digest = Sha384::digest(message);
-        let prehash = ecdsa::hazmat::bits2field::<p384::NistP384>(&digest)
-            .map_err(SignatureError::from_source)?;
-        let public_point = p384::ProjectivePoint::from(*self.0.as_affine());
-        ecdsa::hazmat::verify_prehashed::<p384::NistP384>(&public_point, &prehash, &signature)
-            .map_err(SignatureError::from_source)
-    }
-}
-
-impl JwtVerifier for P384Verifier {
-    fn algorithm(&self) -> Algorithm {
-        Algorithm::ES384
-    }
-}
-
-impl Verifier<Vec<u8>> for Ed25519Verifier {
-    fn verify(
-        &self,
-        message: &[u8],
-        signature: &Vec<u8>,
-    ) -> std::result::Result<(), SignatureError> {
-        let signature =
-            Ed25519Signature::from_slice(signature).map_err(SignatureError::from_source)?;
-        self.0
-            .verify_strict(message, &signature)
-            .map_err(SignatureError::from_source)
-    }
-}
-
-impl JwtVerifier for Ed25519Verifier {
-    fn algorithm(&self) -> Algorithm {
-        Algorithm::EdDSA
-    }
-}
+use crate::public_curve_verifiers::{Ed25519Verifier, P256Verifier, P384Verifier};
 
 fn verifier(algorithm: &Algorithm, key: &DecodingKey) -> Result<Box<dyn JwtVerifier>> {
     match algorithm {
@@ -209,7 +144,7 @@ mod tests {
         use p256::ecdsa::signature::Signer as _;
 
         let signing_key = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
-        let encoded = signing_key.verifying_key().to_encoded_point(false);
+        let encoded = signing_key.verifying_key().to_sec1_point(false);
         let key = DecodingKey::from_ec_der(encoded.as_bytes());
         let verifier = verifier(&Algorithm::ES256, &key).unwrap();
         let signature: P256Signature = signing_key.sign(b"message");
@@ -224,7 +159,7 @@ mod tests {
         use p384::ecdsa::signature::Signer as _;
 
         let signing_key = p384::ecdsa::SigningKey::from_slice(&[8u8; 48]).unwrap();
-        let encoded = signing_key.verifying_key().to_encoded_point(false);
+        let encoded = signing_key.verifying_key().to_sec1_point(false);
         let key = DecodingKey::from_ec_der(encoded.as_bytes());
         let verifier = verifier(&Algorithm::ES384, &key).unwrap();
         let signature: P384Signature = signing_key.sign(b"message");

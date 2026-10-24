@@ -126,6 +126,9 @@ pub mod verifier;
 ))]
 mod wasm_crypto;
 
+#[cfg(feature = "crypto-provider")]
+mod public_curve_verifiers;
+
 #[cfg(all(
     not(all(target_arch = "wasm32", target_os = "unknown")),
     feature = "crypto-provider"

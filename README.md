@@ -42,6 +42,21 @@ cargo test
 
 ### Cryptographic backends
 
+Native and browser curve verification use one shared implementation backed by
+RustCrypto curves 0.14 and the ECDSA 0.17 verification-only split maintained in
+`ElevenID/ssi-elevenid`. Its arithmetic requires crypto-bigint >=0.7.6.
+Credential signing and private-key codecs remain outside the production role
+graphs. Issuer planning remains free of verification backends.
+
+Cargo patches do not propagate from a dependency. Embedding Cargo roots must
+select the same shared ECDSA package as this repository and its interop tool:
+
+```toml
+[patch.crates-io]
+ecdsa = { git = "https://github.com/ElevenID/ssi-elevenid", rev = "234723638447c30f90cf499bce1d6b092f865e9d" }
+```
+
+
 Native verification uses AWS-LC for RSA and supports `ES256`, `ES384`,
 `EdDSA`, `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, and `PS512`.
 The provider is verification-only in production; signing input is intended for
